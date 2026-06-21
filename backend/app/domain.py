@@ -8,6 +8,8 @@ from typing import Iterable, Literal
 
 IncomeKind = Literal["main", "sporadic"]
 Urgency = Literal["need", "planned_want", "impulse_want", "household_discussion"]
+AccountType = Literal["checking", "savings"]
+PlaidSyncKind = Literal["balance", "transaction", "connection"]
 
 
 class WarningLevel(str, Enum):
@@ -44,6 +46,56 @@ class ExpectedBill:
     amount_cents: int
     due_on: date
     paid: bool = False
+
+
+@dataclass(frozen=True)
+class AccountLine:
+    id: int
+    budget_month_id: int
+    name: str
+    account_type: AccountType
+    balance_cents: int
+    included_in_cash_reality: bool
+    plaid_item_id: int | None = None
+    plaid_account_id: str | None = None
+    mask: str | None = None
+    official_name: str | None = None
+    subtype: str | None = None
+    available_balance_cents: int | None = None
+    current_balance_cents: int | None = None
+
+
+@dataclass(frozen=True)
+class PlaidItemLine:
+    id: int
+    household_id: int
+    plaid_item_id: str
+    access_token_ref: str
+    institution_id: str | None
+    institution_name: str | None
+    sync_cursor: str | None
+    status: str
+    last_error_code: str | None
+    last_error_message: str | None
+
+
+@dataclass(frozen=True)
+class TransactionLine:
+    id: int
+    cash_account_id: int
+    plaid_transaction_id: str | None
+    amount_cents: int
+    occurred_on: date
+    name: str
+    merchant_name: str | None
+    pending: bool
+    category_hint: str | None
+
+
+@dataclass(frozen=True)
+class TransactionUpsertResult:
+    transaction_id: int
+    created: bool
 
 
 @dataclass(frozen=True)
@@ -235,4 +287,3 @@ def cents_from_decimal_string(value: str) -> int:
     dollars = int(parts[0] or "0")
     cents = int((parts[1] if len(parts) == 2 else "0").ljust(2, "0")[:2])
     return sign * ((dollars * 100) + cents)
-
