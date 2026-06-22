@@ -102,8 +102,44 @@ CREATE TABLE IF NOT EXISTS account_transactions (
     merchant_name TEXT,
     pending INTEGER NOT NULL DEFAULT 0,
     category_hint TEXT,
+    reviewed INTEGER NOT NULL DEFAULT 0,
+    ignored INTEGER NOT NULL DEFAULT 0,
+    ignored_reason TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS merchant_category_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id INTEGER NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+    budget_category_id INTEGER NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
+    merchant_match_text TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 100,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(household_id, merchant_match_text, budget_category_id)
+);
+
+CREATE TABLE IF NOT EXISTS transaction_category_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id INTEGER NOT NULL REFERENCES account_transactions(id) ON DELETE CASCADE,
+    budget_category_id INTEGER NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    source TEXT NOT NULL CHECK (source IN ('manual', 'rule', 'plaid_hint', 'split')),
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    superseded_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS transaction_categorization_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id INTEGER NOT NULL REFERENCES account_transactions(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    source TEXT,
+    budget_category_id INTEGER REFERENCES budget_categories(id) ON DELETE SET NULL,
+    amount_cents INTEGER,
+    metadata TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS expected_bills (
@@ -140,6 +176,13 @@ CREATE INDEX IF NOT EXISTS idx_account_transactions_account ON account_transacti
 CREATE UNIQUE INDEX IF NOT EXISTS idx_account_transactions_plaid_transaction
     ON account_transactions(plaid_transaction_id)
     WHERE plaid_transaction_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_merchant_rules_household ON merchant_category_rules(household_id, active, priority, id);
+CREATE INDEX IF NOT EXISTS idx_transaction_assignments_transaction
+    ON transaction_category_assignments(transaction_id, active);
+CREATE INDEX IF NOT EXISTS idx_transaction_assignments_category
+    ON transaction_category_assignments(budget_category_id, active);
+CREATE INDEX IF NOT EXISTS idx_transaction_events_transaction
+    ON transaction_categorization_events(transaction_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_expected_bills_budget_month ON expected_bills(budget_month_id);
 CREATE INDEX IF NOT EXISTS idx_paydays_household_date ON paydays(household_id, payday_date);
 CREATE INDEX IF NOT EXISTS idx_plaid_sync_errors_item ON plaid_sync_errors(plaid_item_id);

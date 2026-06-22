@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from backend.app.api import build_server
+from backend.app.api import ApiHandler, build_server
 
 
 class ApiTests(unittest.TestCase):
@@ -99,12 +99,87 @@ class ApiTests(unittest.TestCase):
         self.assertIn("After upcoming bills", result["required_phrase"])
         self.assertEqual(result["days_until_payday"], 7)
 
+    def test_transaction_review_endpoints_return_sanitized_payloads(self) -> None:
+        household = self.post("/households", {"name": "API Transaction Household"})
+        budget_month = self.post(
+            "/budget-months",
+            {
+                "household_id": household["id"],
+                "month": "2026-06",
+                "included_account_balance_cents": 100_000,
+            },
+        )
+        group = self.post(
+            "/budget-groups",
+            {
+                "budget_month_id": budget_month["id"],
+                "name": "Everyday",
+            },
+        )
+        category = self.post(
+            "/categories",
+            {
+                "budget_group_id": group["id"],
+                "name": "Groceries",
+                "planned_cents": 50_000,
+            },
+        )
+        account_id = ApiHandler.repository.add_cash_account(
+            budget_month_id=budget_month["id"],
+            name="Main Checking",
+            account_type="checking",
+            balance_cents=100_000,
+        )
+        transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+            cash_account_id=account_id,
+            plaid_transaction_id="api-txn-1",
+            amount_cents=-2_500,
+            occurred_on=date(2026, 6, 21),
+            name="Fresh Market",
+            merchant_name="Fresh Market",
+            category_hint="Shops",
+        ).transaction_id
+
+        queue = self.get(f"/budget-months/{budget_month['id']}/transaction-review-queue")
+        self.patch(
+            f"/transactions/{transaction_id}/category",
+            {
+                "category_id": category["id"],
+                "reviewed": True,
+            },
+        )
+        detail = self.get(f"/transactions/{transaction_id}")
+
+        serialized_queue = json.dumps(queue)
+        serialized_detail = json.dumps(detail)
+        self.assertEqual(queue["transactions"][0]["transaction"]["id"], transaction_id)
+        self.assertEqual(detail["categorization_status"], "manual")
+        self.assertEqual(detail["final_category_id"], category["id"])
+        self.assertNotIn("access_token", serialized_queue)
+        self.assertNotIn("access_token_ref", serialized_queue)
+        self.assertNotIn("access_token", serialized_detail)
+        self.assertNotIn("access_token_ref", serialized_detail)
+
+    def get(self, path: str) -> dict[str, object]:
+        with urlopen(f"{self.base_url}{path}", timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
     def post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
         request = Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def patch(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        request = Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
         )
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
