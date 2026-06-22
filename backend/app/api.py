@@ -9,11 +9,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .db import BudgetRepository, safe_to_spend_to_dict, summary_to_dict
+from .db import BudgetRepository, account_to_dict, safe_to_spend_to_dict, summary_to_dict
+from .plaid import (
+    PlaidConnectionService,
+    link_token_to_dict,
+    plaid_connection_result_to_dict,
+    plaid_sync_outcome_to_dict,
+)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     repository: BudgetRepository
+    plaid_service: PlaidConnectionService
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -27,6 +34,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 today = parse_date(query.get("today", [date.today().isoformat()])[0])
                 summary = self.repository.get_summary(budget_month_id, today)
                 self.send_json(summary_to_dict(summary))
+                return
+            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/accounts"):
+                budget_month_id = int(parsed.path.split("/")[2])
+                accounts = self.repository.list_accounts(budget_month_id)
+                self.send_json({"accounts": [account_to_dict(account) for account in accounts]})
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
         except Exception as exc:
@@ -115,6 +127,31 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json(safe_to_spend_to_dict(result))
                 return
+            if parsed.path == "/plaid/link-token":
+                link_token = self.plaid_service.create_link_token(
+                    household_id=int(payload["household_id"]),
+                )
+                self.send_json(link_token_to_dict(link_token), status=HTTPStatus.CREATED)
+                return
+            if parsed.path == "/plaid/exchange-public-token":
+                result = self.plaid_service.exchange_public_token(
+                    household_id=int(payload["household_id"]),
+                    budget_month_id=int(payload["budget_month_id"]),
+                    public_token=payload["public_token"],
+                )
+                self.send_json(plaid_connection_result_to_dict(result), status=HTTPStatus.CREATED)
+                return
+            if parsed.path == "/plaid/sync":
+                sync_type = payload["sync_type"]
+                plaid_item_id = int(payload["plaid_item_id"])
+                if sync_type == "balance":
+                    outcome = self.plaid_service.sync_balances(plaid_item_id)
+                elif sync_type == "transaction":
+                    outcome = self.plaid_service.sync_transactions(plaid_item_id)
+                else:
+                    raise ValueError("sync_type must be 'balance' or 'transaction'")
+                self.send_json(plaid_sync_outcome_to_dict(outcome))
+                return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
         except Exception as exc:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
@@ -139,6 +176,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     budget_month_id,
                     int(payload["included_account_balance_cents"]),
                 )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/accounts/"):
+                account_id = int(parsed.path.split("/")[2])
+                if "included_in_cash_reality" in payload:
+                    self.repository.set_account_included(
+                        account_id=account_id,
+                        included_in_cash_reality=bool(payload["included_in_cash_reality"]),
+                    )
                 self.send_json({"ok": True})
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
@@ -175,11 +221,12 @@ def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     repository = BudgetRepository(db_path)
     repository.initialize()
     ApiHandler.repository = repository
+    ApiHandler.plaid_service = PlaidConnectionService(repository)
     return ThreadingHTTPServer((host, port), ApiHandler)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Family Finance Milestone 1 API")
+    parser = argparse.ArgumentParser(description="Family Finance staged MVP API")
     parser.add_argument("--db", default="work/family_finance.sqlite")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
@@ -192,4 +239,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -8,11 +8,15 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .domain import (
+    AccountLine,
     BudgetSummary,
     CategoryLine,
     ExpectedBill,
     IncomeLine,
+    PlaidItemLine,
     SafeToSpendResult,
+    TransactionLine,
+    TransactionUpsertResult,
     Urgency,
     calculate_safe_to_spend,
     summarize_budget,
@@ -92,6 +96,7 @@ class BudgetRepository:
         balance_cents: int,
         included_in_cash_reality: bool = True,
     ) -> int:
+        validate_account_type(account_type)
         with self.connect() as connection:
             return insert_and_return_id(
                 connection,
@@ -137,6 +142,405 @@ class BudgetRepository:
                 f"UPDATE cash_accounts SET {', '.join(assignments)} WHERE id = ?",
                 values,
             )
+
+    def list_accounts(self, budget_month_id: int) -> list[AccountLine]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM cash_accounts WHERE budget_month_id = ? ORDER BY id",
+                (budget_month_id,),
+            ).fetchall()
+        return [account_from_row(row) for row in rows]
+
+    def set_account_included(self, account_id: int, included_in_cash_reality: bool) -> None:
+        self.update_cash_account(
+            account_id=account_id,
+            included_in_cash_reality=included_in_cash_reality,
+        )
+
+    def create_plaid_item(
+        self,
+        *,
+        household_id: int,
+        plaid_item_id: str,
+        access_token_ref: str,
+        institution_id: str | None = None,
+        institution_name: str | None = None,
+        sync_cursor: str | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM plaid_items WHERE plaid_item_id = ?",
+                (plaid_item_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE plaid_items
+                    SET
+                        household_id = ?,
+                        access_token_ref = ?,
+                        institution_id = ?,
+                        institution_name = ?,
+                        sync_cursor = ?,
+                        status = 'connected',
+                        last_error_code = NULL,
+                        last_error_message = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        household_id,
+                        access_token_ref,
+                        institution_id,
+                        institution_name,
+                        sync_cursor,
+                        existing["id"],
+                    ),
+                )
+                return int(existing["id"])
+            return insert_and_return_id(
+                connection,
+                """
+                INSERT INTO plaid_items(
+                    household_id,
+                    plaid_item_id,
+                    access_token_ref,
+                    institution_id,
+                    institution_name,
+                    sync_cursor
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    household_id,
+                    plaid_item_id,
+                    access_token_ref,
+                    institution_id,
+                    institution_name,
+                    sync_cursor,
+                ),
+            )
+
+    def get_plaid_item(self, plaid_item_row_id: int) -> PlaidItemLine:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM plaid_items WHERE id = ?",
+                (plaid_item_row_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"Plaid item {plaid_item_row_id} not found")
+        return plaid_item_from_row(row)
+
+    def list_plaid_items(self, household_id: int) -> list[PlaidItemLine]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM plaid_items WHERE household_id = ? ORDER BY id",
+                (household_id,),
+            ).fetchall()
+        return [plaid_item_from_row(row) for row in rows]
+
+    def upsert_connected_account(
+        self,
+        *,
+        budget_month_id: int,
+        plaid_item_id: int,
+        plaid_account_id: str,
+        name: str,
+        account_type: str,
+        balance_cents: int,
+        included_in_cash_reality: bool = True,
+        subtype: str | None = None,
+        mask: str | None = None,
+        official_name: str | None = None,
+        available_balance_cents: int | None = None,
+        current_balance_cents: int | None = None,
+    ) -> int:
+        validate_account_type(account_type)
+        with self.connect() as connection:
+            budget_month = connection.execute(
+                "SELECT household_id FROM budget_months WHERE id = ?",
+                (budget_month_id,),
+            ).fetchone()
+            if budget_month is None:
+                raise LookupError(f"Budget month {budget_month_id} not found")
+            plaid_item = connection.execute(
+                "SELECT household_id FROM plaid_items WHERE id = ?",
+                (plaid_item_id,),
+            ).fetchone()
+            if plaid_item is None:
+                raise LookupError(f"Plaid item {plaid_item_id} not found")
+            if plaid_item["household_id"] != budget_month["household_id"]:
+                raise ValueError("Plaid item does not belong to the budget month household")
+
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM cash_accounts
+                WHERE plaid_item_id = ? AND plaid_account_id = ?
+                """,
+                (plaid_item_id, plaid_account_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE cash_accounts
+                    SET
+                        budget_month_id = ?,
+                        name = ?,
+                        account_type = ?,
+                        subtype = ?,
+                        mask = ?,
+                        official_name = ?,
+                        balance_cents = ?,
+                        available_balance_cents = ?,
+                        current_balance_cents = ?,
+                        included_in_cash_reality = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        budget_month_id,
+                        name,
+                        account_type,
+                        subtype,
+                        mask,
+                        official_name,
+                        balance_cents,
+                        available_balance_cents,
+                        current_balance_cents,
+                        1 if included_in_cash_reality else 0,
+                        existing["id"],
+                    ),
+                )
+                return int(existing["id"])
+            return insert_and_return_id(
+                connection,
+                """
+                INSERT INTO cash_accounts(
+                    budget_month_id,
+                    plaid_item_id,
+                    plaid_account_id,
+                    name,
+                    account_type,
+                    subtype,
+                    mask,
+                    official_name,
+                    balance_cents,
+                    available_balance_cents,
+                    current_balance_cents,
+                    included_in_cash_reality
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    budget_month_id,
+                    plaid_item_id,
+                    plaid_account_id,
+                    name,
+                    account_type,
+                    subtype,
+                    mask,
+                    official_name,
+                    balance_cents,
+                    available_balance_cents,
+                    current_balance_cents,
+                    1 if included_in_cash_reality else 0,
+                ),
+            )
+
+    def update_connected_account_balance(
+        self,
+        *,
+        plaid_item_id: int,
+        plaid_account_id: str,
+        balance_cents: int,
+        available_balance_cents: int | None = None,
+        current_balance_cents: int | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM cash_accounts
+                WHERE plaid_item_id = ? AND plaid_account_id = ?
+                """,
+                (plaid_item_id, plaid_account_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"Plaid account {plaid_account_id} not found")
+            connection.execute(
+                """
+                UPDATE cash_accounts
+                SET
+                    balance_cents = ?,
+                    available_balance_cents = ?,
+                    current_balance_cents = ?,
+                    last_balance_synced_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    balance_cents,
+                    available_balance_cents,
+                    current_balance_cents,
+                    row["id"],
+                ),
+            )
+            return int(row["id"])
+
+    def find_account_id_by_plaid_account(self, plaid_item_id: int, plaid_account_id: str) -> int | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM cash_accounts
+                WHERE plaid_item_id = ? AND plaid_account_id = ?
+                """,
+                (plaid_item_id, plaid_account_id),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
+
+    def upsert_plaid_transaction(
+        self,
+        *,
+        cash_account_id: int,
+        plaid_transaction_id: str,
+        amount_cents: int,
+        occurred_on: date,
+        name: str,
+        merchant_name: str | None = None,
+        pending: bool = False,
+        category_hint: str | None = None,
+    ) -> TransactionUpsertResult:
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM account_transactions WHERE plaid_transaction_id = ?",
+                (plaid_transaction_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE account_transactions
+                    SET
+                        cash_account_id = ?,
+                        amount_cents = ?,
+                        occurred_on = ?,
+                        name = ?,
+                        merchant_name = ?,
+                        pending = ?,
+                        category_hint = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        cash_account_id,
+                        amount_cents,
+                        occurred_on.isoformat(),
+                        name,
+                        merchant_name,
+                        1 if pending else 0,
+                        category_hint,
+                        existing["id"],
+                    ),
+                )
+                return TransactionUpsertResult(transaction_id=int(existing["id"]), created=False)
+            transaction_id = insert_and_return_id(
+                connection,
+                """
+                INSERT INTO account_transactions(
+                    cash_account_id,
+                    plaid_transaction_id,
+                    amount_cents,
+                    occurred_on,
+                    name,
+                    merchant_name,
+                    pending,
+                    category_hint
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cash_account_id,
+                    plaid_transaction_id,
+                    amount_cents,
+                    occurred_on.isoformat(),
+                    name,
+                    merchant_name,
+                    1 if pending else 0,
+                    category_hint,
+                ),
+            )
+            return TransactionUpsertResult(transaction_id=transaction_id, created=True)
+
+    def list_transactions(self, cash_account_id: int) -> list[TransactionLine]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM account_transactions
+                WHERE cash_account_id = ?
+                ORDER BY occurred_on, id
+                """,
+                (cash_account_id,),
+            ).fetchall()
+        return [transaction_from_row(row) for row in rows]
+
+    def update_plaid_item_cursor(self, plaid_item_id: int, sync_cursor: str | None) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE plaid_items
+                SET sync_cursor = ?, status = 'connected', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (sync_cursor, plaid_item_id),
+            )
+
+    def record_plaid_sync_error(
+        self,
+        *,
+        plaid_item_id: int,
+        sync_type: str,
+        error_code: str | None,
+        error_message: str,
+    ) -> int:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE plaid_items
+                SET
+                    status = 'error',
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error_code, error_message, plaid_item_id),
+            )
+            return insert_and_return_id(
+                connection,
+                """
+                INSERT INTO plaid_sync_errors(
+                    plaid_item_id,
+                    sync_type,
+                    error_code,
+                    error_message
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (plaid_item_id, sync_type, error_code, error_message),
+            )
+
+    def list_plaid_sync_errors(self, plaid_item_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM plaid_sync_errors
+                WHERE plaid_item_id = ?
+                ORDER BY occurred_at, id
+                """,
+                (plaid_item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_income(
         self,
@@ -385,10 +789,86 @@ def insert_and_return_id(connection: sqlite3.Connection, sql: str, values: Itera
     return int(cursor.lastrowid)
 
 
+def validate_account_type(account_type: str) -> None:
+    if account_type not in {"checking", "savings"}:
+        raise ValueError("Only checking and savings accounts are supported")
+
+
+def account_from_row(row: sqlite3.Row) -> AccountLine:
+    return AccountLine(
+        id=row["id"],
+        budget_month_id=row["budget_month_id"],
+        name=row["name"],
+        account_type=row["account_type"],
+        balance_cents=row["balance_cents"],
+        included_in_cash_reality=bool(row["included_in_cash_reality"]),
+        plaid_item_id=row["plaid_item_id"],
+        plaid_account_id=row["plaid_account_id"],
+        mask=row["mask"],
+        official_name=row["official_name"],
+        subtype=row["subtype"],
+        available_balance_cents=row["available_balance_cents"],
+        current_balance_cents=row["current_balance_cents"],
+    )
+
+
+def plaid_item_from_row(row: sqlite3.Row) -> PlaidItemLine:
+    return PlaidItemLine(
+        id=row["id"],
+        household_id=row["household_id"],
+        plaid_item_id=row["plaid_item_id"],
+        access_token_ref=row["access_token_ref"],
+        institution_id=row["institution_id"],
+        institution_name=row["institution_name"],
+        sync_cursor=row["sync_cursor"],
+        status=row["status"],
+        last_error_code=row["last_error_code"],
+        last_error_message=row["last_error_message"],
+    )
+
+
+def transaction_from_row(row: sqlite3.Row) -> TransactionLine:
+    return TransactionLine(
+        id=row["id"],
+        cash_account_id=row["cash_account_id"],
+        plaid_transaction_id=row["plaid_transaction_id"],
+        amount_cents=row["amount_cents"],
+        occurred_on=date.fromisoformat(row["occurred_on"]),
+        name=row["name"],
+        merchant_name=row["merchant_name"],
+        pending=bool(row["pending"]),
+        category_hint=row["category_hint"],
+    )
+
+
 def summary_to_dict(summary: BudgetSummary) -> dict[str, Any]:
     payload = asdict(summary)
     payload["next_payday"] = summary.next_payday.isoformat()
     payload["categories"] = [asdict(category) | {"remaining_cents": category.remaining_cents} for category in summary.categories]
+    return payload
+
+
+def account_to_dict(account: AccountLine) -> dict[str, Any]:
+    return asdict(account)
+
+
+def plaid_item_to_public_dict(item: PlaidItemLine) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "household_id": item.household_id,
+        "plaid_item_id": item.plaid_item_id,
+        "institution_id": item.institution_id,
+        "institution_name": item.institution_name,
+        "sync_cursor": item.sync_cursor,
+        "status": item.status,
+        "last_error_code": item.last_error_code,
+        "last_error_message": item.last_error_message,
+    }
+
+
+def transaction_to_dict(transaction: TransactionLine) -> dict[str, Any]:
+    payload = asdict(transaction)
+    payload["occurred_on"] = transaction.occurred_on.isoformat()
     return payload
 
 

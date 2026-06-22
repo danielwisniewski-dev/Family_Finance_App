@@ -25,13 +25,37 @@ CREATE TABLE IF NOT EXISTS budget_months (
     UNIQUE(household_id, month)
 );
 
+CREATE TABLE IF NOT EXISTS plaid_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id INTEGER NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+    plaid_item_id TEXT NOT NULL UNIQUE,
+    access_token_ref TEXT NOT NULL,
+    institution_id TEXT,
+    institution_name TEXT,
+    sync_cursor TEXT,
+    status TEXT NOT NULL DEFAULT 'connected' CHECK (status IN ('connected', 'error', 'disconnected')),
+    last_error_code TEXT,
+    last_error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS cash_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month_id INTEGER NOT NULL REFERENCES budget_months(id) ON DELETE CASCADE,
+    plaid_item_id INTEGER REFERENCES plaid_items(id) ON DELETE SET NULL,
+    plaid_account_id TEXT,
     name TEXT NOT NULL,
     account_type TEXT NOT NULL CHECK (account_type IN ('checking', 'savings')),
+    subtype TEXT,
+    mask TEXT,
+    official_name TEXT,
     balance_cents INTEGER NOT NULL DEFAULT 0,
-    included_in_cash_reality INTEGER NOT NULL DEFAULT 1
+    available_balance_cents INTEGER,
+    current_balance_cents INTEGER,
+    included_in_cash_reality INTEGER NOT NULL DEFAULT 1,
+    last_balance_synced_at TEXT,
+    UNIQUE(plaid_item_id, plaid_account_id)
 );
 
 CREATE TABLE IF NOT EXISTS income_plan (
@@ -68,6 +92,20 @@ CREATE TABLE IF NOT EXISTS manual_spending (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS account_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cash_account_id INTEGER NOT NULL REFERENCES cash_accounts(id) ON DELETE CASCADE,
+    plaid_transaction_id TEXT,
+    amount_cents INTEGER NOT NULL,
+    occurred_on TEXT NOT NULL,
+    name TEXT NOT NULL,
+    merchant_name TEXT,
+    pending INTEGER NOT NULL DEFAULT 0,
+    category_hint TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS expected_bills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month_id INTEGER NOT NULL REFERENCES budget_months(id) ON DELETE CASCADE,
@@ -84,8 +122,24 @@ CREATE TABLE IF NOT EXISTS paydays (
     UNIQUE(household_id, payday_date)
 );
 
+CREATE TABLE IF NOT EXISTS plaid_sync_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plaid_item_id INTEGER NOT NULL REFERENCES plaid_items(id) ON DELETE CASCADE,
+    sync_type TEXT NOT NULL CHECK (sync_type IN ('balance', 'transaction', 'connection')),
+    error_code TEXT,
+    error_message TEXT NOT NULL,
+    occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_plaid_items_household ON plaid_items(household_id);
 CREATE INDEX IF NOT EXISTS idx_budget_categories_group ON budget_categories(budget_group_id);
 CREATE INDEX IF NOT EXISTS idx_cash_accounts_budget_month ON cash_accounts(budget_month_id);
+CREATE INDEX IF NOT EXISTS idx_cash_accounts_plaid_item ON cash_accounts(plaid_item_id);
 CREATE INDEX IF NOT EXISTS idx_manual_spending_category ON manual_spending(budget_category_id);
+CREATE INDEX IF NOT EXISTS idx_account_transactions_account ON account_transactions(cash_account_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_account_transactions_plaid_transaction
+    ON account_transactions(plaid_transaction_id)
+    WHERE plaid_transaction_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_expected_bills_budget_month ON expected_bills(budget_month_id);
 CREATE INDEX IF NOT EXISTS idx_paydays_household_date ON paydays(household_id, payday_date);
+CREATE INDEX IF NOT EXISTS idx_plaid_sync_errors_item ON plaid_sync_errors(plaid_item_id);
