@@ -10,6 +10,7 @@ IncomeKind = Literal["main", "sporadic"]
 Urgency = Literal["need", "planned_want", "impulse_want", "household_discussion"]
 AccountType = Literal["checking", "savings"]
 PlaidSyncKind = Literal["balance", "transaction", "connection"]
+CategorizationSource = Literal["manual", "rule", "plaid_hint", "split"]
 
 
 class WarningLevel(str, Enum):
@@ -90,6 +91,46 @@ class TransactionLine:
     merchant_name: str | None
     pending: bool
     category_hint: str | None
+    reviewed: bool = False
+    ignored: bool = False
+    ignored_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class TransactionCategoryAssignment:
+    id: int
+    transaction_id: int
+    category_id: int
+    amount_cents: int
+    source: CategorizationSource
+    active: bool = True
+
+
+@dataclass(frozen=True)
+class TransactionDetail:
+    transaction: TransactionLine
+    assignments: tuple[TransactionCategoryAssignment, ...]
+    audit_events: tuple[dict[str, object], ...]
+
+    @property
+    def final_category_id(self) -> int | None:
+        if len(self.assignments) == 1:
+            return self.assignments[0].category_id
+        return None
+
+    @property
+    def categorization_status(self) -> str:
+        if self.transaction.ignored:
+            return "ignored"
+        if len(self.assignments) > 1:
+            return "split"
+        if len(self.assignments) == 1:
+            return self.assignments[0].source
+        return "uncategorized"
+
+    @property
+    def needs_review(self) -> bool:
+        return not self.transaction.reviewed or (not self.transaction.ignored and not self.assignments)
 
 
 @dataclass(frozen=True)

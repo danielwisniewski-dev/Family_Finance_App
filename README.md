@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1 and Milestone 2 backend scaffolding.
+The implemented slices are Milestone 1, Milestone 2, and Milestone 3 backend scaffolding.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -31,6 +31,20 @@ Milestone 2 adds backend-only Plaid/account integration scaffolding:
 - Sync error capture without crashing budget reads
 - Tests for account selection, transaction deduplication, and sync error handling
 
+Milestone 3 adds backend-only transaction review and categorization:
+
+- Transaction list, detail, and review-queue support
+- Reviewed/unreviewed transaction state
+- Manual category assignment, recategorization, and category removal
+- Merchant-based categorization rules with deterministic priority, then id ordering
+- Plaid category/name data stored as hints only
+- Uncategorized queue for transactions without a final category
+- Transaction splitting across multiple budget categories
+- Ignored/excluded transactions that stay in history but do not affect budget spending
+- Audit events for imports, category decisions, splits, review changes, and ignores
+- Category spent/remaining totals that include active, non-ignored transaction assignments
+- Tests for queue behavior, category totals, rules, hints, splits, ignored transactions, and audit metadata
+
 Environment variables are placeholders only:
 
 - `PLAID_CLIENT_ID`
@@ -56,6 +70,45 @@ Deferred by design:
 - Credit cards
 - Receipt scanning
 - MCP/tool layer
+
+## Transaction Review API Notes
+
+Milestone 3 API routes are backend-only JSON routes:
+
+```text
+GET /budget-months/{budget_month_id}/transactions
+GET /budget-months/{budget_month_id}/transaction-review-queue
+GET /transactions/{transaction_id}
+POST /merchant-category-rules
+PATCH /transactions/{transaction_id}/review
+PATCH /transactions/{transaction_id}/category
+PATCH /transactions/{transaction_id}/split
+PATCH /transactions/{transaction_id}/ignore
+```
+
+Transaction category assignment payload:
+
+```json
+{
+  "category_id": 123,
+  "source": "manual",
+  "reviewed": true
+}
+```
+
+Send `"category_id": null` to remove the active category assignment. Split payloads must add up to the absolute transaction amount:
+
+```json
+{
+  "splits": [
+    {"category_id": 123, "amount_cents": 4000},
+    {"category_id": 456, "amount_cents": 2000}
+  ],
+  "reviewed": true
+}
+```
+
+Ignored transactions remain in transaction history and audit events, but active category assignments are superseded and ignored transactions do not reduce category remaining.
 
 ## Run Tests
 

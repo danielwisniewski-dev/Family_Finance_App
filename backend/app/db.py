@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -15,6 +16,8 @@ from .domain import (
     IncomeLine,
     PlaidItemLine,
     SafeToSpendResult,
+    TransactionCategoryAssignment,
+    TransactionDetail,
     TransactionLine,
     TransactionUpsertResult,
     Urgency,
@@ -46,6 +49,9 @@ class BudgetRepository:
         schema_path = Path(__file__).with_name("schema.sql")
         with self.connect() as connection:
             connection.executescript(schema_path.read_text(encoding="utf-8"))
+            ensure_column(connection, "account_transactions", "reviewed", "INTEGER NOT NULL DEFAULT 0")
+            ensure_column(connection, "account_transactions", "ignored", "INTEGER NOT NULL DEFAULT 0")
+            ensure_column(connection, "account_transactions", "ignored_reason", "TEXT")
 
     def create_household(self, name: str, spouses: Iterable[dict[str, str]] = ()) -> int:
         with self.connect() as connection:
@@ -441,6 +447,7 @@ class BudgetRepository:
                         existing["id"],
                     ),
                 )
+                self._apply_best_rule_if_allowed(connection, int(existing["id"]))
                 return TransactionUpsertResult(transaction_id=int(existing["id"]), created=False)
             transaction_id = insert_and_return_id(
                 connection,
@@ -468,6 +475,14 @@ class BudgetRepository:
                     category_hint,
                 ),
             )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="imported",
+                source="plaid_hint" if category_hint else None,
+                metadata={"category_hint": category_hint, "plaid_transaction_id": plaid_transaction_id},
+            )
+            self._apply_best_rule_if_allowed(connection, transaction_id)
             return TransactionUpsertResult(transaction_id=transaction_id, created=True)
 
     def list_transactions(self, cash_account_id: int) -> list[TransactionLine]:
@@ -482,6 +497,231 @@ class BudgetRepository:
                 (cash_account_id,),
             ).fetchall()
         return [transaction_from_row(row) for row in rows]
+
+    def list_budget_transactions(self, budget_month_id: int) -> list[TransactionDetail]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT t.*
+                FROM account_transactions t
+                JOIN cash_accounts a ON a.id = t.cash_account_id
+                WHERE a.budget_month_id = ?
+                ORDER BY t.occurred_on, t.id
+                """,
+                (budget_month_id,),
+            ).fetchall()
+            return [self._transaction_detail_from_row(connection, row) for row in rows]
+
+    def list_uncategorized_transactions(self, budget_month_id: int) -> list[TransactionDetail]:
+        return [
+            detail
+            for detail in self.list_budget_transactions(budget_month_id)
+            if not detail.transaction.ignored and not detail.assignments
+        ]
+
+    def list_transaction_review_queue(self, budget_month_id: int) -> list[TransactionDetail]:
+        return [
+            detail
+            for detail in self.list_budget_transactions(budget_month_id)
+            if detail.needs_review
+        ]
+
+    def get_transaction_detail(self, transaction_id: int) -> TransactionDetail:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM account_transactions WHERE id = ?",
+                (transaction_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"Transaction {transaction_id} not found")
+            return self._transaction_detail_from_row(connection, row)
+
+    def mark_transaction_reviewed(self, transaction_id: int, reviewed: bool = True) -> None:
+        with self.connect() as connection:
+            self._require_transaction(connection, transaction_id)
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET reviewed = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if reviewed else 0, transaction_id),
+            )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="marked_reviewed" if reviewed else "marked_unreviewed",
+            )
+
+    def assign_transaction_category(
+        self,
+        *,
+        transaction_id: int,
+        category_id: int,
+        source: str = "manual",
+        reviewed: bool = True,
+    ) -> None:
+        if source not in {"manual", "rule", "plaid_hint"}:
+            raise ValueError("source must be manual, rule, or plaid_hint")
+        with self.connect() as connection:
+            transaction = self._require_transaction(connection, transaction_id)
+            self._validate_category_for_transaction(connection, transaction_id, category_id)
+            amount_cents = budget_amount_cents(transaction["amount_cents"])
+            self._supersede_active_assignments(connection, transaction_id)
+            self._insert_assignment(
+                connection,
+                transaction_id=transaction_id,
+                category_id=category_id,
+                amount_cents=amount_cents,
+                source=source,
+            )
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET reviewed = ?, ignored = 0, ignored_reason = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if reviewed else int(transaction["reviewed"]), transaction_id),
+            )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="category_assigned",
+                source=source,
+                category_id=category_id,
+                amount_cents=amount_cents,
+            )
+
+    def remove_transaction_category(self, transaction_id: int, reviewed: bool = False) -> None:
+        with self.connect() as connection:
+            self._require_transaction(connection, transaction_id)
+            self._supersede_active_assignments(connection, transaction_id)
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET reviewed = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if reviewed else 0, transaction_id),
+            )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="category_removed",
+            )
+
+    def split_transaction(
+        self,
+        *,
+        transaction_id: int,
+        splits: Iterable[dict[str, int]],
+        reviewed: bool = True,
+    ) -> None:
+        split_rows = tuple(splits)
+        if not split_rows:
+            raise ValueError("At least one split is required")
+        with self.connect() as connection:
+            transaction = self._require_transaction(connection, transaction_id)
+            expected_total = budget_amount_cents(transaction["amount_cents"])
+            actual_total = sum(int(row["amount_cents"]) for row in split_rows)
+            if actual_total != expected_total:
+                raise ValueError("Split amounts must equal the transaction amount")
+            self._supersede_active_assignments(connection, transaction_id)
+            for row in split_rows:
+                category_id = int(row["category_id"])
+                amount_cents = int(row["amount_cents"])
+                if amount_cents <= 0:
+                    raise ValueError("Split amounts must be positive")
+                self._validate_category_for_transaction(connection, transaction_id, category_id)
+                self._insert_assignment(
+                    connection,
+                    transaction_id=transaction_id,
+                    category_id=category_id,
+                    amount_cents=amount_cents,
+                    source="split",
+                )
+                self._record_transaction_event(
+                    connection,
+                    transaction_id=transaction_id,
+                    event_type="split_line_assigned",
+                    source="split",
+                    category_id=category_id,
+                    amount_cents=amount_cents,
+                )
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET reviewed = ?, ignored = 0, ignored_reason = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if reviewed else int(transaction["reviewed"]), transaction_id),
+            )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="transaction_split",
+                source="split",
+                amount_cents=actual_total,
+                metadata={"split_count": len(split_rows)},
+            )
+
+    def set_transaction_ignored(
+        self,
+        *,
+        transaction_id: int,
+        ignored: bool = True,
+        reason: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            self._require_transaction(connection, transaction_id)
+            if ignored:
+                self._supersede_active_assignments(connection, transaction_id)
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET
+                    ignored = ?,
+                    ignored_reason = ?,
+                    reviewed = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if ignored else 0, reason if ignored else None, transaction_id),
+            )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="ignored" if ignored else "unignored",
+                metadata={"reason": reason} if reason else None,
+            )
+
+    def create_merchant_rule(
+        self,
+        *,
+        household_id: int,
+        merchant_match_text: str,
+        category_id: int,
+        priority: int = 100,
+    ) -> int:
+        cleaned = merchant_match_text.strip().casefold()
+        if not cleaned:
+            raise ValueError("merchant_match_text is required")
+        with self.connect() as connection:
+            self._validate_category_for_household(connection, household_id, category_id)
+            rule_id = insert_and_return_id(
+                connection,
+                """
+                INSERT INTO merchant_category_rules(
+                    household_id,
+                    budget_category_id,
+                    merchant_match_text,
+                    priority
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (household_id, category_id, cleaned, priority),
+            )
+            return rule_id
 
     def update_plaid_item_cursor(self, plaid_item_id: int, sync_cursor: str | None) -> None:
         with self.connect() as connection:
@@ -697,6 +937,211 @@ class BudgetRepository:
             low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
         )
 
+    def _transaction_detail_from_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> TransactionDetail:
+        transaction_id = int(row["id"])
+        assignment_rows = connection.execute(
+            """
+            SELECT *
+            FROM transaction_category_assignments
+            WHERE transaction_id = ? AND active = 1
+            ORDER BY id
+            """,
+            (transaction_id,),
+        ).fetchall()
+        event_rows = connection.execute(
+            """
+            SELECT *
+            FROM transaction_categorization_events
+            WHERE transaction_id = ?
+            ORDER BY created_at, id
+            """,
+            (transaction_id,),
+        ).fetchall()
+        return TransactionDetail(
+            transaction=transaction_from_row(row),
+            assignments=tuple(assignment_from_row(item) for item in assignment_rows),
+            audit_events=tuple(dict(item) for item in event_rows),
+        )
+
+    def _require_transaction(self, connection: sqlite3.Connection, transaction_id: int) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM account_transactions WHERE id = ?",
+            (transaction_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Transaction {transaction_id} not found")
+        return row
+
+    def _validate_category_for_transaction(
+        self,
+        connection: sqlite3.Connection,
+        transaction_id: int,
+        category_id: int,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT c.id
+            FROM budget_categories c
+            JOIN budget_groups g ON g.id = c.budget_group_id
+            JOIN cash_accounts a ON a.budget_month_id = g.budget_month_id
+            JOIN account_transactions t ON t.cash_account_id = a.id
+            WHERE t.id = ? AND c.id = ? AND c.archived = 0
+            """,
+            (transaction_id, category_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Category must belong to the transaction budget month and be active")
+
+    def _validate_category_for_household(
+        self,
+        connection: sqlite3.Connection,
+        household_id: int,
+        category_id: int,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT c.id
+            FROM budget_categories c
+            JOIN budget_groups g ON g.id = c.budget_group_id
+            JOIN budget_months b ON b.id = g.budget_month_id
+            WHERE b.household_id = ? AND c.id = ? AND c.archived = 0
+            """,
+            (household_id, category_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Category must belong to the household and be active")
+
+    def _supersede_active_assignments(self, connection: sqlite3.Connection, transaction_id: int) -> None:
+        connection.execute(
+            """
+            UPDATE transaction_category_assignments
+            SET active = 0, superseded_at = CURRENT_TIMESTAMP
+            WHERE transaction_id = ? AND active = 1
+            """,
+            (transaction_id,),
+        )
+
+    def _insert_assignment(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        transaction_id: int,
+        category_id: int,
+        amount_cents: int,
+        source: str,
+    ) -> int:
+        if amount_cents <= 0:
+            raise ValueError("Assignment amount must be positive")
+        return insert_and_return_id(
+            connection,
+            """
+            INSERT INTO transaction_category_assignments(
+                transaction_id,
+                budget_category_id,
+                amount_cents,
+                source
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (transaction_id, category_id, amount_cents, source),
+        )
+
+    def _apply_best_rule_if_allowed(self, connection: sqlite3.Connection, transaction_id: int) -> None:
+        transaction = self._require_transaction(connection, transaction_id)
+        if transaction["ignored"]:
+            return
+        active_assignments = connection.execute(
+            """
+            SELECT source
+            FROM transaction_category_assignments
+            WHERE transaction_id = ? AND active = 1
+            """,
+            (transaction_id,),
+        ).fetchall()
+        if any(row["source"] in {"manual", "split"} for row in active_assignments):
+            return
+        if active_assignments:
+            self._supersede_active_assignments(connection, transaction_id)
+
+        haystack = " ".join(
+            value
+            for value in (transaction["merchant_name"], transaction["name"])
+            if value
+        ).casefold()
+        if not haystack:
+            return
+
+        rule_rows = connection.execute(
+            """
+            SELECT r.*
+            FROM merchant_category_rules r
+            JOIN budget_categories c ON c.id = r.budget_category_id
+            JOIN budget_groups g ON g.id = c.budget_group_id
+            JOIN budget_months b ON b.id = g.budget_month_id
+            JOIN cash_accounts a ON a.budget_month_id = b.id
+            WHERE a.id = ?
+                AND r.household_id = b.household_id
+                AND r.active = 1
+                AND c.archived = 0
+            ORDER BY r.priority, r.id
+            """,
+            (transaction["cash_account_id"],),
+        ).fetchall()
+        for rule in rule_rows:
+            if rule["merchant_match_text"] in haystack:
+                amount_cents = budget_amount_cents(transaction["amount_cents"])
+                self._insert_assignment(
+                    connection,
+                    transaction_id=transaction_id,
+                    category_id=int(rule["budget_category_id"]),
+                    amount_cents=amount_cents,
+                    source="rule",
+                )
+                self._record_transaction_event(
+                    connection,
+                    transaction_id=transaction_id,
+                    event_type="rule_applied",
+                    source="rule",
+                    category_id=int(rule["budget_category_id"]),
+                    amount_cents=amount_cents,
+                    metadata={"rule_id": int(rule["id"])},
+                )
+                return
+
+    def _record_transaction_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        transaction_id: int,
+        event_type: str,
+        source: str | None = None,
+        category_id: int | None = None,
+        amount_cents: int | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        return insert_and_return_id(
+            connection,
+            """
+            INSERT INTO transaction_categorization_events(
+                transaction_id,
+                event_type,
+                source,
+                budget_category_id,
+                amount_cents,
+                metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transaction_id,
+                event_type,
+                source,
+                category_id,
+                amount_cents,
+                json_dumps(metadata) if metadata is not None else None,
+            ),
+        )
+
     def _load_snapshot(self, budget_month_id: int) -> dict[str, Any]:
         with self.connect() as connection:
             budget_month = connection.execute(
@@ -717,15 +1162,28 @@ class BudgetRepository:
                     c.name,
                     c.planned_cents,
                     c.archived,
-                    COALESCE(SUM(s.amount_cents), 0) AS spent_cents
+                    COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0) AS spent_cents
                 FROM budget_categories c
                 JOIN budget_groups g ON g.id = c.budget_group_id
-                LEFT JOIN manual_spending s ON s.budget_category_id = c.id
+                LEFT JOIN (
+                    SELECT budget_category_id, SUM(amount_cents) AS manual_spent_cents
+                    FROM manual_spending
+                    GROUP BY budget_category_id
+                ) ms ON ms.budget_category_id = c.id
+                LEFT JOIN (
+                    SELECT a.budget_category_id, SUM(a.amount_cents) AS transaction_spent_cents
+                    FROM transaction_category_assignments a
+                    JOIN account_transactions t ON t.id = a.transaction_id
+                    JOIN cash_accounts ca ON ca.id = t.cash_account_id
+                    WHERE a.active = 1
+                        AND t.ignored = 0
+                        AND ca.budget_month_id = ?
+                    GROUP BY a.budget_category_id
+                ) ts ON ts.budget_category_id = c.id
                 WHERE g.budget_month_id = ?
-                GROUP BY c.id, c.name, c.planned_cents, c.archived, c.display_order
                 ORDER BY g.display_order, c.display_order, c.id
                 """,
-                (budget_month_id,),
+                (budget_month_id, budget_month_id),
             ).fetchall()
             bill_rows = connection.execute(
                 "SELECT * FROM expected_bills WHERE budget_month_id = ? ORDER BY due_on, id",
@@ -789,6 +1247,23 @@ def insert_and_return_id(connection: sqlite3.Connection, sql: str, values: Itera
     return int(cursor.lastrowid)
 
 
+def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def budget_amount_cents(transaction_amount_cents: int) -> int:
+    return abs(transaction_amount_cents)
+
+
+def json_dumps(value: dict[str, object]) -> str:
+    return json.dumps(value, sort_keys=True)
+
+
 def validate_account_type(account_type: str) -> None:
     if account_type not in {"checking", "savings"}:
         raise ValueError("Only checking and savings accounts are supported")
@@ -838,6 +1313,20 @@ def transaction_from_row(row: sqlite3.Row) -> TransactionLine:
         merchant_name=row["merchant_name"],
         pending=bool(row["pending"]),
         category_hint=row["category_hint"],
+        reviewed=bool(row["reviewed"]),
+        ignored=bool(row["ignored"]),
+        ignored_reason=row["ignored_reason"],
+    )
+
+
+def assignment_from_row(row: sqlite3.Row) -> TransactionCategoryAssignment:
+    return TransactionCategoryAssignment(
+        id=row["id"],
+        transaction_id=row["transaction_id"],
+        category_id=row["budget_category_id"],
+        amount_cents=row["amount_cents"],
+        source=row["source"],
+        active=bool(row["active"]),
     )
 
 
@@ -870,6 +1359,21 @@ def transaction_to_dict(transaction: TransactionLine) -> dict[str, Any]:
     payload = asdict(transaction)
     payload["occurred_on"] = transaction.occurred_on.isoformat()
     return payload
+
+
+def assignment_to_dict(assignment: TransactionCategoryAssignment) -> dict[str, Any]:
+    return asdict(assignment)
+
+
+def transaction_detail_to_dict(detail: TransactionDetail) -> dict[str, Any]:
+    return {
+        "transaction": transaction_to_dict(detail.transaction),
+        "assignments": [assignment_to_dict(assignment) for assignment in detail.assignments],
+        "audit_events": [dict(event) for event in detail.audit_events],
+        "final_category_id": detail.final_category_id,
+        "categorization_status": detail.categorization_status,
+        "needs_review": detail.needs_review,
+    }
 
 
 def safe_to_spend_to_dict(result: SafeToSpendResult) -> dict[str, Any]:

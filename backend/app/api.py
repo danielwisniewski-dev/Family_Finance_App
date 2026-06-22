@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .db import BudgetRepository, account_to_dict, safe_to_spend_to_dict, summary_to_dict
+from .db import BudgetRepository, account_to_dict, safe_to_spend_to_dict, summary_to_dict, transaction_detail_to_dict
 from .plaid import (
     PlaidConnectionService,
     link_token_to_dict,
@@ -39,6 +39,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 budget_month_id = int(parsed.path.split("/")[2])
                 accounts = self.repository.list_accounts(budget_month_id)
                 self.send_json({"accounts": [account_to_dict(account) for account in accounts]})
+                return
+            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/transactions"):
+                budget_month_id = int(parsed.path.split("/")[2])
+                transactions = self.repository.list_budget_transactions(budget_month_id)
+                self.send_json({"transactions": [transaction_detail_to_dict(item) for item in transactions]})
+                return
+            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/transaction-review-queue"):
+                budget_month_id = int(parsed.path.split("/")[2])
+                transactions = self.repository.list_transaction_review_queue(budget_month_id)
+                self.send_json({"transactions": [transaction_detail_to_dict(item) for item in transactions]})
+                return
+            if parsed.path.startswith("/transactions/"):
+                transaction_id = int(parsed.path.split("/")[2])
+                detail = self.repository.get_transaction_detail(transaction_id)
+                self.send_json(transaction_detail_to_dict(detail))
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
         except Exception as exc:
@@ -152,6 +167,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise ValueError("sync_type must be 'balance' or 'transaction'")
                 self.send_json(plaid_sync_outcome_to_dict(outcome))
                 return
+            if parsed.path == "/merchant-category-rules":
+                rule_id = self.repository.create_merchant_rule(
+                    household_id=int(payload["household_id"]),
+                    merchant_match_text=payload["merchant_match_text"],
+                    category_id=int(payload["category_id"]),
+                    priority=int(payload.get("priority", 100)),
+                )
+                self.send_json({"id": rule_id}, status=HTTPStatus.CREATED)
+                return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
         except Exception as exc:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
@@ -185,6 +209,48 @@ class ApiHandler(BaseHTTPRequestHandler):
                         account_id=account_id,
                         included_in_cash_reality=bool(payload["included_in_cash_reality"]),
                     )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/review"):
+                transaction_id = int(parsed.path.split("/")[2])
+                self.repository.mark_transaction_reviewed(
+                    transaction_id,
+                    reviewed=bool(payload.get("reviewed", True)),
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/category"):
+                transaction_id = int(parsed.path.split("/")[2])
+                if payload.get("category_id") is None:
+                    self.repository.remove_transaction_category(
+                        transaction_id,
+                        reviewed=bool(payload.get("reviewed", False)),
+                    )
+                else:
+                    self.repository.assign_transaction_category(
+                        transaction_id=transaction_id,
+                        category_id=int(payload["category_id"]),
+                        source=payload.get("source", "manual"),
+                        reviewed=bool(payload.get("reviewed", True)),
+                    )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/split"):
+                transaction_id = int(parsed.path.split("/")[2])
+                self.repository.split_transaction(
+                    transaction_id=transaction_id,
+                    splits=payload["splits"],
+                    reviewed=bool(payload.get("reviewed", True)),
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/ignore"):
+                transaction_id = int(parsed.path.split("/")[2])
+                self.repository.set_transaction_ignored(
+                    transaction_id=transaction_id,
+                    ignored=bool(payload.get("ignored", True)),
+                    reason=payload.get("reason"),
+                )
                 self.send_json({"ok": True})
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
