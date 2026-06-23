@@ -20,12 +20,29 @@ public final class FamilyFinanceApi {
         this(new JsonHttpClient(baseUrl));
     }
 
+    public FamilyFinanceApi(String baseUrl, String bearerToken) {
+        this(new JsonHttpClient(baseUrl, bearerToken));
+    }
+
     FamilyFinanceApi(JsonHttpClient client) {
         this.client = client;
     }
 
     public JSONObject health() throws ApiException {
         return client.get("/health");
+    }
+
+    public JSONObject login(String usernameOrEmail, String password) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("username", usernameOrEmail);
+            payload.put("password", password);
+            return client.post("/auth/login", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build login request", exception);
+        }
     }
 
     public BudgetSummary getSummary(int budgetMonthId) throws ApiException {
@@ -51,9 +68,9 @@ public final class FamilyFinanceApi {
         return parseTransactions(client.get("/budget-months/" + budgetMonthId + "/transaction-review-queue"));
     }
 
-    public List<NotificationEvent> getNotifications(int budgetMonthId, int userId) throws ApiException {
+    public List<NotificationEvent> getNotifications(int budgetMonthId) throws ApiException {
         JSONArray json = client.get(
-                "/budget-months/" + budgetMonthId + "/notifications?user_id=" + userId
+                "/budget-months/" + budgetMonthId + "/notifications"
         ).optJSONArray("notifications");
         ArrayList<NotificationEvent> notifications = new ArrayList<>();
         if (json != null) {
@@ -64,9 +81,9 @@ public final class FamilyFinanceApi {
         return notifications;
     }
 
-    public int getUnreadNotificationCount(int budgetMonthId, int userId) throws ApiException {
+    public int getUnreadNotificationCount(int budgetMonthId) throws ApiException {
         return client.get(
-                "/budget-months/" + budgetMonthId + "/notifications/unread-count?user_id=" + userId
+                "/budget-months/" + budgetMonthId + "/notifications/unread-count"
         ).optInt("unread_count");
     }
 
@@ -115,10 +132,9 @@ public final class FamilyFinanceApi {
         }
     }
 
-    public void markNotificationRead(int notificationId, int userId) throws ApiException {
+    public void markNotificationRead(int notificationId) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
-            payload.put("user_id", userId);
             client.patch("/notifications/" + notificationId + "/read", payload);
         } catch (ApiException exception) {
             throw exception;
@@ -127,10 +143,9 @@ public final class FamilyFinanceApi {
         }
     }
 
-    public void markAllNotificationsRead(int budgetMonthId, int userId) throws ApiException {
+    public void markAllNotificationsRead(int budgetMonthId) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
-            payload.put("user_id", userId);
             client.patch("/budget-months/" + budgetMonthId + "/notifications/read-all", payload);
         } catch (ApiException exception) {
             throw exception;

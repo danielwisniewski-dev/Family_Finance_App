@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, and Milestone 5A/5B backend coach scaffolding.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, and Milestone 7 private household access.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -79,6 +79,17 @@ Milestone 5B adds a production-shaped OpenAI coach provider scaffold, disabled b
 - Tests use fake OpenAI transports only; they make no live OpenAI network calls
 - No OpenAI API key is required for tests, demo seed, or default local development
 
+Milestone 7 adds a lean private household access layer:
+
+- Local/demo username or email plus password login for Daniel and Kara
+- PBKDF2-SHA256 password hashes stored in SQLite
+- Backend-issued bearer tokens with only token hashes stored server-side
+- Protected financial routes derive current user and household from the bearer token
+- Notification unread/read state uses the authenticated user by default
+- Android login/logout with local MVP token storage and `Authorization: Bearer ...` API calls
+
+This is not production SaaS authentication. There is no public signup, password reset, email verification, OAuth, admin role system, or production identity-provider integration.
+
 Environment variables are placeholders only:
 
 - `PLAID_CLIENT_ID`
@@ -93,6 +104,8 @@ Environment variables are placeholders only:
 - `OPENAI_TIMEOUT_SECONDS`
 
 Do not commit `.env` files, real Plaid credentials, or real OpenAI API keys.
+
+Do not commit real passwords. The demo credentials below are local-only values for the seeded SQLite demo database.
 
 ## Database Schema Assumption
 
@@ -205,16 +218,38 @@ Health check:
 Invoke-RestMethod http://127.0.0.1:8080/health
 ```
 
+Login for protected API routes:
+
+```powershell
+$auth = Invoke-RestMethod http://127.0.0.1:8080/auth/login `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body '{"username":"daniel","password":"daniel-local-demo-only"}'
+
+$headers = @{ Authorization = "Bearer $($auth.token)" }
+Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/summary -Headers $headers
+```
+
 ## Run Demo Seed
 
 The demo seed rebuilds `work/demo_family_finance.sqlite` from scratch with safe local demo data:
 
 - One household and budget month
+- Daniel and Kara local-only demo users
 - Two included checking accounts and one excluded savings account
 - Budget categories for groceries, eating out, household supplies, and gas
 - Expected bills and payday data
 - Assigned and uncategorized mock transactions
-- No real Plaid credentials, real access tokens, production auth, AI, receipts, credit cards, MCP, or push notifications
+- No real Plaid credentials, real access tokens, production auth provider, AI, receipts, credit cards, MCP, or push notifications
+
+Local-only demo credentials:
+
+```text
+Daniel: username daniel / password daniel-local-demo-only
+Kara: username kara / password kara-local-demo-only
+```
+
+These passwords are intentionally fake demo values. The database stores password hashes, not plaintext passwords.
 
 Use Python from your PATH:
 
@@ -254,9 +289,11 @@ Verify locally from Windows:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/health
-Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/summary
-Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/transactions
-Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/transaction-review-queue
+$auth = Invoke-RestMethod http://127.0.0.1:8080/auth/login -Method Post -ContentType "application/json" -Body '{"username":"daniel","password":"daniel-local-demo-only"}'
+$headers = @{ Authorization = "Bearer $($auth.token)" }
+Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/summary -Headers $headers
+Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/transactions -Headers $headers
+Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/transaction-review-queue -Headers $headers
 ```
 
 ## Run Android App
@@ -267,8 +304,9 @@ Open Android Studio, then:
 2. Start a Pixel 8 emulator.
 3. Make sure the backend API is still running on Windows at `http://127.0.0.1:8080`.
 4. Run the `app` configuration.
-5. On the emulator, keep the backend URL set to `http://10.0.2.2:8080`.
+5. On the emulator login screen, keep the backend URL set to `http://10.0.2.2:8080`.
 6. Keep budget month ID set to `1` for the demo seed.
+7. Log in with `daniel` / `daniel-local-demo-only` or `kara` / `kara-local-demo-only`.
 
 Android emulators use `10.0.2.2` to reach the host machine loopback address. Use `http://10.0.2.2:8080` in the app, not `http://127.0.0.1:8080`, because `127.0.0.1` inside the emulator points to the emulator itself.
 
@@ -279,6 +317,8 @@ The app allows cleartext HTTP for this local MVP demo only. Do not treat that as
 With the demo API running and the Pixel 8 emulator open, verify:
 
 - Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
+- Login succeeds with local-only Daniel or Kara demo credentials.
+- Logout clears the local MVP token and returns to the login screen.
 - Monthly budget shows backend categories.
 - Tapping a budget category opens category detail.
 - Transactions shows seeded mock transactions.
@@ -294,9 +334,9 @@ Real in Milestone 4:
 - Deterministic backend financial calculations
 - Local mock/demo account and transaction data
 
-Placeholder or intentionally limited in Milestone 4:
+Placeholder or intentionally limited:
 
-- Login/household access is not production auth
+- Login/household access is a private local access layer, not production auth
 - Budget change approval is not implemented
 - Budget group names are not exposed by the current backend summary route
 - Funding edits are placeholder-only

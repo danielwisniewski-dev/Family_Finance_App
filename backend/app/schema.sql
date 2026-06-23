@@ -10,9 +10,19 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     household_id INTEGER NOT NULL REFERENCES households(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
+    username TEXT,
     email TEXT,
+    password_hash TEXT,
     role TEXT NOT NULL DEFAULT 'spouse',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS budget_months (
@@ -190,6 +200,13 @@ CREATE TABLE IF NOT EXISTS plaid_sync_errors (
 );
 
 CREATE INDEX IF NOT EXISTS idx_plaid_items_household ON plaid_items(household_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
+    ON users(username)
+    WHERE username IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+    ON users(email)
+    WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_budget_categories_group ON budget_categories(budget_group_id);
 CREATE INDEX IF NOT EXISTS idx_cash_accounts_budget_month ON cash_accounts(budget_month_id);
 CREATE INDEX IF NOT EXISTS idx_cash_accounts_plaid_item ON cash_accounts(plaid_item_id);

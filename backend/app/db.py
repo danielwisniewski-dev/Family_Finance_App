@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .auth import hash_password, hash_session_token, new_session_token, verify_password
 from .domain import (
     AccountLine,
     BudgetSummary,
@@ -66,6 +67,8 @@ class BudgetRepository:
         schema_path = Path(__file__).with_name("schema.sql")
         with self.connect() as connection:
             connection.executescript(schema_path.read_text(encoding="utf-8"))
+            ensure_column(connection, "users", "username", "TEXT")
+            ensure_column(connection, "users", "password_hash", "TEXT")
             ensure_column(connection, "account_transactions", "reviewed", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "ignored", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "ignored_reason", "TEXT")
@@ -74,11 +77,109 @@ class BudgetRepository:
         with self.connect() as connection:
             household_id = insert_and_return_id(connection, "INSERT INTO households(name) VALUES (?)", (name,))
             for spouse in spouses:
+                password_hash = spouse.get("password_hash")
+                if password_hash is None and spouse.get("password"):
+                    password_hash = hash_password(spouse["password"])
                 connection.execute(
-                    "INSERT INTO users(household_id, name, email, role) VALUES (?, ?, ?, ?)",
-                    (household_id, spouse["name"], spouse.get("email"), spouse.get("role", "spouse")),
+                    """
+                    INSERT INTO users(household_id, name, username, email, password_hash, role)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        household_id,
+                        spouse["name"],
+                        normalize_login(spouse.get("username")),
+                        normalize_login(spouse.get("email")),
+                        password_hash,
+                        spouse.get("role", "spouse"),
+                    ),
                 )
             return household_id
+
+    def create_local_user(
+        self,
+        *,
+        household_id: int,
+        name: str,
+        username: str,
+        email: str | None,
+        password: str,
+        role: str = "spouse",
+    ) -> int:
+        with self.connect() as connection:
+            self._require_household(connection, household_id)
+            return insert_and_return_id(
+                connection,
+                """
+                INSERT INTO users(household_id, name, username, email, password_hash, role)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    household_id,
+                    name,
+                    require_login_value(username, "username"),
+                    normalize_login(email),
+                    hash_password(password),
+                    role,
+                ),
+            )
+
+    def authenticate_local_user(self, login: str, password: str) -> dict[str, Any] | None:
+        cleaned = require_login_value(login, "login")
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    u.*,
+                    h.name AS household_name
+                FROM users u
+                JOIN households h ON h.id = u.household_id
+                WHERE lower(u.username) = ? OR lower(u.email) = ?
+                """,
+                (cleaned, cleaned),
+            ).fetchone()
+            if row is None or not verify_password(password, row["password_hash"]):
+                return None
+            token = new_session_token()
+            connection.execute(
+                "INSERT INTO auth_sessions(user_id, token_hash) VALUES (?, ?)",
+                (row["id"], hash_session_token(token)),
+            )
+            return {
+                "token": token,
+                "user": safe_user_from_row(row),
+                "household": safe_household_from_user_row(row),
+            }
+
+    def auth_context_for_token(self, token: str) -> dict[str, Any] | None:
+        token = (token or "").strip()
+        if not token:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    u.*,
+                    h.name AS household_name
+                FROM auth_sessions s
+                JOIN users u ON u.id = s.user_id
+                JOIN households h ON h.id = u.household_id
+                WHERE s.token_hash = ?
+                """,
+                (hash_session_token(token),),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE auth_sessions SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = ?",
+                (hash_session_token(token),),
+            )
+            return {
+                "user_id": int(row["id"]),
+                "household_id": int(row["household_id"]),
+                "user": safe_user_from_row(row),
+                "household": safe_household_from_user_row(row),
+            }
 
     def create_budget_month(
         self,
@@ -183,6 +284,91 @@ class BudgetRepository:
         if row is None:
             raise LookupError(f"Budget month {budget_month_id} not found")
         return int(row["household_id"])
+
+    def require_budget_month_access(self, budget_month_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM budget_months WHERE id = ? AND household_id = ?",
+                (budget_month_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Budget month is not available to this household")
+
+    def require_account_access(self, account_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT a.id
+                FROM cash_accounts a
+                JOIN budget_months b ON b.id = a.budget_month_id
+                WHERE a.id = ? AND b.household_id = ?
+                """,
+                (account_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Account is not available to this household")
+
+    def require_category_access(self, category_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT c.id
+                FROM budget_categories c
+                JOIN budget_groups g ON g.id = c.budget_group_id
+                JOIN budget_months b ON b.id = g.budget_month_id
+                WHERE c.id = ? AND b.household_id = ?
+                """,
+                (category_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Category is not available to this household")
+
+    def require_budget_group_access(self, budget_group_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT g.id
+                FROM budget_groups g
+                JOIN budget_months b ON b.id = g.budget_month_id
+                WHERE g.id = ? AND b.household_id = ?
+                """,
+                (budget_group_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Budget group is not available to this household")
+
+    def require_transaction_access(self, transaction_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT t.id
+                FROM account_transactions t
+                JOIN cash_accounts a ON a.id = t.cash_account_id
+                JOIN budget_months b ON b.id = a.budget_month_id
+                WHERE t.id = ? AND b.household_id = ?
+                """,
+                (transaction_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Transaction is not available to this household")
+
+    def require_notification_access(self, notification_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM notification_events WHERE id = ? AND household_id = ?",
+                (notification_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Notification is not available to this household")
+
+    def require_plaid_item_access(self, plaid_item_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM plaid_items WHERE id = ? AND household_id = ?",
+                (plaid_item_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Plaid item is not available to this household")
 
     def set_account_included(self, account_id: int, included_in_cash_reality: bool) -> None:
         self.update_cash_account(
@@ -1475,6 +1661,14 @@ class BudgetRepository:
         if row is None:
             raise ValueError("actor_user_id must belong to the household")
 
+    def _require_household(self, connection: sqlite3.Connection, household_id: int) -> None:
+        row = connection.execute(
+            "SELECT id FROM households WHERE id = ?",
+            (household_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Household {household_id} not found")
+
     def _require_notification_event(self, connection: sqlite3.Connection, event_id: int) -> sqlite3.Row:
         row = connection.execute(
             "SELECT * FROM notification_events WHERE id = ?",
@@ -1825,6 +2019,38 @@ def ensure_column(connection: sqlite3.Connection, table_name: str, column_name: 
     }
     if column_name not in columns:
         connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def normalize_login(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().casefold()
+    return cleaned or None
+
+
+def require_login_value(value: str | None, field_name: str) -> str:
+    cleaned = normalize_login(value)
+    if cleaned is None:
+        raise ValueError(f"{field_name} is required")
+    return cleaned
+
+
+def safe_user_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "household_id": int(row["household_id"]),
+        "name": row["name"],
+        "username": row["username"],
+        "email": row["email"],
+        "role": row["role"],
+    }
+
+
+def safe_household_from_user_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["household_id"]),
+        "name": row["household_name"],
+    }
 
 
 def budget_amount_cents(transaction_amount_cents: int) -> int:

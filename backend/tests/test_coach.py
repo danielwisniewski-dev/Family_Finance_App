@@ -27,6 +27,7 @@ class CoachApiTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.auth_token: str | None = None
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -258,17 +259,34 @@ class CoachApiTests(unittest.TestCase):
         self.assertEqual(invalid_amount["error"], "amount_cents must be an integer")
 
     def seed_budget(self, *, balance_cents: int, grocery_planned_cents: int) -> dict[str, int]:
-        household = self.post(
-            "/households",
-            {
-                "name": "Coach Household",
-                "spouses": [{"name": "A"}, {"name": "B"}],
-            },
+        household_id = ApiHandler.repository.create_household(
+            "Coach Household",
+            spouses=[
+                {
+                    "name": "A",
+                    "username": "coach-a",
+                    "email": "coach-a@example.test",
+                    "password": "coach-a-password",
+                },
+                {
+                    "name": "B",
+                    "username": "coach-b",
+                    "email": "coach-b@example.test",
+                    "password": "coach-b-password",
+                },
+            ],
+        )
+        self.auth_token = str(
+            self.post(
+                "/auth/login",
+                {"username": "coach-a", "password": "coach-a-password"},
+                use_auth=False,
+            )["token"]
         )
         budget_month = self.post(
             "/budget-months",
             {
-                "household_id": household["id"],
+                "household_id": household_id,
                 "month": "2026-06",
                 "included_account_balance_cents": balance_cents,
             },
@@ -317,19 +335,20 @@ class CoachApiTests(unittest.TestCase):
         self.post(
             "/paydays",
             {
-                "household_id": household["id"],
+                "household_id": household_id,
                 "payday_date": "2026-06-28",
             },
         )
         return {
-            "household_id": household["id"],
+            "household_id": household_id,
             "budget_month_id": budget_month["id"],
             "groceries_id": groceries["id"],
             "household_supplies_id": household_supplies["id"],
         }
 
     def get(self, path: str) -> dict[str, object]:
-        with urlopen(f"{self.base_url}{path}", timeout=5) as response:
+        request = Request(f"{self.base_url}{path}", headers=self.auth_headers(), method="GET")
+        with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def post(
@@ -338,11 +357,12 @@ class CoachApiTests(unittest.TestCase):
         payload: dict[str, object],
         *,
         expect_error: bool = False,
+        use_auth: bool = True,
     ) -> dict[str, object]:
         request = Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self.auth_headers(use_auth) | {"Content-Type": "application/json"},
             method="POST",
         )
         try:
@@ -356,6 +376,11 @@ class CoachApiTests(unittest.TestCase):
         if expect_error:
             self.fail(f"Expected {path} to return an error")
         return result
+
+    def auth_headers(self, use_auth: bool = True) -> dict[str, str]:
+        if not use_auth or self.auth_token is None:
+            return {}
+        return {"Authorization": f"Bearer {self.auth_token}"}
 
 
 class OpenAICoachProviderTests(unittest.TestCase):
@@ -483,8 +508,12 @@ class OpenAICoachProviderTests(unittest.TestCase):
                 included_in_cash_reality=True,
             )
 
-            summary_before = get_json(base_url, f"/budget-months/{fixture['budget_month_id']}/summary?today=2026-06-21")
-            transaction_before = get_json(base_url, f"/transactions/{transaction_id}")
+            summary_before = get_json(
+                base_url,
+                f"/budget-months/{fixture['budget_month_id']}/summary?today=2026-06-21",
+                fixture["auth_token"],
+            )
+            transaction_before = get_json(base_url, f"/transactions/{transaction_id}", fixture["auth_token"])
             coach_response = post_json(
                 base_url,
                 "/coach/safe-to-spend",
@@ -494,9 +523,14 @@ class OpenAICoachProviderTests(unittest.TestCase):
                     "amount_cents": 7_500,
                     "today": "2026-06-21",
                 },
+                fixture["auth_token"],
             )
-            summary_after = get_json(base_url, f"/budget-months/{fixture['budget_month_id']}/summary?today=2026-06-21")
-            transaction_after = get_json(base_url, f"/transactions/{transaction_id}")
+            summary_after = get_json(
+                base_url,
+                f"/budget-months/{fixture['budget_month_id']}/summary?today=2026-06-21",
+                fixture["auth_token"],
+            )
+            transaction_after = get_json(base_url, f"/transactions/{transaction_id}", fixture["auth_token"])
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -558,39 +592,67 @@ def valid_openai_coach_payload() -> dict[str, object]:
     }
 
 
-def get_json(base_url: str, path: str) -> dict[str, object]:
-    with urlopen(f"{base_url}{path}", timeout=5) as response:
+def get_json(base_url: str, path: str, auth_token: str | None = None) -> dict[str, object]:
+    request = Request(
+        f"{base_url}{path}",
+        headers=auth_headers(auth_token),
+        method="GET",
+    )
+    with urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def post_json(base_url: str, path: str, payload: dict[str, object]) -> dict[str, object]:
+def post_json(base_url: str, path: str, payload: dict[str, object], auth_token: str | None = None) -> dict[str, object]:
     request = Request(
         f"{base_url}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=auth_headers(auth_token) | {"Content-Type": "application/json"},
         method="POST",
     )
     with urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def seed_budget_for_base_url(base_url: str) -> dict[str, int]:
-    household = post_json(
-        base_url,
-        "/households",
-        {
-            "name": "OpenAI Coach Household",
-            "spouses": [{"name": "A"}, {"name": "B"}],
-        },
+def auth_headers(auth_token: str | None) -> dict[str, str]:
+    if auth_token is None:
+        return {}
+    return {"Authorization": f"Bearer {auth_token}"}
+
+
+def seed_budget_for_base_url(base_url: str) -> dict[str, object]:
+    household_id = ApiHandler.repository.create_household(
+        "OpenAI Coach Household",
+        spouses=[
+            {
+                "name": "A",
+                "username": "openai-coach-a",
+                "email": "openai-coach-a@example.test",
+                "password": "openai-coach-a-password",
+            },
+            {
+                "name": "B",
+                "username": "openai-coach-b",
+                "email": "openai-coach-b@example.test",
+                "password": "openai-coach-b-password",
+            },
+        ],
+    )
+    auth_token = str(
+        post_json(
+            base_url,
+            "/auth/login",
+            {"username": "openai-coach-a", "password": "openai-coach-a-password"},
+        )["token"]
     )
     budget_month = post_json(
         base_url,
         "/budget-months",
         {
-            "household_id": household["id"],
+            "household_id": household_id,
             "month": "2026-06",
             "included_account_balance_cents": 100_000,
         },
+        auth_token,
     )
     post_json(
         base_url,
@@ -601,6 +663,7 @@ def seed_budget_for_base_url(base_url: str) -> dict[str, int]:
             "kind": "main",
             "planned_cents": 300_000,
         },
+        auth_token,
     )
     group = post_json(
         base_url,
@@ -609,6 +672,7 @@ def seed_budget_for_base_url(base_url: str) -> dict[str, int]:
             "budget_month_id": budget_month["id"],
             "name": "Everyday",
         },
+        auth_token,
     )
     groceries = post_json(
         base_url,
@@ -618,6 +682,7 @@ def seed_budget_for_base_url(base_url: str) -> dict[str, int]:
             "name": "Groceries",
             "planned_cents": 50_000,
         },
+        auth_token,
     )
     household_supplies = post_json(
         base_url,
@@ -627,6 +692,7 @@ def seed_budget_for_base_url(base_url: str) -> dict[str, int]:
             "name": "Household Supplies",
             "planned_cents": 20_000,
         },
+        auth_token,
     )
     post_json(
         base_url,
@@ -637,20 +703,23 @@ def seed_budget_for_base_url(base_url: str) -> dict[str, int]:
             "amount_cents": 20_000,
             "due_on": "2026-06-24",
         },
+        auth_token,
     )
     post_json(
         base_url,
         "/paydays",
         {
-            "household_id": household["id"],
+            "household_id": household_id,
             "payday_date": "2026-06-28",
         },
+        auth_token,
     )
     return {
-        "household_id": household["id"],
+        "household_id": household_id,
         "budget_month_id": budget_month["id"],
         "groceries_id": groceries["id"],
         "household_supplies_id": household_supplies["id"],
+        "auth_token": auth_token,
     }
 
 

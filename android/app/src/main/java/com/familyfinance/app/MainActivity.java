@@ -29,6 +29,8 @@ import com.familyfinance.app.model.TransactionDetail;
 import com.familyfinance.app.state.BudgetScreenState;
 import com.familyfinance.app.state.MoneyFormatter;
 
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -38,7 +40,6 @@ public final class MainActivity extends Activity {
     private static final String PREFS = "family_finance";
     private static final String DEFAULT_BASE_URL = "http://10.0.2.2:8080";
     private static final int DEFAULT_BUDGET_MONTH_ID = 1;
-    private static final int DEFAULT_USER_ID = 1;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -46,7 +47,11 @@ public final class MainActivity extends Activity {
     private LinearLayout root;
     private String baseUrl;
     private int budgetMonthId;
-    private int userId;
+    private int currentUserId;
+    private int householdId;
+    private String currentUserName;
+    private String householdName;
+    private String authToken;
     private FamilyFinanceApi api;
     private BudgetSummary summary;
     private List<TransactionDetail> transactions = new ArrayList<>();
@@ -59,8 +64,12 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         loadPreferences();
-        showLoading("Loading dashboard...");
-        refreshData(this::showDashboard);
+        if (authToken == null || authToken.isEmpty()) {
+            showLogin(null);
+        } else {
+            showLoading("Loading dashboard...");
+            refreshData(this::showDashboard);
+        }
     }
 
     @Override
@@ -73,18 +82,52 @@ public final class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         baseUrl = prefs.getString("base_url", DEFAULT_BASE_URL);
         budgetMonthId = prefs.getInt("budget_month_id", DEFAULT_BUDGET_MONTH_ID);
-        userId = prefs.getInt("user_id", DEFAULT_USER_ID);
-        api = new FamilyFinanceApi(baseUrl);
+        authToken = prefs.getString("auth_token", "");
+        currentUserId = prefs.getInt("current_user_id", 0);
+        householdId = prefs.getInt("household_id", 0);
+        currentUserName = prefs.getString("current_user_name", "");
+        householdName = prefs.getString("household_name", "");
+        api = new FamilyFinanceApi(baseUrl, authToken);
     }
 
-    private void savePreferences(String newBaseUrl, int newBudgetMonthId, int newUserId) {
+    private void saveConnectionPreferences(String newBaseUrl, int newBudgetMonthId) {
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putString("base_url", newBaseUrl)
                 .putInt("budget_month_id", newBudgetMonthId)
-                .putInt("user_id", newUserId)
                 .apply();
         loadPreferences();
+    }
+
+    private void saveAuthSession(String token, JSONObject user, JSONObject household) {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString("auth_token", token)
+                .putInt("current_user_id", user.optInt("id"))
+                .putString("current_user_name", user.optString("name"))
+                .putInt("household_id", household.optInt("id"))
+                .putString("household_name", household.optString("name"))
+                .apply();
+        loadPreferences();
+    }
+
+    private void logout() {
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .remove("auth_token")
+                .remove("current_user_id")
+                .remove("current_user_name")
+                .remove("household_id")
+                .remove("household_name")
+                .apply();
+        loadPreferences();
+        summary = null;
+        transactions = new ArrayList<>();
+        reviewQueue = new ArrayList<>();
+        accounts = new ArrayList<>();
+        notifications = new ArrayList<>();
+        unreadNotificationCount = 0;
+        showLogin("Logged out.");
     }
 
     private void refreshData(Runnable afterLoad) {
@@ -94,8 +137,8 @@ public final class MainActivity extends Activity {
                 List<TransactionDetail> loadedTransactions = api.getTransactions(budgetMonthId);
                 List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(budgetMonthId);
                 List<CashAccount> loadedAccounts = api.getAccounts(budgetMonthId);
-                List<NotificationEvent> loadedNotifications = api.getNotifications(budgetMonthId, userId);
-                int loadedUnreadNotificationCount = api.getUnreadNotificationCount(budgetMonthId, userId);
+                List<NotificationEvent> loadedNotifications = api.getNotifications(budgetMonthId);
+                int loadedUnreadNotificationCount = api.getUnreadNotificationCount(budgetMonthId);
                 mainHandler.post(() -> {
                     summary = loadedSummary;
                     transactions = loadedTransactions;
@@ -111,9 +154,78 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void showLogin(String message) {
+        beginScreen("Login");
+        if (message != null && !message.trim().isEmpty()) {
+            addBody(message.trim());
+        }
+        addSection("Backend connection");
+        EditText baseUrlInput = new EditText(this);
+        baseUrlInput.setSingleLine(true);
+        baseUrlInput.setText(baseUrl);
+        root.addView(baseUrlInput);
+
+        EditText budgetMonthInput = new EditText(this);
+        budgetMonthInput.setHint("Budget month ID");
+        budgetMonthInput.setSingleLine(true);
+        budgetMonthInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        budgetMonthInput.setText(Integer.toString(budgetMonthId));
+        root.addView(budgetMonthInput);
+
+        addSection("Private household login");
+        EditText usernameInput = new EditText(this);
+        usernameInput.setHint("Username or email");
+        usernameInput.setSingleLine(true);
+        usernameInput.setText("daniel");
+        root.addView(usernameInput);
+
+        EditText passwordInput = new EditText(this);
+        passwordInput.setHint("Password");
+        passwordInput.setSingleLine(true);
+        passwordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        root.addView(passwordInput);
+
+        addButton("Log in", () -> {
+            int parsedBudgetMonthId;
+            try {
+                parsedBudgetMonthId = Integer.parseInt(budgetMonthInput.getText().toString());
+            } catch (NumberFormatException exception) {
+                toast("Budget month ID must be a number.");
+                return;
+            }
+            String newBaseUrl = baseUrlInput.getText().toString();
+            String username = usernameInput.getText().toString().trim();
+            String password = passwordInput.getText().toString();
+            if (username.isEmpty() || password.isEmpty()) {
+                toast("Enter username/email and password.");
+                return;
+            }
+            showLoading("Logging in...");
+            executor.execute(() -> {
+                try {
+                    FamilyFinanceApi loginApi = new FamilyFinanceApi(newBaseUrl);
+                    JSONObject auth = loginApi.login(username, password);
+                    mainHandler.post(() -> {
+                        saveConnectionPreferences(newBaseUrl, parsedBudgetMonthId);
+                        saveAuthSession(
+                                auth.optString("token"),
+                                auth.optJSONObject("user") == null ? new JSONObject() : auth.optJSONObject("user"),
+                                auth.optJSONObject("household") == null ? new JSONObject() : auth.optJSONObject("household")
+                        );
+                        showLoading("Loading dashboard...");
+                        refreshData(this::showDashboard);
+                    });
+                } catch (Exception exception) {
+                    mainHandler.post(() -> showLogin(exception.getMessage() == null ? exception.toString() : exception.getMessage()));
+                }
+            });
+        });
+    }
+
     private void showDashboard() {
         beginScreen("Dashboard");
-        addFact("Backend", baseUrl + "  |  Budget month ID " + budgetMonthId + "  |  User ID " + userId);
+        addFact("Backend", baseUrl + "  |  Budget month ID " + budgetMonthId);
+        addFact("Signed in", blankAsDash(currentUserName) + "  |  " + blankAsDash(householdName));
         if (summary == null) {
             addBody("No summary loaded.");
             addNav();
@@ -128,7 +240,7 @@ public final class MainActivity extends Activity {
         }
         addMetric("Uncategorized transactions", Integer.toString(reviewQueue.size()));
         addMetric("Unread notifications", Integer.toString(unreadNotificationCount));
-        addFact("Notification viewer", "Unread state is scoped to user ID " + userId);
+        addFact("Notification viewer", "Unread state is scoped to the signed-in user.");
         addButton("Notifications / accountability", this::showNotifications);
 
         addSection("Categories needing attention");
@@ -149,10 +261,10 @@ public final class MainActivity extends Activity {
     private void showNotifications() {
         beginScreen("Notifications");
         addMetric("Unread", Integer.toString(unreadNotificationCount));
-        addFact("Viewer user ID", Integer.toString(userId));
+        addFact("Viewer", blankAsDash(currentUserName));
         addButton("Mark all read", () -> runMutation(
                 "Marking notifications read...",
-                () -> api.markAllNotificationsRead(budgetMonthId, userId),
+                () -> api.markAllNotificationsRead(budgetMonthId),
                 () -> refreshData(this::showNotifications)
         ));
         addSection("Accountability events");
@@ -363,23 +475,18 @@ public final class MainActivity extends Activity {
         budgetMonthInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         budgetMonthInput.setText(Integer.toString(budgetMonthId));
         root.addView(budgetMonthInput);
-        EditText userIdInput = new EditText(this);
-        userIdInput.setHint("Viewer user ID for notification read state");
-        userIdInput.setSingleLine(true);
-        userIdInput.setInputType(InputType.TYPE_CLASS_NUMBER);
-        userIdInput.setText(Integer.toString(userId));
-        root.addView(userIdInput);
+        addFact("Signed in", blankAsDash(currentUserName) + "  |  " + blankAsDash(householdName));
+        addFact("Current user ID", currentUserId == 0 ? "-" : Integer.toString(currentUserId));
+        addFact("Household ID", householdId == 0 ? "-" : Integer.toString(householdId));
         addButton("Save and reload", () -> {
             int parsedId;
-            int parsedUserId;
             try {
                 parsedId = Integer.parseInt(budgetMonthInput.getText().toString());
-                parsedUserId = Integer.parseInt(userIdInput.getText().toString());
             } catch (NumberFormatException exception) {
-                toast("Budget month ID and user ID must be numbers.");
+                toast("Budget month ID must be a number.");
                 return;
             }
-            savePreferences(baseUrlInput.getText().toString(), parsedId, parsedUserId);
+            saveConnectionPreferences(baseUrlInput.getText().toString(), parsedId);
             showLoading("Reloading...");
             refreshData(this::showDashboard);
         });
@@ -388,6 +495,7 @@ public final class MainActivity extends Activity {
                 () -> api.health(),
                 () -> toast("Backend health check passed.")
         ));
+        addButton("Log out", this::logout);
 
         addSection("Account inclusion");
         if (accounts.isEmpty()) {
@@ -427,7 +535,7 @@ public final class MainActivity extends Activity {
         if (!notification.isRead()) {
             addButton("Mark read", () -> runMutation(
                     "Marking notification read...",
-                    () -> api.markNotificationRead(notification.id, userId),
+                    () -> api.markNotificationRead(notification.id),
                     () -> refreshData(this::showNotifications)
             ));
         }
@@ -469,6 +577,7 @@ public final class MainActivity extends Activity {
         beginScreen("Error");
         addWarning(context);
         addBody(exception.getMessage() == null ? exception.toString() : exception.getMessage());
+        addButton("Log in", () -> showLogin(null));
         addButton("Retry dashboard", () -> refreshData(this::showDashboard));
         addButton("Settings", this::showSettings);
     }
@@ -482,6 +591,7 @@ public final class MainActivity extends Activity {
         addButton("Safe to spend", this::showSafeToSpend);
         addButton("Notifications", this::showNotifications);
         addButton("Accounts / settings", this::showSettings);
+        addButton("Log out", this::logout);
     }
 
     private void addMetric(String label, String value) {

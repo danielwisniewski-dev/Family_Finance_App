@@ -7,6 +7,10 @@ from .db import BudgetRepository, safe_to_spend_to_dict
 from .domain import format_money
 
 
+DEMO_DANIEL_PASSWORD = "daniel-local-demo-only"
+DEMO_KARA_PASSWORD = "kara-local-demo-only"
+
+
 def main() -> None:
     db_path = Path("work/demo_family_finance.sqlite")
     if db_path.exists():
@@ -16,12 +20,29 @@ def main() -> None:
     repository.initialize()
 
     household_id = repository.create_household(
-        "Demo Household",
+        "Daniel and Kara Household",
         spouses=(
-            {"name": "Alex", "email": "alex@example.test"},
-            {"name": "Jordan", "email": "jordan@example.test"},
+            {
+                "name": "Daniel",
+                "username": "daniel",
+                "email": "daniel@example.test",
+                "password": DEMO_DANIEL_PASSWORD,
+            },
+            {
+                "name": "Kara",
+                "username": "kara",
+                "email": "kara@example.test",
+                "password": DEMO_KARA_PASSWORD,
+            },
         ),
     )
+    with repository.connect() as connection:
+        daniel_user_id = int(
+            connection.execute(
+                "SELECT id FROM users WHERE username = ?",
+                ("daniel",),
+            ).fetchone()["id"]
+        )
     budget_month_id = repository.create_budget_month(
         household_id=household_id,
         month="2026-06",
@@ -165,6 +186,7 @@ def main() -> None:
         purchase_amount_cents=3_000,
         today=date(2026, 6, 21),
         urgency="planned_want",
+        actor_user_id=daniel_user_id,
     )
 
     print("Safe-to-spend result")
@@ -173,8 +195,11 @@ def main() -> None:
     print(result.required_phrase)
     print(f"Demo database: {db_path}")
     print(f"Budget month ID: {budget_month_id}")
+    print("Local-only demo credentials:")
+    print(f"  Daniel: username daniel / password {DEMO_DANIEL_PASSWORD}")
+    print(f"  Kara: username kara / password {DEMO_KARA_PASSWORD}")
     print("Android emulator backend URL: http://10.0.2.2:8080")
-    print("Seed includes categories, accounts, assigned transactions, and uncategorized review items.")
+    print("Seed includes Daniel/Kara users, categories, accounts, assigned transactions, and uncategorized review items.")
     print(safe_to_spend_to_dict(result))
 
 

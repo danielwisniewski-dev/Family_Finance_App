@@ -13,9 +13,15 @@ import java.nio.charset.StandardCharsets;
 
 public final class JsonHttpClient {
     private final String baseUrl;
+    private final String bearerToken;
 
     public JsonHttpClient(String baseUrl) {
+        this(baseUrl, null);
+    }
+
+    public JsonHttpClient(String baseUrl, String bearerToken) {
         this.baseUrl = trimTrailingSlash(baseUrl);
+        this.bearerToken = bearerToken == null ? "" : bearerToken.trim();
     }
 
     public JSONObject get(String path) throws ApiException {
@@ -39,6 +45,9 @@ public final class JsonHttpClient {
             connection.setConnectTimeout(5_000);
             connection.setReadTimeout(5_000);
             connection.setRequestProperty("Accept", "application/json");
+            if (!bearerToken.isEmpty()) {
+                connection.setRequestProperty("Authorization", "Bearer " + bearerToken);
+            }
             if (payload != null) {
                 connection.setDoOutput(true);
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
@@ -53,6 +62,9 @@ public final class JsonHttpClient {
             String body = readBody(status >= 400 ? connection.getErrorStream() : connection.getInputStream());
             JSONObject json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
             if (status >= 400) {
+                if (status == 401 && !"/auth/login".equals(path)) {
+                    throw new ApiException("Login required or session expired. Please log in again.");
+                }
                 throw new ApiException(json.optString("error", "API error " + status));
             }
             return json;
