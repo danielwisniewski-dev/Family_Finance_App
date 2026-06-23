@@ -383,11 +383,51 @@ Forbidden in Milestone 4:
 
 ---
 
-### Milestone 5 — Agent Advisor Layer
+### Milestone 5A - Coach Scaffolding
 
 Goal:
 
-Add AI explanation without letting AI own financial truth.
+Add the backend coach architecture without connecting to a real AI provider.
+
+The coach should use:
+
+- Android app -> backend coach endpoint -> coach service -> provider interface -> mock provider
+- Backend-calculated fact packets only
+- Structured, predictable coach responses
+- Draft budget change suggestions only
+
+The mock provider is deterministic and does not require an OpenAI, Anthropic, Gemini, or other AI API key.
+
+The coach may:
+
+- Explain safe-to-spend results
+- Suggest caution/no/discuss
+- Draft budget changes for later approval
+
+The coach may not:
+
+- Make budget changes without approval
+- Recategorize transactions
+- Mark transactions reviewed or ignored
+- Create, archive, or delete categories
+- Access Plaid directly
+- Invent balances, bills, payday dates, or transactions
+
+### Milestone 5B - OpenAI Provider Scaffold
+
+Goal:
+
+Add production-shaped OpenAI coach provider integration without making it the default provider.
+
+The provider should:
+
+- Stay disabled unless `COACH_PROVIDER=openai`
+- Require `OPENAI_API_KEY` only when OpenAI is explicitly selected
+- Use `OPENAI_MODEL` and `OPENAI_TIMEOUT_SECONDS`
+- Receive only backend-produced fact packets
+- Request structured JSON output and map it into the existing coach response schema
+- Return sanitized fallback responses on timeout or provider error
+- Avoid live OpenAI calls in tests and demos
 
 The agent should use backend-calculated numbers only.
 
