@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, and Milestone 4 Android MVP screens.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, and Milestone 5A backend coach scaffolding.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -56,6 +56,18 @@ Milestone 4 adds Android MVP screens that call the local backend API:
 - Transaction category assignment, reviewed/unreviewed, and ignore/unignore actions where supported by the backend
 - Accounts/settings screen with backend URL, budget month ID, health check, and account inclusion display
 
+Milestone 5A adds backend-first AI coach scaffolding without connecting to a real AI API:
+
+- `POST /coach/safe-to-spend` returns the deterministic backend safe-to-spend result plus a structured coach explanation
+- `POST /coach/budget-change-suggestion` returns a draft budget change proposal only
+- Coach service and provider interface separate backend facts from coach wording
+- `MockCoachProvider` gives deterministic responses for tests and demos
+- A future `OpenAICoachProvider` placeholder exists but intentionally makes no API calls
+- Coach responses include summary, recommendation, tone, warning level, facts used, tradeoffs, suggested actions, spouse discussion flag, proposed budget change, confidence, and limitations
+- Tests verify the coach uses backend-calculated facts, includes the required safe-to-spend phrase, does not mutate budget/category/transaction data, and does not expose Plaid token references
+
+Milestone 5A is intentionally backend-first. Android coach display, chatbot UI, conversation history, autonomous actions, and push notifications remain deferred.
+
 Environment variables are placeholders only:
 
 - `PLAID_CLIENT_ID`
@@ -75,7 +87,7 @@ Current assumption: this is still a dev-only SQLite schema rebuild workflow. Dur
 
 Deferred by design:
 
-- AI agent explanations
+- Real AI provider integration
 - Push notifications
 - Credit cards
 - Receipt scanning
@@ -276,3 +288,48 @@ Placeholder or intentionally limited in Milestone 4:
 - Transaction split editing is read-only in Android
 - Plaid remains scaffolding/mock behavior only
 - AI, receipt scanning, credit cards, MCP, and push notifications are not included
+
+## Coach API Notes
+
+Milestone 5A coach routes are mock/deterministic backend routes:
+
+```text
+POST /coach/safe-to-spend
+POST /coach/budget-change-suggestion
+```
+
+Safe-to-spend coach payload:
+
+```json
+{
+  "budget_month_id": 1,
+  "category_id": 1,
+  "amount_cents": 7500,
+  "today": "2026-06-21",
+  "urgency": "planned_want",
+  "purpose": "weekly groceries"
+}
+```
+
+The response includes both `safe_to_spend` and `coach`. The deterministic safe-to-spend result remains the source of truth, and the coach explanation must include:
+
+```text
+After upcoming bills, you would have about $___ left for ___ days until payday.
+```
+
+Budget change suggestion payload:
+
+```json
+{
+  "budget_month_id": 1,
+  "from_category_id": 2,
+  "to_category_id": 1,
+  "amount_cents": 5000,
+  "today": "2026-06-21",
+  "purpose": "cover grocery overage"
+}
+```
+
+This returns a draft `proposed_budget_change` only. It does not apply the change, update category funding, recategorize transactions, mark transactions reviewed, create/archive categories, or access Plaid.
+
+No OpenAI, Anthropic, Gemini, Agents SDK, MCP/tool layer, real API key, or `.env` file is required for Milestone 5A.

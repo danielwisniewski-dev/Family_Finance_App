@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .coach import (
+    BudgetChangeSuggestionRequest,
+    CoachService,
+    SafeToSpendCoachRequest,
+    coach_response_to_dict,
+)
 from .db import BudgetRepository, account_to_dict, safe_to_spend_to_dict, summary_to_dict, transaction_detail_to_dict
 from .plaid import (
     PlaidConnectionService,
@@ -21,6 +27,7 @@ from .plaid import (
 class ApiHandler(BaseHTTPRequestHandler):
     repository: BudgetRepository
     plaid_service: PlaidConnectionService
+    coach_service: CoachService
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -141,6 +148,53 @@ class ApiHandler(BaseHTTPRequestHandler):
                     urgency=payload.get("urgency", "planned_want"),
                 )
                 self.send_json(safe_to_spend_to_dict(result))
+                return
+            if parsed.path == "/coach/safe-to-spend":
+                amount_cents = require_int(payload, "amount_cents", fallback_key="purchase_amount_cents")
+                category_id = require_int(payload, "category_id")
+                budget_month_id = require_int(payload, "budget_month_id")
+                result = self.repository.safe_to_spend(
+                    budget_month_id=budget_month_id,
+                    category_id=category_id,
+                    purchase_amount_cents=amount_cents,
+                    today=parse_date(payload.get("today", date.today().isoformat())),
+                    urgency=payload.get("urgency", "planned_want"),
+                )
+                coach_response = self.coach_service.explain_safe_to_spend(
+                    result=result,
+                    request=SafeToSpendCoachRequest(
+                        amount_cents=amount_cents,
+                        category_id=category_id,
+                        note=payload.get("note"),
+                        purpose=payload.get("purpose"),
+                    ),
+                )
+                self.send_json(
+                    {
+                        "safe_to_spend": safe_to_spend_to_dict(result),
+                        "coach": coach_response_to_dict(coach_response),
+                    }
+                )
+                return
+            if parsed.path == "/coach/budget-change-suggestion":
+                budget_month_id = require_int(payload, "budget_month_id")
+                amount_cents = require_int(payload, "amount_cents")
+                summary = self.repository.get_summary(
+                    budget_month_id,
+                    parse_date(payload.get("today", date.today().isoformat())),
+                )
+                coach_response = self.coach_service.suggest_budget_change(
+                    summary=summary,
+                    request=BudgetChangeSuggestionRequest(
+                        budget_month_id=budget_month_id,
+                        amount_cents=amount_cents,
+                        from_category_id=optional_int(payload, "from_category_id"),
+                        to_category_id=optional_int(payload, "to_category_id"),
+                        note=payload.get("note"),
+                        purpose=payload.get("purpose"),
+                    ),
+                )
+                self.send_json({"coach": coach_response_to_dict(coach_response)})
                 return
             if parsed.path == "/plaid/link-token":
                 link_token = self.plaid_service.create_link_token(
@@ -283,11 +337,33 @@ def parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def require_int(payload: dict[str, Any], key: str, fallback_key: str | None = None) -> int:
+    if key not in payload and (fallback_key is None or fallback_key not in payload):
+        if fallback_key is None:
+            raise ValueError(f"{key} is required")
+        raise ValueError(f"{key} or {fallback_key} is required")
+    value = payload.get(key, payload.get(fallback_key))
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
+def optional_int(payload: dict[str, Any], key: str) -> int | None:
+    if key not in payload or payload[key] is None:
+        return None
+    try:
+        return int(payload[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
 def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     repository = BudgetRepository(db_path)
     repository.initialize()
     ApiHandler.repository = repository
     ApiHandler.plaid_service = PlaidConnectionService(repository)
+    ApiHandler.coach_service = CoachService()
     return ThreadingHTTPServer((host, port), ApiHandler)
 
 
