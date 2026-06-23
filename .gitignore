@@ -4,4 +4,10 @@ __pycache__/
 *.sqlite-shm
 *.sqlite-wal
 work/
+.idea/
+android/.idea/
+android/.gradle/
+android/local.properties
+android/build/
+android/app/build/
 
