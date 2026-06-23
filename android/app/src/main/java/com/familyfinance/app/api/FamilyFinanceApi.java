@@ -2,6 +2,7 @@ package com.familyfinance.app.api;
 
 import com.familyfinance.app.model.BudgetSummary;
 import com.familyfinance.app.model.CashAccount;
+import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.TransactionDetail;
 
@@ -50,6 +51,25 @@ public final class FamilyFinanceApi {
         return parseTransactions(client.get("/budget-months/" + budgetMonthId + "/transaction-review-queue"));
     }
 
+    public List<NotificationEvent> getNotifications(int budgetMonthId, int userId) throws ApiException {
+        JSONArray json = client.get(
+                "/budget-months/" + budgetMonthId + "/notifications?user_id=" + userId
+        ).optJSONArray("notifications");
+        ArrayList<NotificationEvent> notifications = new ArrayList<>();
+        if (json != null) {
+            for (int i = 0; i < json.length(); i++) {
+                notifications.add(NotificationEvent.fromJson(json.optJSONObject(i)));
+            }
+        }
+        return notifications;
+    }
+
+    public int getUnreadNotificationCount(int budgetMonthId, int userId) throws ApiException {
+        return client.get(
+                "/budget-months/" + budgetMonthId + "/notifications/unread-count?user_id=" + userId
+        ).optInt("unread_count");
+    }
+
     public TransactionDetail getTransaction(int transactionId) throws ApiException {
         return TransactionDetail.fromJson(client.get("/transactions/" + transactionId));
     }
@@ -92,6 +112,30 @@ public final class FamilyFinanceApi {
             throw exception;
         } catch (Exception exception) {
             throw new ApiException("Could not build ignore request", exception);
+        }
+    }
+
+    public void markNotificationRead(int notificationId, int userId) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("user_id", userId);
+            client.patch("/notifications/" + notificationId + "/read", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build notification read request", exception);
+        }
+    }
+
+    public void markAllNotificationsRead(int budgetMonthId, int userId) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("user_id", userId);
+            client.patch("/budget-months/" + budgetMonthId + "/notifications/read-all", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build mark all notifications request", exception);
         }
     }
 

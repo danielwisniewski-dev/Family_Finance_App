@@ -22,6 +22,7 @@ import com.familyfinance.app.api.FamilyFinanceApi;
 import com.familyfinance.app.model.BudgetCategory;
 import com.familyfinance.app.model.BudgetSummary;
 import com.familyfinance.app.model.CashAccount;
+import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
@@ -37,6 +38,7 @@ public final class MainActivity extends Activity {
     private static final String PREFS = "family_finance";
     private static final String DEFAULT_BASE_URL = "http://10.0.2.2:8080";
     private static final int DEFAULT_BUDGET_MONTH_ID = 1;
+    private static final int DEFAULT_USER_ID = 1;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -44,11 +46,14 @@ public final class MainActivity extends Activity {
     private LinearLayout root;
     private String baseUrl;
     private int budgetMonthId;
+    private int userId;
     private FamilyFinanceApi api;
     private BudgetSummary summary;
     private List<TransactionDetail> transactions = new ArrayList<>();
     private List<TransactionDetail> reviewQueue = new ArrayList<>();
     private List<CashAccount> accounts = new ArrayList<>();
+    private List<NotificationEvent> notifications = new ArrayList<>();
+    private int unreadNotificationCount;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -68,14 +73,16 @@ public final class MainActivity extends Activity {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         baseUrl = prefs.getString("base_url", DEFAULT_BASE_URL);
         budgetMonthId = prefs.getInt("budget_month_id", DEFAULT_BUDGET_MONTH_ID);
+        userId = prefs.getInt("user_id", DEFAULT_USER_ID);
         api = new FamilyFinanceApi(baseUrl);
     }
 
-    private void savePreferences(String newBaseUrl, int newBudgetMonthId) {
+    private void savePreferences(String newBaseUrl, int newBudgetMonthId, int newUserId) {
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putString("base_url", newBaseUrl)
                 .putInt("budget_month_id", newBudgetMonthId)
+                .putInt("user_id", newUserId)
                 .apply();
         loadPreferences();
     }
@@ -87,11 +94,15 @@ public final class MainActivity extends Activity {
                 List<TransactionDetail> loadedTransactions = api.getTransactions(budgetMonthId);
                 List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(budgetMonthId);
                 List<CashAccount> loadedAccounts = api.getAccounts(budgetMonthId);
+                List<NotificationEvent> loadedNotifications = api.getNotifications(budgetMonthId, userId);
+                int loadedUnreadNotificationCount = api.getUnreadNotificationCount(budgetMonthId, userId);
                 mainHandler.post(() -> {
                     summary = loadedSummary;
                     transactions = loadedTransactions;
                     reviewQueue = loadedReviewQueue;
                     accounts = loadedAccounts;
+                    notifications = loadedNotifications;
+                    unreadNotificationCount = loadedUnreadNotificationCount;
                     afterLoad.run();
                 });
             } catch (Exception exception) {
@@ -102,7 +113,7 @@ public final class MainActivity extends Activity {
 
     private void showDashboard() {
         beginScreen("Dashboard");
-        addFact("Backend", baseUrl + "  |  Budget month ID " + budgetMonthId);
+        addFact("Backend", baseUrl + "  |  Budget month ID " + budgetMonthId + "  |  User ID " + userId);
         if (summary == null) {
             addBody("No summary loaded.");
             addNav();
@@ -116,6 +127,9 @@ public final class MainActivity extends Activity {
             addWarning("Low cushion warning: cash remaining after bills is tight for the days until payday.");
         }
         addMetric("Uncategorized transactions", Integer.toString(reviewQueue.size()));
+        addMetric("Unread notifications", Integer.toString(unreadNotificationCount));
+        addFact("Notification viewer", "Unread state is scoped to user ID " + userId);
+        addButton("Notifications / accountability", this::showNotifications);
 
         addSection("Categories needing attention");
         List<BudgetCategory> attention = summary.categoriesNeedingAttention();
@@ -127,6 +141,26 @@ public final class MainActivity extends Activity {
                         category.name + "  " + MoneyFormatter.dollars(category.remainingCents),
                         () -> showCategoryDetail(category.id)
                 );
+            }
+        }
+        addNav();
+    }
+
+    private void showNotifications() {
+        beginScreen("Notifications");
+        addMetric("Unread", Integer.toString(unreadNotificationCount));
+        addFact("Viewer user ID", Integer.toString(userId));
+        addButton("Mark all read", () -> runMutation(
+                "Marking notifications read...",
+                () -> api.markAllNotificationsRead(budgetMonthId, userId),
+                () -> refreshData(this::showNotifications)
+        ));
+        addSection("Accountability events");
+        if (notifications.isEmpty()) {
+            addBody("No notification events for this budget month.");
+        } else {
+            for (NotificationEvent notification : notifications) {
+                addNotificationRow(notification);
             }
         }
         addNav();
@@ -324,19 +358,28 @@ public final class MainActivity extends Activity {
         baseUrlInput.setText(baseUrl);
         root.addView(baseUrlInput);
         EditText budgetMonthInput = new EditText(this);
+        budgetMonthInput.setHint("Budget month ID");
         budgetMonthInput.setSingleLine(true);
         budgetMonthInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         budgetMonthInput.setText(Integer.toString(budgetMonthId));
         root.addView(budgetMonthInput);
+        EditText userIdInput = new EditText(this);
+        userIdInput.setHint("Viewer user ID for notification read state");
+        userIdInput.setSingleLine(true);
+        userIdInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        userIdInput.setText(Integer.toString(userId));
+        root.addView(userIdInput);
         addButton("Save and reload", () -> {
             int parsedId;
+            int parsedUserId;
             try {
                 parsedId = Integer.parseInt(budgetMonthInput.getText().toString());
+                parsedUserId = Integer.parseInt(userIdInput.getText().toString());
             } catch (NumberFormatException exception) {
-                toast("Budget month ID must be a number.");
+                toast("Budget month ID and user ID must be numbers.");
                 return;
             }
-            savePreferences(baseUrlInput.getText().toString(), parsedId);
+            savePreferences(baseUrlInput.getText().toString(), parsedId, parsedUserId);
             showLoading("Reloading...");
             refreshData(this::showDashboard);
         });
@@ -371,6 +414,23 @@ public final class MainActivity extends Activity {
                         + "\n" + status,
                 () -> showTransactionDetail(detail.transaction.id)
         );
+    }
+
+    private void addNotificationRow(NotificationEvent notification) {
+        String status = notification.severityLabel()
+                + " | " + notification.readStateLabel()
+                + " | " + blankAsDash(notification.createdAt);
+        addSection(notification.title);
+        addBody(notification.message);
+        addFact("Status", status);
+        addFact("Type", notification.eventType);
+        if (!notification.isRead()) {
+            addButton("Mark read", () -> runMutation(
+                    "Marking notification read...",
+                    () -> api.markNotificationRead(notification.id, userId),
+                    () -> refreshData(this::showNotifications)
+            ));
+        }
     }
 
     private void runMutation(String loadingMessage, ThrowingRunnable operation, Runnable onSuccess) {
@@ -420,6 +480,7 @@ public final class MainActivity extends Activity {
         addButton("Transactions", () -> showTransactions(false));
         addButton("Uncategorized review", () -> showTransactions(true));
         addButton("Safe to spend", this::showSafeToSpend);
+        addButton("Notifications", this::showNotifications);
         addButton("Accounts / settings", this::showSettings);
     }
 

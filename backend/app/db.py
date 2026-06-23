@@ -14,6 +14,7 @@ from .domain import (
     CategoryLine,
     ExpectedBill,
     IncomeLine,
+    NotificationEvent,
     PlaidItemLine,
     SafeToSpendResult,
     TransactionCategoryAssignment,
@@ -21,8 +22,24 @@ from .domain import (
     TransactionLine,
     TransactionUpsertResult,
     Urgency,
+    WarningLevel,
     calculate_safe_to_spend,
     summarize_budget,
+)
+
+
+FORBIDDEN_METADATA_TERMS = (
+    "access_token",
+    "access_token_ref",
+    "token_ref",
+    "api_key",
+    "api key",
+    "openai_api_key",
+    "openai api key",
+    "secret",
+    "raw_provider",
+    "provider_error",
+    "plaid_token",
 )
 
 
@@ -156,6 +173,16 @@ class BudgetRepository:
                 (budget_month_id,),
             ).fetchall()
         return [account_from_row(row) for row in rows]
+
+    def household_id_for_budget_month(self, budget_month_id: int) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT household_id FROM budget_months WHERE id = ?",
+                (budget_month_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"Budget month {budget_month_id} not found")
+        return int(row["household_id"])
 
     def set_account_included(self, account_id: int, included_in_cash_reality: bool) -> None:
         self.update_cash_account(
@@ -536,7 +563,12 @@ class BudgetRepository:
                 raise LookupError(f"Transaction {transaction_id} not found")
             return self._transaction_detail_from_row(connection, row)
 
-    def mark_transaction_reviewed(self, transaction_id: int, reviewed: bool = True) -> None:
+    def mark_transaction_reviewed(
+        self,
+        transaction_id: int,
+        reviewed: bool = True,
+        actor_user_id: int | None = None,
+    ) -> None:
         with self.connect() as connection:
             self._require_transaction(connection, transaction_id)
             connection.execute(
@@ -552,6 +584,20 @@ class BudgetRepository:
                 transaction_id=transaction_id,
                 event_type="marked_reviewed" if reviewed else "marked_unreviewed",
             )
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type="transaction_marked_reviewed" if reviewed else "transaction_marked_unreviewed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="transaction",
+                affected_entity_id=transaction_id,
+                title="Transaction marked reviewed" if reviewed else "Transaction marked unreviewed",
+                message=f"{context['transaction_name']} was marked {'reviewed' if reviewed else 'unreviewed'}.",
+                severity="info",
+                metadata={"transaction_id": transaction_id, "reviewed": reviewed},
+            )
 
     def assign_transaction_category(
         self,
@@ -560,6 +606,7 @@ class BudgetRepository:
         category_id: int,
         source: str = "manual",
         reviewed: bool = True,
+        actor_user_id: int | None = None,
     ) -> None:
         if source not in {"manual", "rule", "plaid_hint"}:
             raise ValueError("source must be manual, rule, or plaid_hint")
@@ -567,6 +614,7 @@ class BudgetRepository:
             transaction = self._require_transaction(connection, transaction_id)
             self._validate_category_for_transaction(connection, transaction_id, category_id)
             amount_cents = budget_amount_cents(transaction["amount_cents"])
+            previous_assignments = self._active_assignments(connection, transaction_id)
             self._supersede_active_assignments(connection, transaction_id)
             self._insert_assignment(
                 connection,
@@ -591,10 +639,55 @@ class BudgetRepository:
                 category_id=category_id,
                 amount_cents=amount_cents,
             )
+            previous_category_ids = [int(row["budget_category_id"]) for row in previous_assignments]
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            category_name = self._category_name(connection, category_id)
+            recategorized = bool(previous_category_ids) and previous_category_ids != [category_id]
+            old_category_name = (
+                self._category_name(connection, previous_category_ids[0])
+                if len(previous_category_ids) == 1
+                else None
+            )
+            if recategorized:
+                title = "Transaction recategorized"
+                message = (
+                    f"{context['transaction_name']} moved from {old_category_name or 'multiple categories'} "
+                    f"to {category_name}."
+                )
+                event_type = "transaction_recategorized"
+            else:
+                title = "Transaction category assigned"
+                message = f"{context['transaction_name']} was assigned to {category_name}."
+                event_type = "transaction_category_assigned"
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type=event_type,
+                actor_user_id=actor_user_id,
+                affected_entity_type="transaction",
+                affected_entity_id=transaction_id,
+                title=title,
+                message=message,
+                severity="info",
+                metadata={
+                    "transaction_id": transaction_id,
+                    "category_id": category_id,
+                    "previous_category_ids": previous_category_ids,
+                    "amount_cents": amount_cents,
+                    "source": source,
+                },
+            )
 
-    def remove_transaction_category(self, transaction_id: int, reviewed: bool = False) -> None:
+    def remove_transaction_category(
+        self,
+        transaction_id: int,
+        reviewed: bool = False,
+        actor_user_id: int | None = None,
+    ) -> None:
         with self.connect() as connection:
             self._require_transaction(connection, transaction_id)
+            previous_assignments = self._active_assignments(connection, transaction_id)
             self._supersede_active_assignments(connection, transaction_id)
             connection.execute(
                 """
@@ -608,6 +701,24 @@ class BudgetRepository:
                 connection,
                 transaction_id=transaction_id,
                 event_type="category_removed",
+            )
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type="transaction_category_removed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="transaction",
+                affected_entity_id=transaction_id,
+                title="Transaction category removed",
+                message=f"{context['transaction_name']} was returned to uncategorized review.",
+                severity="info",
+                metadata={
+                    "transaction_id": transaction_id,
+                    "previous_category_ids": [int(row["budget_category_id"]) for row in previous_assignments],
+                    "reviewed": reviewed,
+                },
             )
 
     def split_transaction(
@@ -671,6 +782,7 @@ class BudgetRepository:
         transaction_id: int,
         ignored: bool = True,
         reason: str | None = None,
+        actor_user_id: int | None = None,
     ) -> None:
         with self.connect() as connection:
             self._require_transaction(connection, transaction_id)
@@ -693,6 +805,210 @@ class BudgetRepository:
                 transaction_id=transaction_id,
                 event_type="ignored" if ignored else "unignored",
                 metadata={"reason": reason} if reason else None,
+            )
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type="transaction_ignored" if ignored else "transaction_unignored",
+                actor_user_id=actor_user_id,
+                affected_entity_type="transaction",
+                affected_entity_id=transaction_id,
+                title="Transaction ignored" if ignored else "Transaction unignored",
+                message=(
+                    f"{context['transaction_name']} was excluded from budget spending."
+                    if ignored
+                    else f"{context['transaction_name']} was returned to budget review."
+                ),
+                severity="important" if ignored else "caution",
+                metadata={"transaction_id": transaction_id, "ignored": ignored, "reason": reason} if reason else {
+                    "transaction_id": transaction_id,
+                    "ignored": ignored,
+                },
+            )
+
+    def create_notification_event(
+        self,
+        *,
+        household_id: int,
+        budget_month_id: int | None,
+        event_type: str,
+        actor_user_id: int | None,
+        affected_entity_type: str,
+        affected_entity_id: int | None,
+        title: str,
+        message: str,
+        severity: str = "info",
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            return self._insert_notification_event(
+                connection,
+                household_id=household_id,
+                budget_month_id=budget_month_id,
+                event_type=event_type,
+                actor_user_id=actor_user_id,
+                affected_entity_type=affected_entity_type,
+                affected_entity_id=affected_entity_id,
+                title=title,
+                message=message,
+                severity=severity,
+                metadata=metadata,
+            )
+
+    def list_notification_events(
+        self,
+        *,
+        household_id: int | None = None,
+        budget_month_id: int | None = None,
+        user_id: int | None = None,
+        event_type: str | None = None,
+        severity: str | None = None,
+    ) -> list[NotificationEvent]:
+        if household_id is None and budget_month_id is None:
+            raise ValueError("household_id or budget_month_id is required")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if household_id is not None:
+            clauses.append("household_id = ?")
+            values.append(household_id)
+        if budget_month_id is not None:
+            clauses.append("budget_month_id = ?")
+            values.append(budget_month_id)
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            values.append(event_type)
+        if severity is not None:
+            validate_notification_severity(severity)
+            clauses.append("severity = ?")
+            values.append(severity)
+        where = " AND ".join(clauses)
+        with self.connect() as connection:
+            if user_id is not None:
+                self._validate_user_for_notification_scope(
+                    connection,
+                    user_id=user_id,
+                    household_id=household_id,
+                    budget_month_id=budget_month_id,
+                )
+                values = [user_id] + values
+                rows = connection.execute(
+                    f"""
+                    SELECT
+                        n.*,
+                        r.read_at AS viewer_read_at,
+                        r.user_id AS viewer_read_by_user_id
+                    FROM notification_events n
+                    LEFT JOIN notification_event_reads r
+                        ON r.event_id = n.id
+                        AND r.user_id = ?
+                    WHERE {where}
+                    ORDER BY n.created_at DESC, n.id DESC
+                    """,
+                    values,
+                ).fetchall()
+                return [notification_from_row(row) for row in rows]
+            rows = connection.execute(
+                f"""
+                SELECT
+                    n.*,
+                    NULL AS viewer_read_at,
+                    NULL AS viewer_read_by_user_id
+                FROM notification_events n
+                WHERE {where}
+                ORDER BY n.created_at DESC, n.id DESC
+                """,
+                values,
+            ).fetchall()
+        return [notification_from_row(row) for row in rows]
+
+    def unread_notification_count(
+        self,
+        *,
+        household_id: int | None = None,
+        budget_month_id: int | None = None,
+        user_id: int | None = None,
+    ) -> int:
+        if household_id is None and budget_month_id is None:
+            raise ValueError("household_id or budget_month_id is required")
+        if user_id is None:
+            raise ValueError("user_id is required for unread notification counts")
+        clauses: list[str] = ["r.event_id IS NULL"]
+        values: list[Any] = []
+        if household_id is not None:
+            clauses.append("n.household_id = ?")
+            values.append(household_id)
+        if budget_month_id is not None:
+            clauses.append("n.budget_month_id = ?")
+            values.append(budget_month_id)
+        with self.connect() as connection:
+            self._validate_user_for_notification_scope(
+                connection,
+                user_id=user_id,
+                household_id=household_id,
+                budget_month_id=budget_month_id,
+            )
+            values = [user_id] + values
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM notification_events n
+                LEFT JOIN notification_event_reads r
+                    ON r.event_id = n.id
+                    AND r.user_id = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                values,
+            ).fetchone()
+        return int(row["count"])
+
+    def mark_notification_read(self, event_id: int, user_id: int) -> None:
+        with self.connect() as connection:
+            event = self._require_notification_event(connection, event_id)
+            self._validate_user_for_household(connection, int(event["household_id"]), user_id)
+            connection.execute(
+                """
+                INSERT INTO notification_event_reads(event_id, user_id)
+                VALUES (?, ?)
+                ON CONFLICT(event_id, user_id) DO NOTHING
+                """,
+                (event_id, user_id),
+            )
+
+    def mark_all_notifications_read(
+        self,
+        *,
+        household_id: int | None = None,
+        budget_month_id: int | None = None,
+        user_id: int,
+    ) -> None:
+        if household_id is None and budget_month_id is None:
+            raise ValueError("household_id or budget_month_id is required")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if household_id is not None:
+            clauses.append("household_id = ?")
+            values.append(household_id)
+        if budget_month_id is not None:
+            clauses.append("budget_month_id = ?")
+            values.append(budget_month_id)
+        with self.connect() as connection:
+            self._validate_user_for_notification_scope(
+                connection,
+                user_id=user_id,
+                household_id=household_id,
+                budget_month_id=budget_month_id,
+            )
+            connection.execute(
+                f"""
+                INSERT INTO notification_event_reads(event_id, user_id)
+                SELECT id, ?
+                FROM notification_events
+                WHERE {' AND '.join(clauses)}
+                ON CONFLICT(event_id, user_id) DO NOTHING
+                """,
+                [user_id] + values,
             )
 
     def create_merchant_rule(
@@ -816,9 +1132,11 @@ class BudgetRepository:
         name: str,
         planned_cents: int,
         display_order: int = 0,
+        actor_user_id: int | None = None,
     ) -> int:
         with self.connect() as connection:
-            return insert_and_return_id(
+            context = self._notification_context_for_budget_group(connection, budget_group_id)
+            category_id = insert_and_return_id(
                 connection,
                 """
                 INSERT INTO budget_categories(budget_group_id, name, planned_cents, display_order)
@@ -826,6 +1144,20 @@ class BudgetRepository:
                 """,
                 (budget_group_id, name, planned_cents, display_order),
             )
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type="category_created",
+                actor_user_id=actor_user_id,
+                affected_entity_type="category",
+                affected_entity_id=category_id,
+                title="Category created",
+                message=f"{name} was added to the budget.",
+                severity="info",
+                metadata={"category_id": category_id, "planned_cents": planned_cents},
+            )
+            return category_id
 
     def update_category(
         self,
@@ -834,6 +1166,7 @@ class BudgetRepository:
         name: str | None = None,
         planned_cents: int | None = None,
         archived: bool | None = None,
+        actor_user_id: int | None = None,
     ) -> None:
         assignments: list[str] = []
         values: list[Any] = []
@@ -850,10 +1183,44 @@ class BudgetRepository:
             return
         values.append(category_id)
         with self.connect() as connection:
+            before = self._notification_context_for_category(connection, category_id)
             connection.execute(
                 f"UPDATE budget_categories SET {', '.join(assignments)} WHERE id = ?",
                 values,
             )
+            category_name = name if name is not None else str(before["category_name"])
+            if planned_cents is not None and int(before["planned_cents"]) != planned_cents:
+                self._insert_notification_event(
+                    connection,
+                    household_id=before["household_id"],
+                    budget_month_id=before["budget_month_id"],
+                    event_type="category_funding_changed",
+                    actor_user_id=actor_user_id,
+                    affected_entity_type="category",
+                    affected_entity_id=category_id,
+                    title="Category funding changed",
+                    message=f"{category_name} funding changed from {before['planned_cents']} cents to {planned_cents} cents.",
+                    severity="caution",
+                    metadata={
+                        "category_id": category_id,
+                        "previous_planned_cents": int(before["planned_cents"]),
+                        "planned_cents": planned_cents,
+                    },
+                )
+            if archived is True and not bool(before["archived"]):
+                self._insert_notification_event(
+                    connection,
+                    household_id=before["household_id"],
+                    budget_month_id=before["budget_month_id"],
+                    event_type="category_archived",
+                    actor_user_id=actor_user_id,
+                    affected_entity_type="category",
+                    affected_entity_id=category_id,
+                    title="Category archived",
+                    message=f"{category_name} was archived.",
+                    severity="important",
+                    metadata={"category_id": category_id},
+                )
 
     def record_spending(
         self,
@@ -921,12 +1288,13 @@ class BudgetRepository:
         purchase_amount_cents: int,
         today: date,
         urgency: Urgency = "planned_want",
+        actor_user_id: int | None = None,
     ) -> SafeToSpendResult:
         snapshot = self._load_snapshot(budget_month_id)
         category = next((item for item in snapshot["categories"] if item.id == category_id), None)
         if category is None:
             raise LookupError(f"Category {category_id} is not part of budget month {budget_month_id}")
-        return calculate_safe_to_spend(
+        result = calculate_safe_to_spend(
             category=category,
             purchase_amount_cents=purchase_amount_cents,
             included_account_balance_cents=snapshot["included_account_balance_cents"],
@@ -936,6 +1304,209 @@ class BudgetRepository:
             urgency=urgency,
             low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
         )
+        if result.warning_level in {
+            WarningLevel.CAUTION,
+            WarningLevel.NO,
+            WarningLevel.DISCUSS_WITH_SPOUSE,
+        }:
+            warning = result.warning_level.value
+            event_suffix = "discuss" if warning == "discuss_with_spouse" else warning
+            self.create_notification_event(
+                household_id=int(snapshot["budget_month"]["household_id"]),
+                budget_month_id=budget_month_id,
+                event_type=f"safe_to_spend_{event_suffix}",
+                actor_user_id=actor_user_id,
+                affected_entity_type="category",
+                affected_entity_id=category_id,
+                title="Safe-to-spend needs attention",
+                message=f"{category.name}: {result.required_phrase}",
+                severity="important" if result.warning_level == WarningLevel.NO else "caution",
+                metadata={
+                    "category_id": category_id,
+                    "purchase_amount_cents": purchase_amount_cents,
+                    "warning_level": warning,
+                    "category_remaining_after_cents": result.category_remaining_after_cents,
+                    "cash_after_purchase_and_bills_cents": result.cash_after_purchase_and_bills_cents,
+                },
+            )
+        return result
+
+    def _active_assignments(self, connection: sqlite3.Connection, transaction_id: int) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT *
+            FROM transaction_category_assignments
+            WHERE transaction_id = ? AND active = 1
+            ORDER BY id
+            """,
+            (transaction_id,),
+        ).fetchall()
+
+    def _category_name(self, connection: sqlite3.Connection, category_id: int) -> str:
+        row = connection.execute(
+            "SELECT name FROM budget_categories WHERE id = ?",
+            (category_id,),
+        ).fetchone()
+        return str(row["name"]) if row is not None else f"Category #{category_id}"
+
+    def _notification_context_for_budget_group(
+        self,
+        connection: sqlite3.Connection,
+        budget_group_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT b.household_id, b.id AS budget_month_id
+            FROM budget_groups g
+            JOIN budget_months b ON b.id = g.budget_month_id
+            WHERE g.id = ?
+            """,
+            (budget_group_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Budget group {budget_group_id} not found")
+        return dict(row)
+
+    def _notification_context_for_category(
+        self,
+        connection: sqlite3.Connection,
+        category_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT
+                b.household_id,
+                b.id AS budget_month_id,
+                c.name AS category_name,
+                c.planned_cents,
+                c.archived
+            FROM budget_categories c
+            JOIN budget_groups g ON g.id = c.budget_group_id
+            JOIN budget_months b ON b.id = g.budget_month_id
+            WHERE c.id = ?
+            """,
+            (category_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Category {category_id} not found")
+        return dict(row)
+
+    def _notification_context_for_transaction(
+        self,
+        connection: sqlite3.Connection,
+        transaction_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT
+                b.household_id,
+                b.id AS budget_month_id,
+                t.name AS transaction_name
+            FROM account_transactions t
+            JOIN cash_accounts a ON a.id = t.cash_account_id
+            JOIN budget_months b ON b.id = a.budget_month_id
+            WHERE t.id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Transaction {transaction_id} not found")
+        return dict(row)
+
+    def _insert_notification_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        household_id: int,
+        budget_month_id: int | None,
+        event_type: str,
+        actor_user_id: int | None,
+        affected_entity_type: str,
+        affected_entity_id: int | None,
+        title: str,
+        message: str,
+        severity: str,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        validate_notification_severity(severity)
+        if actor_user_id is not None:
+            self._validate_user_for_household(connection, household_id, actor_user_id)
+        return insert_and_return_id(
+            connection,
+            """
+            INSERT INTO notification_events(
+                household_id,
+                budget_month_id,
+                event_type,
+                actor_user_id,
+                affected_entity_type,
+                affected_entity_id,
+                title,
+                message,
+                severity,
+                metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                household_id,
+                budget_month_id,
+                event_type,
+                actor_user_id,
+                affected_entity_type,
+                affected_entity_id,
+                title,
+                message,
+                severity,
+                json_dumps(sanitize_notification_metadata(metadata or {})),
+            ),
+        )
+
+    def _validate_user_for_household(
+        self,
+        connection: sqlite3.Connection,
+        household_id: int,
+        user_id: int,
+    ) -> None:
+        row = connection.execute(
+            "SELECT id FROM users WHERE id = ? AND household_id = ?",
+            (user_id, household_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("actor_user_id must belong to the household")
+
+    def _require_notification_event(self, connection: sqlite3.Connection, event_id: int) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM notification_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Notification event {event_id} not found")
+        return row
+
+    def _validate_user_for_notification_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        user_id: int,
+        household_id: int | None,
+        budget_month_id: int | None,
+    ) -> None:
+        if household_id is not None:
+            self._validate_user_for_household(connection, household_id, user_id)
+            return
+        if budget_month_id is not None:
+            row = connection.execute(
+                """
+                SELECT household_id
+                FROM budget_months
+                WHERE id = ?
+                """,
+                (budget_month_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"Budget month {budget_month_id} not found")
+            self._validate_user_for_household(connection, int(row["household_id"]), user_id)
 
     def _transaction_detail_from_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> TransactionDetail:
         transaction_id = int(row["id"])
@@ -1330,6 +1901,25 @@ def assignment_from_row(row: sqlite3.Row) -> TransactionCategoryAssignment:
     )
 
 
+def notification_from_row(row: sqlite3.Row) -> NotificationEvent:
+    return NotificationEvent(
+        id=row["id"],
+        household_id=row["household_id"],
+        budget_month_id=row["budget_month_id"],
+        event_type=row["event_type"],
+        actor_user_id=row["actor_user_id"],
+        affected_entity_type=row["affected_entity_type"],
+        affected_entity_id=row["affected_entity_id"],
+        title=row["title"],
+        message=row["message"],
+        severity=row["severity"],
+        metadata=sanitize_notification_metadata(json.loads(row["metadata"] or "{}")),
+        read_at=row["viewer_read_at"],
+        read_by_user_id=row["viewer_read_by_user_id"],
+        created_at=row["created_at"],
+    )
+
+
 def summary_to_dict(summary: BudgetSummary) -> dict[str, Any]:
     payload = asdict(summary)
     payload["next_payday"] = summary.next_payday.isoformat()
@@ -1381,3 +1971,39 @@ def safe_to_spend_to_dict(result: SafeToSpendResult) -> dict[str, Any]:
     payload["warning_level"] = result.warning_level.value
     payload["next_payday"] = result.next_payday.isoformat()
     return payload
+
+
+def notification_event_to_dict(event: NotificationEvent) -> dict[str, Any]:
+    return asdict(event) | {"metadata": sanitize_notification_metadata(event.metadata)}
+
+
+def validate_notification_severity(severity: str) -> None:
+    if severity not in {"info", "caution", "important"}:
+        raise ValueError("severity must be info, caution, or important")
+
+
+def sanitize_notification_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    sanitized: dict[str, object] = {}
+    for key, value in metadata.items():
+        key_text = str(key)
+        if is_forbidden_metadata_text(key_text):
+            continue
+        sanitized[key_text] = sanitize_notification_metadata_value(value)
+    return sanitized
+
+
+def sanitize_notification_metadata_value(value: object) -> object:
+    if isinstance(value, dict):
+        return sanitize_notification_metadata(value)
+    if isinstance(value, list):
+        return [sanitize_notification_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_notification_metadata_value(item) for item in value]
+    if isinstance(value, str) and is_forbidden_metadata_text(value):
+        return "[redacted]"
+    return value
+
+
+def is_forbidden_metadata_text(value: str) -> bool:
+    lowered = value.casefold()
+    return any(term in lowered for term in FORBIDDEN_METADATA_TERMS)
