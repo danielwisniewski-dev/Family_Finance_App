@@ -160,6 +160,87 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("access_token", serialized_detail)
         self.assertNotIn("access_token_ref", serialized_detail)
 
+    def test_notification_routes_list_count_and_mark_read(self) -> None:
+        household = self.post(
+            "/households",
+            {
+                "name": "API Notification Household",
+                "spouses": [{"name": "A"}, {"name": "B"}],
+            },
+        )
+        with ApiHandler.repository.connect() as connection:
+            user_id = int(
+                connection.execute(
+                    "SELECT id FROM users WHERE household_id = ? ORDER BY id LIMIT 1",
+                    (household["id"],),
+                ).fetchone()["id"]
+            )
+        budget_month = self.post(
+            "/budget-months",
+            {
+                "household_id": household["id"],
+                "month": "2026-06",
+                "included_account_balance_cents": 100_000,
+            },
+        )
+        group = self.post(
+            "/budget-groups",
+            {
+                "budget_month_id": budget_month["id"],
+                "name": "Everyday",
+            },
+        )
+        category = self.post(
+            "/categories",
+            {
+                "budget_group_id": group["id"],
+                "name": "Groceries",
+                "planned_cents": 50_000,
+            },
+        )
+        account_id = ApiHandler.repository.add_cash_account(
+            budget_month_id=budget_month["id"],
+            name="Main Checking",
+            account_type="checking",
+            balance_cents=100_000,
+        )
+        transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+            cash_account_id=account_id,
+            plaid_transaction_id="api-notification-txn",
+            amount_cents=-2_500,
+            occurred_on=date(2026, 6, 21),
+            name="Fresh Market",
+            merchant_name="Fresh Market",
+        ).transaction_id
+        self.patch(
+            f"/transactions/{transaction_id}/category",
+            {
+                "category_id": category["id"],
+                "reviewed": True,
+            },
+        )
+
+        notifications = self.get(f"/budget-months/{budget_month['id']}/notifications?user_id={user_id}")
+        count = self.get(f"/budget-months/{budget_month['id']}/notifications/unread-count?user_id={user_id}")
+        assigned = [
+            item
+            for item in notifications["notifications"]
+            if item["event_type"] == "transaction_category_assigned"
+        ][0]
+
+        self.assertGreaterEqual(count["unread_count"], 1)
+        self.assertEqual(assigned["affected_entity_id"], transaction_id)
+        self.assertIsNone(assigned["read_at"])
+
+        self.patch(f"/notifications/{assigned['id']}/read", {"user_id": user_id})
+        reread = self.get(f"/budget-months/{budget_month['id']}/notifications?user_id={user_id}")
+        read_assigned = [
+            item
+            for item in reread["notifications"]
+            if item["id"] == assigned["id"]
+        ][0]
+        self.assertIsNotNone(read_assigned["read_at"])
+
     def get(self, path: str) -> dict[str, object]:
         with urlopen(f"{self.base_url}{path}", timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))

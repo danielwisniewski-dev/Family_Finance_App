@@ -11,6 +11,7 @@ Urgency = Literal["need", "planned_want", "impulse_want", "household_discussion"
 AccountType = Literal["checking", "savings"]
 PlaidSyncKind = Literal["balance", "transaction", "connection"]
 CategorizationSource = Literal["manual", "rule", "plaid_hint", "split"]
+NotificationSeverity = Literal["info", "caution", "important"]
 
 
 class WarningLevel(str, Enum):
@@ -137,6 +138,24 @@ class TransactionDetail:
 class TransactionUpsertResult:
     transaction_id: int
     created: bool
+
+
+@dataclass(frozen=True)
+class NotificationEvent:
+    id: int
+    household_id: int
+    budget_month_id: int | None
+    event_type: str
+    actor_user_id: int | None
+    affected_entity_type: str
+    affected_entity_id: int | None
+    title: str
+    message: str
+    severity: NotificationSeverity
+    metadata: dict[str, object]
+    read_at: str | None
+    read_by_user_id: int | None
+    created_at: str
 
 
 @dataclass(frozen=True)

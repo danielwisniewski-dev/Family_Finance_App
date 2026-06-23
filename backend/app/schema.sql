@@ -142,6 +142,28 @@ CREATE TABLE IF NOT EXISTS transaction_categorization_events (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS notification_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    household_id INTEGER NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+    budget_month_id INTEGER REFERENCES budget_months(id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    affected_entity_type TEXT NOT NULL,
+    affected_entity_id INTEGER,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'caution', 'important')),
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS notification_event_reads (
+    event_id INTEGER NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    read_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(event_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS expected_bills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month_id INTEGER NOT NULL REFERENCES budget_months(id) ON DELETE CASCADE,
@@ -183,6 +205,12 @@ CREATE INDEX IF NOT EXISTS idx_transaction_assignments_category
     ON transaction_category_assignments(budget_category_id, active);
 CREATE INDEX IF NOT EXISTS idx_transaction_events_transaction
     ON transaction_categorization_events(transaction_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_notification_events_household
+    ON notification_events(household_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_notification_events_budget_month
+    ON notification_events(budget_month_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_notification_event_reads_user
+    ON notification_event_reads(user_id, read_at);
 CREATE INDEX IF NOT EXISTS idx_expected_bills_budget_month ON expected_bills(budget_month_id);
 CREATE INDEX IF NOT EXISTS idx_paydays_household_date ON paydays(household_id, payday_date);
 CREATE INDEX IF NOT EXISTS idx_plaid_sync_errors_item ON plaid_sync_errors(plaid_item_id);

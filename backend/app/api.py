@@ -16,7 +16,14 @@ from .coach import (
     build_coach_service_from_env,
     coach_response_to_dict,
 )
-from .db import BudgetRepository, account_to_dict, safe_to_spend_to_dict, summary_to_dict, transaction_detail_to_dict
+from .db import (
+    BudgetRepository,
+    account_to_dict,
+    notification_event_to_dict,
+    safe_to_spend_to_dict,
+    summary_to_dict,
+    transaction_detail_to_dict,
+)
 from .plaid import (
     PlaidConnectionService,
     link_token_to_dict,
@@ -57,6 +64,46 @@ class ApiHandler(BaseHTTPRequestHandler):
                 budget_month_id = int(parsed.path.split("/")[2])
                 transactions = self.repository.list_transaction_review_queue(budget_month_id)
                 self.send_json({"transactions": [transaction_detail_to_dict(item) for item in transactions]})
+                return
+            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications"):
+                budget_month_id = int(parsed.path.split("/")[2])
+                query = parse_qs(parsed.query)
+                events = self.repository.list_notification_events(
+                    budget_month_id=budget_month_id,
+                    user_id=optional_query_int(query, "user_id", fallback_key="spouse_id"),
+                    event_type=optional_query_value(query, "event_type"),
+                    severity=optional_query_value(query, "severity"),
+                )
+                self.send_json({"notifications": [notification_event_to_dict(event) for event in events]})
+                return
+            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications/unread-count"):
+                budget_month_id = int(parsed.path.split("/")[2])
+                query = parse_qs(parsed.query)
+                count = self.repository.unread_notification_count(
+                    budget_month_id=budget_month_id,
+                    user_id=require_query_int(query, "user_id", fallback_key="spouse_id"),
+                )
+                self.send_json({"unread_count": count})
+                return
+            if parsed.path.startswith("/households/") and parsed.path.endswith("/notifications"):
+                household_id = int(parsed.path.split("/")[2])
+                query = parse_qs(parsed.query)
+                events = self.repository.list_notification_events(
+                    household_id=household_id,
+                    user_id=optional_query_int(query, "user_id", fallback_key="spouse_id"),
+                    event_type=optional_query_value(query, "event_type"),
+                    severity=optional_query_value(query, "severity"),
+                )
+                self.send_json({"notifications": [notification_event_to_dict(event) for event in events]})
+                return
+            if parsed.path.startswith("/households/") and parsed.path.endswith("/notifications/unread-count"):
+                household_id = int(parsed.path.split("/")[2])
+                query = parse_qs(parsed.query)
+                count = self.repository.unread_notification_count(
+                    household_id=household_id,
+                    user_id=require_query_int(query, "user_id", fallback_key="spouse_id"),
+                )
+                self.send_json({"unread_count": count})
                 return
             if parsed.path.startswith("/transactions/"):
                 transaction_id = int(parsed.path.split("/")[2])
@@ -111,6 +158,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     name=payload["name"],
                     planned_cents=int(payload.get("planned_cents", 0)),
                     display_order=int(payload.get("display_order", 0)),
+                    actor_user_id=optional_int(payload, "actor_user_id"),
                 )
                 self.send_json({"id": category_id}, status=HTTPStatus.CREATED)
                 return
@@ -147,6 +195,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     purchase_amount_cents=int(payload["purchase_amount_cents"]),
                     today=parse_date(payload.get("today", date.today().isoformat())),
                     urgency=payload.get("urgency", "planned_want"),
+                    actor_user_id=optional_int(payload, "actor_user_id"),
                 )
                 self.send_json(safe_to_spend_to_dict(result))
                 return
@@ -160,6 +209,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     purchase_amount_cents=amount_cents,
                     today=parse_date(payload.get("today", date.today().isoformat())),
                     urgency=payload.get("urgency", "planned_want"),
+                    actor_user_id=optional_int(payload, "actor_user_id"),
                 )
                 coach_response = self.coach_service.explain_safe_to_spend(
                     result=result,
@@ -195,7 +245,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                         purpose=payload.get("purpose"),
                     ),
                 )
-                self.send_json({"coach": coach_response_to_dict(coach_response)})
+                coach_payload = coach_response_to_dict(coach_response)
+                self.repository.create_notification_event(
+                    household_id=self.repository.household_id_for_budget_month(budget_month_id),
+                    budget_month_id=budget_month_id,
+                    event_type="coach_suggestion_generated",
+                    actor_user_id=optional_int(payload, "actor_user_id"),
+                    affected_entity_type="coach_suggestion",
+                    affected_entity_id=None,
+                    title="Coach suggestion generated",
+                    message=coach_response.summary,
+                    severity="caution" if coach_response.requires_spouse_discussion else "info",
+                    metadata={
+                        "amount_cents": amount_cents,
+                        "from_category_id": optional_int(payload, "from_category_id"),
+                        "to_category_id": optional_int(payload, "to_category_id"),
+                        "warning_level": coach_response.warning_level,
+                        "has_proposed_budget_change": coach_response.proposed_budget_change is not None,
+                    },
+                )
+                self.send_json({"coach": coach_payload})
                 return
             if parsed.path == "/plaid/link-token":
                 link_token = self.plaid_service.create_link_token(
@@ -246,6 +315,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     name=payload.get("name"),
                     planned_cents=payload.get("planned_cents"),
                     archived=payload.get("archived"),
+                    actor_user_id=optional_int(payload, "actor_user_id"),
                 )
                 self.send_json({"ok": True})
                 return
@@ -271,6 +341,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.repository.mark_transaction_reviewed(
                     transaction_id,
                     reviewed=bool(payload.get("reviewed", True)),
+                    actor_user_id=optional_int(payload, "actor_user_id"),
                 )
                 self.send_json({"ok": True})
                 return
@@ -280,6 +351,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.repository.remove_transaction_category(
                         transaction_id,
                         reviewed=bool(payload.get("reviewed", False)),
+                        actor_user_id=optional_int(payload, "actor_user_id"),
                     )
                 else:
                     self.repository.assign_transaction_category(
@@ -287,6 +359,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         category_id=int(payload["category_id"]),
                         source=payload.get("source", "manual"),
                         reviewed=bool(payload.get("reviewed", True)),
+                        actor_user_id=optional_int(payload, "actor_user_id"),
                     )
                 self.send_json({"ok": True})
                 return
@@ -305,6 +378,32 @@ class ApiHandler(BaseHTTPRequestHandler):
                     transaction_id=transaction_id,
                     ignored=bool(payload.get("ignored", True)),
                     reason=payload.get("reason"),
+                    actor_user_id=optional_int(payload, "actor_user_id"),
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/notifications/") and parsed.path.endswith("/read"):
+                notification_id = int(parsed.path.split("/")[2])
+                self.repository.mark_notification_read(
+                    notification_id,
+                    user_id=require_user_id(payload),
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/households/") and parsed.path.endswith("/notifications/read-all"):
+                household_id = int(parsed.path.split("/")[2])
+                self.repository.mark_all_notifications_read(
+                    household_id=household_id,
+                    budget_month_id=optional_int(payload, "budget_month_id"),
+                    user_id=require_user_id(payload),
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications/read-all"):
+                budget_month_id = int(parsed.path.split("/")[2])
+                self.repository.mark_all_notifications_read(
+                    budget_month_id=budget_month_id,
+                    user_id=require_user_id(payload),
                 )
                 self.send_json({"ok": True})
                 return
@@ -356,6 +455,42 @@ def optional_int(payload: dict[str, Any], key: str) -> int | None:
     try:
         return int(payload[key])
     except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
+def require_user_id(payload: dict[str, Any]) -> int:
+    for key in ("user_id", "spouse_id", "actor_user_id"):
+        if key in payload and payload[key] is not None:
+            return require_int(payload, key)
+    raise ValueError("user_id or spouse_id is required")
+
+
+def optional_query_value(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    if not values:
+        return None
+    value = values[0].strip()
+    return value or None
+
+
+def require_query_int(query: dict[str, list[str]], key: str, fallback_key: str | None = None) -> int:
+    value = optional_query_int(query, key, fallback_key=fallback_key)
+    if value is None:
+        if fallback_key is None:
+            raise ValueError(f"{key} is required")
+        raise ValueError(f"{key} or {fallback_key} is required")
+    return value
+
+
+def optional_query_int(query: dict[str, list[str]], key: str, fallback_key: str | None = None) -> int | None:
+    value = optional_query_value(query, key)
+    if value is None and fallback_key is not None:
+        value = optional_query_value(query, fallback_key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
         raise ValueError(f"{key} must be an integer") from exc
 
 
