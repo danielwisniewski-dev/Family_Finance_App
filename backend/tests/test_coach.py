@@ -414,6 +414,23 @@ class OpenAICoachProviderTests(unittest.TestCase):
         self.assertNotIn("test-key", serialized)
         self.assertNotIn("provider details", serialized)
 
+    def test_openai_provider_malformed_response_returns_safe_fallback(self) -> None:
+        def fake_malformed(payload: dict[str, object], api_key: str, timeout_seconds: float) -> dict[str, object]:
+            response = valid_openai_coach_payload()
+            response["requires_spouse_discussion"] = "false"
+            response["warning_level"] = "maybe"
+            return {"output_text": json.dumps(response)}
+
+        provider = OpenAICoachProvider(api_key="test-key", transport=fake_malformed)
+        response = provider.explain_safe_to_spend(sample_safe_to_spend_facts(warning_level="safe"))
+
+        self.assertEqual(response.summary, "Coach explanation is temporarily unavailable.")
+        self.assertEqual(response.warning_level, "safe")
+        self.assertEqual(response.confidence, "low")
+        serialized = json.dumps(response.__dict__, default=str)
+        self.assertNotIn("test-key", serialized)
+        self.assertNotIn("maybe", serialized)
+
     def test_openai_endpoint_does_not_mutate_data_or_call_live_network(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
         captured_payloads: list[dict[str, object]] = []

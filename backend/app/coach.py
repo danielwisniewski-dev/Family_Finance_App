@@ -573,26 +573,89 @@ def extract_response_json(raw_response: dict[str, Any]) -> dict[str, Any]:
 
 
 def coach_response_from_provider_payload(payload: dict[str, Any]) -> CoachResponse:
+    validate_provider_payload(payload)
     proposed_change = payload.get("proposed_budget_change")
     return CoachResponse(
-        summary=str(payload["summary"]),
-        recommendation=str(payload["recommendation"]),
-        tone=str(payload["tone"]),
-        warning_level=validate_warning_level(str(payload["warning_level"])),
-        facts_used=tuple(str(item) for item in payload.get("facts_used", ())),
-        tradeoffs=tuple(str(item) for item in payload.get("tradeoffs", ())),
-        suggested_actions=tuple(str(item) for item in payload.get("suggested_actions", ())),
-        requires_spouse_discussion=bool(payload["requires_spouse_discussion"]),
+        summary=payload["summary"],
+        recommendation=payload["recommendation"],
+        tone=payload["tone"],
+        warning_level=payload["warning_level"],
+        facts_used=tuple(payload["facts_used"]),
+        tradeoffs=tuple(payload["tradeoffs"]),
+        suggested_actions=tuple(payload["suggested_actions"]),
+        requires_spouse_discussion=payload["requires_spouse_discussion"],
         proposed_budget_change=proposed_budget_change_from_payload(proposed_change),
-        confidence=str(payload["confidence"]),
-        limitations=tuple(str(item) for item in payload.get("limitations", ())),
+        confidence=payload["confidence"],
+        limitations=tuple(payload["limitations"]),
     )
+
+
+def validate_provider_payload(payload: dict[str, Any]) -> None:
+    for key in (
+        "summary",
+        "recommendation",
+        "tone",
+        "warning_level",
+        "facts_used",
+        "tradeoffs",
+        "suggested_actions",
+        "requires_spouse_discussion",
+        "proposed_budget_change",
+        "confidence",
+        "limitations",
+    ):
+        if key not in payload:
+            raise ValueError(f"OpenAI response missing {key}")
+    for key in ("summary", "recommendation", "tone", "warning_level", "confidence"):
+        if not isinstance(payload[key], str):
+            raise ValueError(f"OpenAI response {key} must be a string")
+    if payload["tone"] != "firm_practical_not_shaming":
+        raise ValueError("OpenAI response tone is not allowed")
+    validate_warning_level(payload["warning_level"])
+    for key in ("facts_used", "tradeoffs", "suggested_actions", "limitations"):
+        if not isinstance(payload[key], list) or not all(isinstance(item, str) for item in payload[key]):
+            raise ValueError(f"OpenAI response {key} must be a list of strings")
+    if not isinstance(payload["requires_spouse_discussion"], bool):
+        raise ValueError("OpenAI response requires_spouse_discussion must be boolean")
+    validate_proposed_budget_change_payload(payload["proposed_budget_change"])
 
 
 def validate_warning_level(value: str) -> str:
     if value not in {"safe", "caution", "no", "discuss"}:
         raise ValueError("warning_level must be safe, caution, no, or discuss")
     return value
+
+
+def validate_proposed_budget_change_payload(payload: dict[str, Any] | None) -> None:
+    if payload is None:
+        return
+    if not isinstance(payload, dict):
+        raise ValueError("OpenAI response proposed_budget_change must be an object or null")
+    for key in (
+        "change_type",
+        "amount_cents",
+        "from_category_id",
+        "from_category_name",
+        "to_category_id",
+        "to_category_name",
+        "status",
+    ):
+        if key not in payload:
+            raise ValueError(f"OpenAI response proposed_budget_change missing {key}")
+    if not isinstance(payload["change_type"], str):
+        raise ValueError("OpenAI response proposed_budget_change.change_type must be a string")
+    if not isinstance(payload["amount_cents"], int):
+        raise ValueError("OpenAI response proposed_budget_change.amount_cents must be an integer")
+    if payload["from_category_id"] is not None and not isinstance(payload["from_category_id"], int):
+        raise ValueError("OpenAI response proposed_budget_change.from_category_id must be integer or null")
+    if payload["to_category_id"] is not None and not isinstance(payload["to_category_id"], int):
+        raise ValueError("OpenAI response proposed_budget_change.to_category_id must be integer or null")
+    if payload["from_category_name"] is not None and not isinstance(payload["from_category_name"], str):
+        raise ValueError("OpenAI response proposed_budget_change.from_category_name must be string or null")
+    if payload["to_category_name"] is not None and not isinstance(payload["to_category_name"], str):
+        raise ValueError("OpenAI response proposed_budget_change.to_category_name must be string or null")
+    if payload["status"] != "draft_only":
+        raise ValueError("OpenAI response proposed_budget_change.status must be draft_only")
 
 
 def proposed_budget_change_from_payload(payload: dict[str, Any] | None) -> ProposedBudgetChange | None:
