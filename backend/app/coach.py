@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+import json
+import os
+import socket
 from dataclasses import asdict, dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from .domain import BudgetSummary, SafeToSpendResult, WarningLevel, format_money
 
 
 CoachWarningLevel = str
+OpenAITransport = Callable[[dict[str, Any], str, float], dict[str, Any]]
+
+
+class CoachConfigurationError(RuntimeError):
+    pass
+
+
+class CoachProviderError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -223,13 +237,97 @@ class MockCoachProvider:
 
 
 class OpenAICoachProvider:
-    """Placeholder for a future real provider. It intentionally makes no API calls."""
+    """Production-shaped OpenAI provider. Disabled unless explicitly configured."""
+
+    api_url = "https://api.openai.com/v1/responses"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = "gpt-4o-mini",
+        timeout_seconds: float = 10.0,
+        transport: OpenAITransport | None = None,
+    ):
+        if not api_key:
+            raise CoachConfigurationError("OPENAI_API_KEY is required when COACH_PROVIDER=openai")
+        if timeout_seconds <= 0:
+            raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be positive")
+        self._api_key = api_key
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+        self._transport = transport or self._post_response
 
     def explain_safe_to_spend(self, facts: SafeToSpendFactPacket) -> CoachResponse:
-        raise NotImplementedError("Real AI provider integration is deferred beyond Milestone 5A")
+        payload = self._build_payload(
+            task="safe_to_spend",
+            facts=safe_to_spend_facts_for_provider(facts),
+        )
+        return self._call_or_fallback(payload, fallback_warning_level=facts.warning_level)
 
     def suggest_budget_change(self, facts: BudgetChangeFactPacket) -> CoachResponse:
-        raise NotImplementedError("Real AI provider integration is deferred beyond Milestone 5A")
+        payload = self._build_payload(
+            task="budget_change_suggestion",
+            facts=budget_change_facts_for_provider(facts),
+        )
+        return self._call_or_fallback(payload, fallback_warning_level="discuss")
+
+    def _build_payload(self, *, task: str, facts: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You are a household finance coach. Use only the provided backend facts. "
+                                "Do not invent balances, bills, payday dates, transactions, or professional advice. "
+                                "Do not suggest direct mutations. Keep wording short, firm, practical, and not shaming."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": json.dumps({"task": task, "facts": facts}, sort_keys=True),
+                        }
+                    ],
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "coach_response",
+                    "strict": True,
+                    "schema": coach_response_json_schema(),
+                }
+            },
+        }
+
+    def _call_or_fallback(self, payload: dict[str, Any], *, fallback_warning_level: str) -> CoachResponse:
+        try:
+            raw_response = self._transport(payload, self._api_key, self.timeout_seconds)
+            return coach_response_from_provider_payload(extract_response_json(raw_response))
+        except (CoachProviderError, HTTPError, TimeoutError, URLError, socket.timeout, OSError, ValueError, KeyError):
+            return unavailable_provider_response(fallback_warning_level)
+
+    def _post_response(self, payload: dict[str, Any], api_key: str, timeout_seconds: float) -> dict[str, Any]:
+        request = Request(
+            self.api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
 
 
 class CoachService:
@@ -337,3 +435,194 @@ def coach_response_to_dict(response: CoachResponse) -> dict[str, Any]:
     payload["suggested_actions"] = list(response.suggested_actions)
     payload["limitations"] = list(response.limitations)
     return payload
+
+
+def build_coach_service_from_env(env: dict[str, str] | None = None) -> CoachService:
+    values = env if env is not None else os.environ
+    provider_name = values.get("COACH_PROVIDER", "mock").strip().lower()
+    if provider_name in ("", "mock"):
+        return CoachService(MockCoachProvider())
+    if provider_name != "openai":
+        raise CoachConfigurationError("COACH_PROVIDER must be 'mock' or 'openai'")
+
+    api_key = values.get("OPENAI_API_KEY", "")
+    model = values.get("OPENAI_MODEL", "gpt-4o-mini")
+    timeout_seconds = parse_timeout(values.get("OPENAI_TIMEOUT_SECONDS", "10"))
+    return CoachService(
+        OpenAICoachProvider(
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+
+
+def parse_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be a number") from exc
+    if timeout <= 0:
+        raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be positive")
+    return timeout
+
+
+def safe_to_spend_facts_for_provider(facts: SafeToSpendFactPacket) -> dict[str, Any]:
+    return {
+        "amount_cents": facts.amount_cents,
+        "category_id": facts.category_id,
+        "category_name": facts.category_name,
+        "warning_level": facts.warning_level,
+        "budget_line_fits": facts.budget_line_fits,
+        "category_remaining_before_cents": facts.category_remaining_before_cents,
+        "category_remaining_after_cents": facts.category_remaining_after_cents,
+        "included_account_balance_cents": facts.included_account_balance_cents,
+        "bills_before_payday_cents": facts.bills_before_payday_cents,
+        "cash_after_bills_before_purchase_cents": facts.cash_after_bills_before_purchase_cents,
+        "cash_after_purchase_and_bills_cents": facts.cash_after_purchase_and_bills_cents,
+        "days_until_payday": facts.days_until_payday,
+        "required_phrase": facts.required_phrase,
+        "backend_facts": list(facts.backend_facts),
+        "note": facts.note,
+        "purpose": facts.purpose,
+    }
+
+
+def budget_change_facts_for_provider(facts: BudgetChangeFactPacket) -> dict[str, Any]:
+    return {
+        "budget_month_id": facts.budget_month_id,
+        "month": facts.month,
+        "amount_cents": facts.amount_cents,
+        "from_category_id": facts.from_category_id,
+        "from_category_name": facts.from_category_name,
+        "from_category_remaining_cents": facts.from_category_remaining_cents,
+        "to_category_id": facts.to_category_id,
+        "to_category_name": facts.to_category_name,
+        "to_category_remaining_cents": facts.to_category_remaining_cents,
+        "cash_after_bills_cents": facts.cash_after_bills_cents,
+        "days_until_payday": facts.days_until_payday,
+        "note": facts.note,
+        "purpose": facts.purpose,
+    }
+
+
+def coach_response_json_schema() -> dict[str, Any]:
+    proposed_budget_change_schema = {
+        "type": ["object", "null"],
+        "additionalProperties": False,
+        "properties": {
+            "change_type": {"type": "string"},
+            "amount_cents": {"type": "integer"},
+            "from_category_id": {"type": ["integer", "null"]},
+            "from_category_name": {"type": ["string", "null"]},
+            "to_category_id": {"type": ["integer", "null"]},
+            "to_category_name": {"type": ["string", "null"]},
+            "status": {"type": "string", "enum": ["draft_only"]},
+        },
+        "required": [
+            "change_type",
+            "amount_cents",
+            "from_category_id",
+            "from_category_name",
+            "to_category_id",
+            "to_category_name",
+            "status",
+        ],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": "string"},
+            "recommendation": {"type": "string"},
+            "tone": {"type": "string", "enum": ["firm_practical_not_shaming"]},
+            "warning_level": {"type": "string", "enum": ["safe", "caution", "no", "discuss"]},
+            "facts_used": {"type": "array", "items": {"type": "string"}},
+            "tradeoffs": {"type": "array", "items": {"type": "string"}},
+            "suggested_actions": {"type": "array", "items": {"type": "string"}},
+            "requires_spouse_discussion": {"type": "boolean"},
+            "proposed_budget_change": proposed_budget_change_schema,
+            "confidence": {"type": "string"},
+            "limitations": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "summary",
+            "recommendation",
+            "tone",
+            "warning_level",
+            "facts_used",
+            "tradeoffs",
+            "suggested_actions",
+            "requires_spouse_discussion",
+            "proposed_budget_change",
+            "confidence",
+            "limitations",
+        ],
+    }
+
+
+def extract_response_json(raw_response: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(raw_response.get("output_text"), str):
+        return json.loads(raw_response["output_text"])
+    for item in raw_response.get("output", []):
+        for content in item.get("content", []):
+            text = content.get("text")
+            if isinstance(text, str):
+                return json.loads(text)
+    raise CoachProviderError("OpenAI response did not include structured output text")
+
+
+def coach_response_from_provider_payload(payload: dict[str, Any]) -> CoachResponse:
+    proposed_change = payload.get("proposed_budget_change")
+    return CoachResponse(
+        summary=str(payload["summary"]),
+        recommendation=str(payload["recommendation"]),
+        tone=str(payload["tone"]),
+        warning_level=validate_warning_level(str(payload["warning_level"])),
+        facts_used=tuple(str(item) for item in payload.get("facts_used", ())),
+        tradeoffs=tuple(str(item) for item in payload.get("tradeoffs", ())),
+        suggested_actions=tuple(str(item) for item in payload.get("suggested_actions", ())),
+        requires_spouse_discussion=bool(payload["requires_spouse_discussion"]),
+        proposed_budget_change=proposed_budget_change_from_payload(proposed_change),
+        confidence=str(payload["confidence"]),
+        limitations=tuple(str(item) for item in payload.get("limitations", ())),
+    )
+
+
+def validate_warning_level(value: str) -> str:
+    if value not in {"safe", "caution", "no", "discuss"}:
+        raise ValueError("warning_level must be safe, caution, no, or discuss")
+    return value
+
+
+def proposed_budget_change_from_payload(payload: dict[str, Any] | None) -> ProposedBudgetChange | None:
+    if payload is None:
+        return None
+    return ProposedBudgetChange(
+        change_type=str(payload["change_type"]),
+        amount_cents=int(payload["amount_cents"]),
+        from_category_id=payload["from_category_id"],
+        from_category_name=payload["from_category_name"],
+        to_category_id=payload["to_category_id"],
+        to_category_name=payload["to_category_name"],
+        status=str(payload.get("status", "draft_only")),
+    )
+
+
+def unavailable_provider_response(warning_level: str) -> CoachResponse:
+    return CoachResponse(
+        summary="Coach explanation is temporarily unavailable.",
+        recommendation="Use the deterministic safe-to-spend result and discuss any unclear tradeoff before acting.",
+        tone="firm_practical_not_shaming",
+        warning_level=validate_warning_level(warning_level),
+        facts_used=("Backend financial facts were calculated, but the OpenAI provider did not return a usable response.",),
+        tradeoffs=("No budget changes were made.",),
+        suggested_actions=("Retry later.", "Use the backend safe-to-spend result as the source of truth."),
+        requires_spouse_discussion=warning_level in {"no", "discuss"},
+        proposed_budget_change=None,
+        confidence="low",
+        limitations=(
+            "OpenAI coach provider unavailable or timed out.",
+            "No provider internals, API keys, or raw errors are exposed.",
+        ),
+    )

@@ -13,6 +13,7 @@ from .coach import (
     BudgetChangeSuggestionRequest,
     CoachService,
     SafeToSpendCoachRequest,
+    build_coach_service_from_env,
     coach_response_to_dict,
 )
 from .db import BudgetRepository, account_to_dict, safe_to_spend_to_dict, summary_to_dict, transaction_detail_to_dict
@@ -363,7 +364,7 @@ def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     repository.initialize()
     ApiHandler.repository = repository
     ApiHandler.plaid_service = PlaidConnectionService(repository)
-    ApiHandler.coach_service = CoachService()
+    ApiHandler.coach_service = build_coach_service_from_env()
     return ThreadingHTTPServer((host, port), ApiHandler)
 
 

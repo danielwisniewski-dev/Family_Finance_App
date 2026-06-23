@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, and Milestone 5A backend coach scaffolding.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, and Milestone 5A/5B backend coach scaffolding.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -68,6 +68,17 @@ Milestone 5A adds backend-first AI coach scaffolding without connecting to a rea
 
 Milestone 5A is intentionally backend-first. Android coach display, chatbot UI, conversation history, autonomous actions, and push notifications remain deferred.
 
+Milestone 5B adds a production-shaped OpenAI coach provider scaffold, disabled by default:
+
+- `MockCoachProvider` remains the default provider
+- `OpenAICoachProvider` is selected only when `COACH_PROVIDER=openai`
+- OpenAI receives only controlled backend fact packets
+- OpenAI responses are expected as structured JSON and mapped into the existing `CoachResponse` schema
+- Missing OpenAI configuration returns a clear configuration error
+- Timeout or provider failure returns a sanitized fallback coach response
+- Tests use fake OpenAI transports only; they make no live OpenAI network calls
+- No OpenAI API key is required for tests, demo seed, or default local development
+
 Environment variables are placeholders only:
 
 - `PLAID_CLIENT_ID`
@@ -76,8 +87,12 @@ Environment variables are placeholders only:
 - `PLAID_PRODUCTS`
 - `PLAID_COUNTRY_CODES`
 - `PLAID_REDIRECT_URI`
+- `COACH_PROVIDER`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+- `OPENAI_TIMEOUT_SECONDS`
 
-Do not commit `.env` files or real Plaid credentials.
+Do not commit `.env` files, real Plaid credentials, or real OpenAI API keys.
 
 ## Database Schema Assumption
 
@@ -87,7 +102,7 @@ Current assumption: this is still a dev-only SQLite schema rebuild workflow. Dur
 
 Deferred by design:
 
-- Real AI provider integration
+- Live OpenAI provider use in demos/tests
 - Push notifications
 - Credit cards
 - Receipt scanning
@@ -291,7 +306,7 @@ Placeholder or intentionally limited in Milestone 4:
 
 ## Coach API Notes
 
-Milestone 5A coach routes are mock/deterministic backend routes:
+Milestone 5 coach routes are backend routes behind a provider abstraction:
 
 ```text
 POST /coach/safe-to-spend
@@ -332,4 +347,25 @@ Budget change suggestion payload:
 
 This returns a draft `proposed_budget_change` only. It does not apply the change, update category funding, recategorize transactions, mark transactions reviewed, create/archive categories, or access Plaid.
 
-No OpenAI, Anthropic, Gemini, Agents SDK, MCP/tool layer, real API key, or `.env` file is required for Milestone 5A.
+No Anthropic, Gemini, Agents SDK, MCP/tool layer, real API key, or `.env` file is required for Milestone 5A/5B default mock operation.
+
+### Coach Provider Configuration
+
+By default, the backend uses the deterministic mock provider:
+
+```powershell
+$env:COACH_PROVIDER = "mock"
+```
+
+To enable the OpenAI provider later for local development, set:
+
+```powershell
+$env:COACH_PROVIDER = "openai"
+$env:OPENAI_API_KEY = "<your real key outside git>"
+$env:OPENAI_MODEL = "gpt-4o-mini"
+$env:OPENAI_TIMEOUT_SECONDS = "10"
+```
+
+`OPENAI_API_KEY` is required only when `COACH_PROVIDER=openai`. Never commit `.env` files or real keys. Real OpenAI API use may incur cost, so keep `COACH_PROVIDER=mock` for tests and demos unless you intentionally opt in locally.
+
+The OpenAI provider is a direct backend provider abstraction for short coach calls. It does not use the Agents SDK, does not expose provider internals to Android, does not access Plaid, and does not mutate budget, category, or transaction data.

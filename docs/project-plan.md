@@ -413,11 +413,21 @@ The coach may not:
 - Access Plaid directly
 - Invent balances, bills, payday dates, or transactions
 
-### Milestone 5B - Agent Advisor Layer
+### Milestone 5B - OpenAI Provider Scaffold
 
 Goal:
 
-Add real AI explanation without letting AI own financial truth.
+Add production-shaped OpenAI coach provider integration without making it the default provider.
+
+The provider should:
+
+- Stay disabled unless `COACH_PROVIDER=openai`
+- Require `OPENAI_API_KEY` only when OpenAI is explicitly selected
+- Use `OPENAI_MODEL` and `OPENAI_TIMEOUT_SECONDS`
+- Receive only backend-produced fact packets
+- Request structured JSON output and map it into the existing coach response schema
+- Return sanitized fallback responses on timeout or provider error
+- Avoid live OpenAI calls in tests and demos
 
 The agent should use backend-calculated numbers only.
 
