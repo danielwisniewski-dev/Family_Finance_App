@@ -18,6 +18,7 @@ class ApiTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.auth_token: str | None = None
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -26,17 +27,18 @@ class ApiTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_safe_to_spend_endpoint_returns_required_fields(self) -> None:
-        household = self.post(
-            "/households",
-            {
-                "name": "API Household",
-                "spouses": [{"name": "A"}, {"name": "B"}],
-            },
+        household_id = ApiHandler.repository.create_household(
+            "API Household",
+            spouses=[
+                {"name": "A", "username": "api-a", "email": "api-a@example.test", "password": "api-a-password"},
+                {"name": "B", "username": "api-b", "email": "api-b@example.test", "password": "api-b-password"},
+            ],
         )
+        self.login("api-a", "api-a-password")
         budget_month = self.post(
             "/budget-months",
             {
-                "household_id": household["id"],
+                "household_id": household_id,
                 "month": "2026-06",
                 "included_account_balance_cents": 100_000,
             },
@@ -77,7 +79,7 @@ class ApiTests(unittest.TestCase):
         self.post(
             "/paydays",
             {
-                "household_id": household["id"],
+                "household_id": household_id,
                 "payday_date": "2026-06-28",
             },
         )
@@ -100,11 +102,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["days_until_payday"], 7)
 
     def test_transaction_review_endpoints_return_sanitized_payloads(self) -> None:
-        household = self.post("/households", {"name": "API Transaction Household"})
+        household_id = ApiHandler.repository.create_household(
+            "API Transaction Household",
+            spouses=[
+                {
+                    "name": "Reviewer",
+                    "username": "api-reviewer",
+                    "email": "api-reviewer@example.test",
+                    "password": "api-reviewer-password",
+                }
+            ],
+        )
+        self.login("api-reviewer", "api-reviewer-password")
         budget_month = self.post(
             "/budget-months",
             {
-                "household_id": household["id"],
+                "household_id": household_id,
                 "month": "2026-06",
                 "included_account_balance_cents": 100_000,
             },
@@ -161,24 +174,25 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("access_token_ref", serialized_detail)
 
     def test_notification_routes_list_count_and_mark_read(self) -> None:
-        household = self.post(
-            "/households",
-            {
-                "name": "API Notification Household",
-                "spouses": [{"name": "A"}, {"name": "B"}],
-            },
+        household_id = ApiHandler.repository.create_household(
+            "API Notification Household",
+            spouses=[
+                {"name": "A", "username": "api-note-a", "email": "api-note-a@example.test", "password": "api-note-a-password"},
+                {"name": "B", "username": "api-note-b", "email": "api-note-b@example.test", "password": "api-note-b-password"},
+            ],
         )
+        self.login("api-note-a", "api-note-a-password")
         with ApiHandler.repository.connect() as connection:
             user_id = int(
                 connection.execute(
                     "SELECT id FROM users WHERE household_id = ? ORDER BY id LIMIT 1",
-                    (household["id"],),
+                    (household_id,),
                 ).fetchone()["id"]
             )
         budget_month = self.post(
             "/budget-months",
             {
-                "household_id": household["id"],
+                "household_id": household_id,
                 "month": "2026-06",
                 "included_account_balance_cents": 100_000,
             },
@@ -241,15 +255,28 @@ class ApiTests(unittest.TestCase):
         ][0]
         self.assertIsNotNone(read_assigned["read_at"])
 
+    def login(self, username: str, password: str) -> dict[str, object]:
+        result = self.post(
+            "/auth/login",
+            {
+                "username": username,
+                "password": password,
+            },
+            use_auth=False,
+        )
+        self.auth_token = str(result["token"])
+        return result
+
     def get(self, path: str) -> dict[str, object]:
-        with urlopen(f"{self.base_url}{path}", timeout=5) as response:
+        request = Request(f"{self.base_url}{path}", headers=self.auth_headers(), method="GET")
+        with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+    def post(self, path: str, payload: dict[str, object], *, use_auth: bool = True) -> dict[str, object]:
         request = Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self.auth_headers(use_auth) | {"Content-Type": "application/json"},
             method="POST",
         )
         with urlopen(request, timeout=5) as response:
@@ -259,11 +286,16 @@ class ApiTests(unittest.TestCase):
         request = Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self.auth_headers() | {"Content-Type": "application/json"},
             method="PATCH",
         )
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def auth_headers(self, use_auth: bool = True) -> dict[str, str]:
+        if not use_auth or self.auth_token is None:
+            return {}
+        return {"Authorization": f"Bearer {self.auth_token}"}
 
 
 if __name__ == "__main__":
