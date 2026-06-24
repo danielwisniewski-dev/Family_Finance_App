@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS plaid_items (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS plaid_access_tokens (
+    token_ref TEXT PRIMARY KEY,
+    access_token TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS cash_accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month_id INTEGER NOT NULL REFERENCES budget_months(id) ON DELETE CASCADE,
@@ -200,6 +206,7 @@ CREATE TABLE IF NOT EXISTS plaid_sync_errors (
 );
 
 CREATE INDEX IF NOT EXISTS idx_plaid_items_household ON plaid_items(household_id);
+CREATE INDEX IF NOT EXISTS idx_plaid_access_tokens_created ON plaid_access_tokens(created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
     ON users(username)
     WHERE username IS NOT NULL;

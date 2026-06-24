@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, and Milestone 7 private household access.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, and Milestone 8 Plaid Sandbox linking/sync.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -90,13 +90,28 @@ Milestone 7 adds a lean private household access layer:
 
 This is not production SaaS authentication. There is no public signup, password reset, email verification, OAuth, admin role system, or production identity-provider integration.
 
-Environment variables are placeholders only:
+Milestone 8 adds Plaid Sandbox linking and sync:
+
+- Backend-created Plaid Link tokens for authenticated users
+- Android Plaid Link launch using the official Plaid Link SDK
+- Backend-only public token exchange and access token handling
+- Local MVP SQLite token references with backend-only raw token storage
+- Checking/savings account import and balance sync
+- Credit card, loan, and investment accounts ignored for MVP scope
+- Transactions Sync support for added, modified, and removed transactions
+- Cursor persistence for incremental transaction sync
+- Removed Plaid transactions marked ignored/auditable rather than deleted
+- Sanitized sync errors that do not expose Plaid or OpenAI secrets
+
+This is Sandbox-only. `PLAID_ENV` must be `sandbox`; production Plaid is intentionally unsupported in this app.
+
+Environment variables:
 
 - `PLAID_CLIENT_ID`
 - `PLAID_SECRET`
-- `PLAID_ENV`
-- `PLAID_PRODUCTS`
-- `PLAID_COUNTRY_CODES`
+- `PLAID_ENV=sandbox`
+- `PLAID_PRODUCTS=transactions`
+- `PLAID_COUNTRY_CODES=US`
 - `PLAID_REDIRECT_URI`
 - `COACH_PROVIDER`
 - `OPENAI_API_KEY`
@@ -121,11 +136,11 @@ Deferred by design:
 - Receipt scanning
 - MCP/tool layer
 
-Milestone 4 still intentionally excludes:
+Still intentionally excluded:
 
 - Production auth
-- Real Plaid network integration
-- AI behavior
+- Production Plaid
+- AI autonomous budget changes
 - Receipt scanning
 - Credit cards
 - MCP/tool layer
@@ -217,6 +232,38 @@ Health check:
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/health
 ```
+
+## Plaid Sandbox Setup
+
+Do not use production Plaid credentials with this app. For local Sandbox linking:
+
+1. In the Plaid Dashboard, add Android package name `com.familyfinance.app` to the allowed Android package names.
+2. Set local environment variables outside git:
+
+```powershell
+$env:PLAID_CLIENT_ID = "<your sandbox client id>"
+$env:PLAID_SECRET = "<your sandbox secret>"
+$env:PLAID_ENV = "sandbox"
+$env:PLAID_PRODUCTS = "transactions"
+$env:PLAID_COUNTRY_CODES = "US"
+```
+
+`PLAID_REDIRECT_URI` is optional and should only be set if your Plaid Dashboard/app configuration requires it.
+
+The backend creates Link tokens and exchanges public tokens. Android never receives Plaid access tokens or token refs. For this local MVP, raw Plaid access tokens are stored in SQLite behind token refs so sync can work across backend calls. Production requires encrypted persistent secret storage or a secrets manager before using real financial credentials.
+
+Sandbox manual flow:
+
+1. Run the backend with the env vars above.
+2. Log into Android as Daniel or Kara.
+3. Open `Accounts / settings`.
+4. Tap `Link bank with Plaid Sandbox`.
+5. Complete Plaid Link with Sandbox test credentials.
+6. Confirm linked checking/savings accounts appear.
+7. Tap `Sync balances` and `Sync transactions`.
+8. Confirm imported transactions appear in `Transactions` and uncategorized items appear in `Uncategorized review`.
+
+Credit cards, loans, and investments returned by Plaid are ignored for this MVP.
 
 Login for protected API routes:
 
@@ -341,7 +388,7 @@ Placeholder or intentionally limited:
 - Budget group names are not exposed by the current backend summary route
 - Funding edits are placeholder-only
 - Transaction split editing is read-only in Android
-- Plaid remains scaffolding/mock behavior only
+- Plaid is Sandbox-only and requires local Plaid env vars for live linking
 - AI, receipt scanning, credit cards, MCP, and push notifications are not included
 
 ## Coach API Notes

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.app.db import BudgetRepository
 from backend.app.plaid import (
@@ -207,6 +208,96 @@ class PlaidAccountTests(unittest.TestCase):
         self.assertEqual(result.accounts[0]["account_type"], "checking")
         self.assertFalse(result.accounts[2]["included_in_cash_reality"])
 
+    def test_credit_card_accounts_are_ignored_during_import(self) -> None:
+        service = PlaidConnectionService(
+            self.repository,
+            client=CreditCardPlaidClient(),
+            token_store=InMemoryPlaidTokenStore(),
+        )
+
+        result = service.exchange_public_token(
+            household_id=self.household_id,
+            budget_month_id=self.budget_month_id,
+            public_token="public-sandbox-token",
+        )
+        accounts = self.repository.list_accounts(self.budget_month_id)
+
+        self.assertEqual(len(result.accounts), 1)
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0].account_type, "checking")
+        self.assertEqual(accounts[0].name, "Main Checking")
+
+    def test_transaction_sync_inserts_added_transactions_and_persists_cursor(self) -> None:
+        token_store = InMemoryPlaidTokenStore()
+        token_ref = token_store.store("raw-access-token")
+        plaid_item_id = self.create_connected_checking_item(token_ref)
+        client = CursorPlaidClient()
+        service = PlaidConnectionService(self.repository, client=client, token_store=token_store)
+
+        outcome = service.sync_transactions(plaid_item_id)
+        item = self.repository.get_plaid_item(plaid_item_id)
+        account_id = self.repository.find_account_id_by_plaid_account(plaid_item_id, "checking-one")
+        transactions = self.repository.list_transactions(account_id or 0)
+
+        self.assertTrue(outcome.success)
+        self.assertEqual(outcome.inserted_transactions, 1)
+        self.assertEqual(item.sync_cursor, "cursor-1")
+        self.assertEqual(client.cursors, [None])
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0].plaid_transaction_id, "txn-sync-one")
+
+    def test_repeated_transaction_sync_does_not_duplicate_transactions_and_reuses_cursor(self) -> None:
+        token_store = InMemoryPlaidTokenStore()
+        token_ref = token_store.store("raw-access-token")
+        plaid_item_id = self.create_connected_checking_item(token_ref)
+        client = DuplicatePlaidClient()
+        service = PlaidConnectionService(self.repository, client=client, token_store=token_store)
+
+        first = service.sync_transactions(plaid_item_id)
+        second = service.sync_transactions(plaid_item_id)
+        account_id = self.repository.find_account_id_by_plaid_account(plaid_item_id, "checking-one")
+        transactions = self.repository.list_transactions(account_id or 0)
+
+        self.assertEqual(first.inserted_transactions, 1)
+        self.assertEqual(second.updated_transactions, 1)
+        self.assertEqual(client.cursors, [None, "cursor-dup-1"])
+        self.assertEqual(len(transactions), 1)
+
+    def test_modified_transactions_update_existing_records(self) -> None:
+        token_store = InMemoryPlaidTokenStore()
+        token_ref = token_store.store("raw-access-token")
+        plaid_item_id = self.create_connected_checking_item(token_ref)
+        client = ModifiedPlaidClient()
+        service = PlaidConnectionService(self.repository, client=client, token_store=token_store)
+
+        service.sync_transactions(plaid_item_id)
+        outcome = service.sync_transactions(plaid_item_id)
+        account_id = self.repository.find_account_id_by_plaid_account(plaid_item_id, "checking-one")
+        transactions = self.repository.list_transactions(account_id or 0)
+
+        self.assertEqual(outcome.updated_transactions, 1)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0].amount_cents, -1_500)
+        self.assertEqual(transactions[0].name, "Coffee Final")
+
+    def test_removed_transactions_are_ignored_and_auditable(self) -> None:
+        token_store = InMemoryPlaidTokenStore()
+        token_ref = token_store.store("raw-access-token")
+        plaid_item_id = self.create_connected_checking_item(token_ref)
+        client = RemovedPlaidClient()
+        service = PlaidConnectionService(self.repository, client=client, token_store=token_store)
+
+        service.sync_transactions(plaid_item_id)
+        outcome = service.sync_transactions(plaid_item_id)
+        account_id = self.repository.find_account_id_by_plaid_account(plaid_item_id, "checking-one")
+        transactions = self.repository.list_transactions(account_id or 0)
+        detail = self.repository.get_transaction_detail(transactions[0].id)
+
+        self.assertEqual(outcome.removed_transactions, 1)
+        self.assertTrue(detail.transaction.ignored)
+        self.assertEqual(detail.transaction.ignored_reason, "Removed by Plaid sync")
+        self.assertTrue(any(event["event_type"] == "removed_by_plaid" for event in detail.audit_events))
+
     def test_sync_errors_are_recorded_without_raising(self) -> None:
         token_store = InMemoryPlaidTokenStore()
         token_ref = token_store.store("raw-access-token")
@@ -230,6 +321,47 @@ class PlaidAccountTests(unittest.TestCase):
         self.assertEqual(item.status, "error")
         self.assertEqual(item.last_error_code, "ITEM_LOGIN_REQUIRED")
         self.assertEqual(len(errors), 1)
+
+    def test_sync_errors_are_sanitized_before_response_and_storage(self) -> None:
+        token_store = InMemoryPlaidTokenStore()
+        token_ref = token_store.store("raw-access-token")
+        plaid_item_id = self.repository.create_plaid_item(
+            household_id=self.household_id,
+            plaid_item_id="item-secret-failing",
+            access_token_ref=token_ref,
+        )
+        service = PlaidConnectionService(
+            self.repository,
+            client=SecretFailingPlaidClient(),
+            token_store=token_store,
+        )
+
+        with patch.dict("os.environ", {"PLAID_SECRET": "super-secret", "OPENAI_API_KEY": "sk-secret"}):
+            outcome = service.sync_balances(plaid_item_id)
+        errors = self.repository.list_plaid_sync_errors(plaid_item_id)
+        serialized = f"{outcome.error_message} {errors[0]['error_message']}"
+
+        self.assertNotIn("super-secret", serialized)
+        self.assertNotIn("sk-secret", serialized)
+        self.assertNotIn("token-ref", serialized)
+        self.assertIn("redacted", serialized)
+
+    def create_connected_checking_item(self, token_ref: str) -> int:
+        plaid_item_id = self.repository.create_plaid_item(
+            household_id=self.household_id,
+            plaid_item_id=f"item-{token_ref}",
+            access_token_ref=token_ref,
+        )
+        self.repository.upsert_connected_account(
+            budget_month_id=self.budget_month_id,
+            plaid_item_id=plaid_item_id,
+            plaid_account_id="checking-one",
+            name="Main Checking",
+            account_type="checking",
+            balance_cents=75_000,
+            included_in_cash_reality=True,
+        )
+        return plaid_item_id
 
 
 class FakePlaidClient:
@@ -292,6 +424,97 @@ class FakePlaidClient:
 class FailingPlaidClient(FakePlaidClient):
     def get_balances(self, access_token: str) -> tuple[PlaidAccountSnapshot, ...]:
         raise PlaidIntegrationError("Plaid item needs user repair", "ITEM_LOGIN_REQUIRED")
+
+
+class SecretFailingPlaidClient(FakePlaidClient):
+    def get_balances(self, access_token: str) -> tuple[PlaidAccountSnapshot, ...]:
+        raise PlaidIntegrationError(
+            "Failed with secret super-secret, key sk-secret, and token-ref plaid-token-ref-test",
+            "PLAID_SECRET_LEAK_TEST",
+        )
+
+
+class CreditCardPlaidClient(FakePlaidClient):
+    def exchange_public_token(self, public_token: str) -> PlaidPublicTokenExchange:
+        return PlaidPublicTokenExchange(
+            access_token="fake-access-token",
+            plaid_item_id="item-with-credit-card",
+            institution_id="ins-test",
+            institution_name="Test Bank",
+            accounts=(
+                PlaidAccountSnapshot(
+                    plaid_account_id="checking-one",
+                    name="Main Checking",
+                    account_type="checking",
+                    balance_cents=75_000,
+                ),
+                PlaidAccountSnapshot(
+                    plaid_account_id="credit-one",
+                    name="Sandbox Credit Card",
+                    account_type="credit",
+                    balance_cents=-10_000,
+                ),
+            ),
+        )
+
+
+class CursorPlaidClient(FakePlaidClient):
+    def __init__(self) -> None:
+        self.cursors: list[str | None] = []
+
+    def sync_transactions(self, access_token: str, cursor: str | None) -> PlaidTransactionSync:
+        self.cursors.append(cursor)
+        return PlaidTransactionSync(
+            transactions=(sync_transaction("txn-sync-one", -1_200, "Coffee"),),
+            next_cursor="cursor-1",
+        )
+
+
+class DuplicatePlaidClient(CursorPlaidClient):
+    def sync_transactions(self, access_token: str, cursor: str | None) -> PlaidTransactionSync:
+        self.cursors.append(cursor)
+        return PlaidTransactionSync(
+            transactions=(sync_transaction("txn-duplicate-sync", -1_200, "Coffee"),),
+            next_cursor=f"cursor-dup-{len(self.cursors)}",
+        )
+
+
+class ModifiedPlaidClient(CursorPlaidClient):
+    def sync_transactions(self, access_token: str, cursor: str | None) -> PlaidTransactionSync:
+        self.cursors.append(cursor)
+        if cursor is None:
+            return PlaidTransactionSync(
+                transactions=(sync_transaction("txn-modified", -1_200, "Coffee Pending"),),
+                next_cursor="cursor-mod-1",
+            )
+        return PlaidTransactionSync(
+            modified_transactions=(sync_transaction("txn-modified", -1_500, "Coffee Final"),),
+            next_cursor="cursor-mod-2",
+        )
+
+
+class RemovedPlaidClient(CursorPlaidClient):
+    def sync_transactions(self, access_token: str, cursor: str | None) -> PlaidTransactionSync:
+        self.cursors.append(cursor)
+        if cursor is None:
+            return PlaidTransactionSync(
+                transactions=(sync_transaction("txn-removed", -1_200, "Coffee"),),
+                next_cursor="cursor-rem-1",
+            )
+        return PlaidTransactionSync(
+            removed_transaction_ids=("txn-removed",),
+            next_cursor="cursor-rem-2",
+        )
+
+
+def sync_transaction(plaid_transaction_id: str, amount_cents: int, name: str) -> PlaidTransactionSnapshot:
+    return PlaidTransactionSnapshot(
+        plaid_transaction_id=plaid_transaction_id,
+        plaid_account_id="checking-one",
+        amount_cents=amount_cents,
+        occurred_on=date(2026, 6, 21),
+        name=name,
+    )
 
 
 if __name__ == "__main__":

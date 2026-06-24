@@ -26,6 +26,7 @@ from .db import (
 )
 from .plaid import (
     PlaidConnectionService,
+    build_plaid_service_from_env,
     link_token_to_dict,
     plaid_connection_result_to_dict,
     plaid_sync_outcome_to_dict,
@@ -612,7 +613,7 @@ def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     repository = BudgetRepository(db_path)
     repository.initialize()
     ApiHandler.repository = repository
-    ApiHandler.plaid_service = PlaidConnectionService(repository)
+    ApiHandler.plaid_service = build_plaid_service_from_env(repository)
     ApiHandler.coach_service = build_coach_service_from_env()
     return ThreadingHTTPServer((host, port), ApiHandler)
 
