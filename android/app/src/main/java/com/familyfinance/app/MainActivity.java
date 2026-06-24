@@ -55,6 +55,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.time.LocalDate;
 import java.time.YearMonth;
 
 import kotlin.Unit;
@@ -517,6 +518,10 @@ public final class MainActivity extends Activity {
                 toast("Enter the next payday date.");
                 return;
             }
+            if (!isIsoDate(payday)) {
+                toast("Next payday must use YYYY-MM-DD.");
+                return;
+            }
             runMutation(
                     "Creating starter budget...",
                     () -> {
@@ -553,7 +558,10 @@ public final class MainActivity extends Activity {
     private void showBudget() {
         beginScreen("Monthly Budget");
         if (summary == null || budgetDetail == null) {
-            addBody("No budget loaded.");
+            addBody("No budget month is loaded. Create a starter budget or reload after the backend is reachable.");
+            if (budgetMonths.isEmpty()) {
+                addButton("Create starter budget month", this::showStarterBudget);
+            }
             addNav();
             return;
         }
@@ -628,6 +636,12 @@ public final class MainActivity extends Activity {
     private void showBudgetMonths() {
         beginScreen("Budget Months");
         addMetric("Current month", summary == null ? "-" : summary.month);
+        if (budgetMonths.isEmpty()) {
+            addBody("No budget months returned by the backend.");
+            addButton("Create starter budget month", this::showStarterBudget);
+            addNav();
+            return;
+        }
         for (BudgetMonth month : budgetMonths) {
             addButton(
                     (month.active ? "Active  " : "") + month.month + " | ID " + month.id,
@@ -922,7 +936,9 @@ public final class MainActivity extends Activity {
         beginScreen(reviewOnly ? "Uncategorized Review" : "Transactions");
         List<TransactionDetail> source = reviewOnly ? reviewQueue : transactions;
         if (source.isEmpty()) {
-            addBody(reviewOnly ? "No transactions need categorization." : "No transactions returned by backend.");
+            addBody(reviewOnly
+                    ? "No transactions need categorization right now."
+                    : "No transactions returned by the backend for this budget month.");
         } else {
             for (TransactionDetail detail : source) {
                 addTransactionButton(detail);
@@ -1074,11 +1090,12 @@ public final class MainActivity extends Activity {
                 total += cents;
             }
             if (splits.size() < 2) {
-                toast("Use at least two split lines.");
+                toast(BudgetScreenState.splitValidationMessage(totalCents, splitAmounts(splits)));
                 return;
             }
-            if (total != totalCents) {
-                toast("Split total must equal the transaction amount.");
+            String validation = BudgetScreenState.splitValidationMessage(totalCents, splitAmounts(splits));
+            if (!validation.isEmpty()) {
+                toast(validation);
                 return;
             }
             runMutation(
@@ -1239,6 +1256,16 @@ public final class MainActivity extends Activity {
 
     private void showSafeToSpend() {
         beginScreen("Safe To Spend");
+        if (summary == null) {
+            addBody("No budget month is loaded. Safe-to-spend needs backend budget and payday data.");
+            addNav();
+            return;
+        }
+        if (summary.categories.isEmpty()) {
+            addBody("No active categories are available for safe-to-spend.");
+            addNav();
+            return;
+        }
         EditText amount = new EditText(this);
         amount.setHint("Amount, e.g. 42.50");
         amount.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
@@ -1308,7 +1335,7 @@ public final class MainActivity extends Activity {
                 AppDiagnostics diagnostics = api.getDiagnostics();
                 mainHandler.post(() -> renderSettings(accountSettings, diagnostics, null));
             } catch (Exception exception) {
-                mainHandler.post(() -> renderSettings(null, null, exception.getMessage()));
+                mainHandler.post(() -> renderSettings(null, null, userFacingError(exception)));
             }
         });
     }
@@ -1338,8 +1365,24 @@ public final class MainActivity extends Activity {
             addFact("Backend reachable", diagnostics.backendReachable ? "Yes" : "No");
             addFact("Database initialized", diagnostics.databaseInitialized ? "Yes" : "No");
             addFact("Plaid sandbox only", diagnostics.plaidSandboxOnly ? "Yes" : "No");
+            addFact("Active budget month ID", diagnostics.activeBudgetMonthId == 0 ? "-" : Integer.toString(diagnostics.activeBudgetMonthId));
+            addFact("Integrity", diagnostics.integrityOk ? "OK" : "Needs attention");
             addFact("Diagnostic user", blankAsDash(diagnostics.userName));
             addFact("Diagnostic household", blankAsDash(diagnostics.householdName));
+            if (!diagnostics.checks.isEmpty()) {
+                addSection("Integrity checks");
+                for (AppDiagnostics.DiagnosticCheck check : diagnostics.checks) {
+                    String line = (check.ok ? "OK: " : "Needs attention: ") + check.message;
+                    if (check.count > 0) {
+                        line = line + " (" + check.count + ")";
+                    }
+                    if (check.ok) {
+                        addBody(line);
+                    } else {
+                        addWarning(line);
+                    }
+                }
+            }
         }
         addButton("Save and reload", () -> {
             int parsedId;
@@ -1399,6 +1442,10 @@ public final class MainActivity extends Activity {
                 toast("Enter current and new passwords.");
                 return;
             }
+            if (newPassword.length() < 8) {
+                toast("New password must be at least 8 characters.");
+                return;
+            }
             runMutation(
                     "Changing password...",
                     () -> api.changePassword(currentPassword, newPassword),
@@ -1417,7 +1464,7 @@ public final class MainActivity extends Activity {
 
         addSection("Account inclusion");
         if (accounts.isEmpty()) {
-            addBody("No linked checking or savings accounts returned.");
+            addBody("No linked checking or savings accounts returned. Link Plaid Sandbox or add demo accounts from the backend seed flow.");
         } else {
             for (CashAccount account : accounts) {
                 addBody(account.name
@@ -1568,7 +1615,7 @@ public final class MainActivity extends Activity {
     private void showError(String context, Exception exception) {
         beginScreen("Error");
         addWarning(context);
-        addBody(exception.getMessage() == null ? exception.toString() : exception.getMessage());
+        addBody(userFacingError(exception));
         addButton("Log in", () -> showLogin(null));
         addButton("Retry dashboard", () -> refreshData(this::showDashboard));
         addButton("Settings", this::showSettings);
@@ -1668,6 +1715,49 @@ public final class MainActivity extends Activity {
             return null;
         }
         return summary.categories.get(spinner.getSelectedItemPosition());
+    }
+
+    private List<Integer> splitAmounts(List<int[]> splits) {
+        ArrayList<Integer> amounts = new ArrayList<>();
+        for (int[] split : splits) {
+            amounts.add(split[1]);
+        }
+        return amounts;
+    }
+
+    private boolean isIsoDate(String value) {
+        try {
+            LocalDate.parse(value);
+            return true;
+        } catch (Exception exception) {
+            return false;
+        }
+    }
+
+    private String userFacingError(Exception exception) {
+        if (exception == null) {
+            return "Unknown error.";
+        }
+        String message = exception.getMessage() == null ? exception.toString() : exception.getMessage();
+        if (message.contains("Login required") || message.contains("Authentication required")) {
+            return "Session expired or login is required. Please log in again.";
+        }
+        if (message.contains("Plaid Sandbox is not configured")) {
+            return "Plaid Sandbox is not configured on the backend.";
+        }
+        if (message.contains("No upcoming payday configured")) {
+            return "Safe-to-spend needs an upcoming payday. Add a payday in Bills and paydays.";
+        }
+        if (message.contains("No active category") || message.contains("not part of budget month")) {
+            return "Safe-to-spend needs an active budget category for this month.";
+        }
+        if (message.contains("Split amounts must equal") || message.contains("Split total must equal")) {
+            return "Split total must equal the transaction amount.";
+        }
+        if (message.contains("Category must belong") && message.contains("active")) {
+            return "That archived or unavailable category cannot be used for this action.";
+        }
+        return message;
     }
 
     private void setSpinnerToCategory(Spinner spinner, int categoryId) {

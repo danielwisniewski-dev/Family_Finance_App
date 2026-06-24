@@ -44,4 +44,21 @@ public final class BudgetScreenState {
         }
         return null;
     }
+
+    public static String splitValidationMessage(int transactionTotalCents, List<Integer> splitAmountsCents) {
+        if (splitAmountsCents == null || splitAmountsCents.size() < 2) {
+            return "Use at least two split lines.";
+        }
+        int total = 0;
+        for (Integer amount : splitAmountsCents) {
+            if (amount == null || amount <= 0) {
+                return "Split amounts must be positive.";
+            }
+            total += amount;
+        }
+        if (total != transactionTotalCents) {
+            return "Split total must equal the transaction amount.";
+        }
+        return "";
+    }
 }

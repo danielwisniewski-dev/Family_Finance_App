@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, and Milestone 9 budget setup/monthly planning.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, and Milestone 12 MVP usability hardening/data integrity.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -116,6 +116,15 @@ Milestone 9 adds budget setup and monthly planning edits:
 - Accountability notification events for budget setup changes
 - Android screens for budget months, category funding, income planning, and bills/paydays
 
+Milestone 12 hardens MVP daily-use behavior:
+
+- Consistent sanitized API error payloads with stable `error`, `message`, `code`, and `status` fields
+- Authenticated `/app/diagnostics` response with read-only integrity checks
+- Validation for common names, dates, password, and amount inputs
+- Clear safe-to-spend errors when budget, category, or payday data is missing
+- Sanitized Plaid Sandbox configuration and request failures
+- Android empty/loading/error states for setup, dashboard, budget, review queue, safe-to-spend, Plaid/accounts, settings, and diagnostics
+
 Environment variables:
 
 - `PLAID_CLIENT_ID`
@@ -156,7 +165,7 @@ Still intentionally excluded:
 - Credit cards
 - MCP/tool layer
 - Push notifications
-- Transaction split editing in Android
+- Production-grade migration tooling
 
 ## Transaction Review API Notes
 
@@ -369,25 +378,21 @@ Android emulators use `10.0.2.2` to reach the host machine loopback address. Use
 
 The app allows cleartext HTTP for this local MVP demo only. Do not treat that as production network security.
 
-## Milestone 4 Smoke Test
+## MVP Smoke Test
 
 With the demo API running and the Pixel 8 emulator open, verify:
 
-- Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
 - Login succeeds with local-only Daniel or Kara demo credentials.
-- Logout clears the local MVP token and returns to the login screen.
-- Monthly budget shows backend categories.
-- Tapping a budget category opens category detail.
-- Monthly budget supports budget month switching/copy-forward, category add/edit/archive, and category funding edits.
-- Income planning supports income add/edit/remove.
-- Bills and paydays supports expected bill and payday add/edit/remove.
-- Transactions shows seeded mock transactions.
-- Uncategorized review shows items from the demo seed.
-- Tapping a transaction opens transaction detail.
+- Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
+- Monthly budget shows backend groups/categories and supports budget month switching/copy-forward, category add/edit/archive, and funding edits.
 - Safe to spend returns a backend-calculated result and required phrase.
-- Transaction detail can assign a category, toggle reviewed/unreviewed, and ignore/unignore a transaction.
+- Uncategorized review shows empty or non-empty state from backend data.
+- Tapping a transaction opens transaction detail when demo transactions exist.
+- Transaction detail can assign a category, split a transaction, toggle reviewed/unreviewed, create a merchant rule, and ignore/unignore a transaction.
+- Accounts / settings shows account inclusion, Plaid Sandbox actions, account settings, and diagnostics/integrity checks.
+- Logout clears the local MVP token and returns to the login screen.
 
-Real in Milestone 4:
+Real in current MVP:
 
 - Backend API calls from Android
 - Backend summary, account, transaction, review queue, transaction detail, safe-to-spend, category assignment, review, and ignore data
@@ -400,7 +405,6 @@ Placeholder or intentionally limited:
 - Budget change approval is not implemented
 - Budget group names are not exposed by the current backend summary route
 - Funding edits are placeholder-only
-- Transaction split editing is read-only in Android
 - Plaid is Sandbox-only and requires local Plaid env vars for live linking
 - AI, receipt scanning, credit cards, MCP, and push notifications are not included
 

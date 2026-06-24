@@ -66,10 +66,7 @@ public final class JsonHttpClient {
             String body = readBody(status >= 400 ? connection.getErrorStream() : connection.getInputStream());
             JSONObject json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
             if (status >= 400) {
-                if (status == 401 && !"/auth/login".equals(path)) {
-                    throw new ApiException("Login required or session expired. Please log in again.");
-                }
-                throw new ApiException(json.optString("error", "API error " + status));
+                throw ApiException.fromApiError(status, json, path);
             }
             return json;
         } catch (ApiException exception) {

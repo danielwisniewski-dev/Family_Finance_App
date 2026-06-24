@@ -575,9 +575,15 @@ def optional_str(value: object) -> str | None:
 
 def sanitize_plaid_error(message: str) -> str:
     lowered = message.casefold()
+    if "plaid sandbox is not configured" in lowered:
+        return "Plaid Sandbox is not configured. Set Sandbox client ID and secret on the backend."
+    if "only plaid_env=sandbox" in lowered:
+        return "Only Plaid Sandbox is supported in this app."
+    if "public_token is required" in lowered:
+        return "Plaid public token is required."
     forbidden_terms = ("access_token", "access token", "token_ref", "token-ref", "api_key", "secret")
     if any(term in lowered for term in forbidden_terms):
-        return "Plaid sync failed; details were redacted."
+        return "Plaid request failed; details were redacted."
     return redact_sensitive_text(message, PlaidSettings.from_env())
 
 

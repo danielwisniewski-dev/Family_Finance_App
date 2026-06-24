@@ -201,6 +201,151 @@ class BudgetRepository:
             payload["current_household"] = auth_context["household"]
         return payload
 
+    def app_diagnostics(self, auth_context: dict[str, Any]) -> dict[str, Any]:
+        household_id = int(auth_context["household_id"])
+        checks: list[dict[str, object]] = []
+        with self.connect() as connection:
+            setup = self.setup_status()
+            household = connection.execute(
+                "SELECT active_budget_month_id FROM households WHERE id = ?",
+                (household_id,),
+            ).fetchone()
+            active_budget_month_id = household["active_budget_month_id"] if household is not None else None
+            month_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM budget_months WHERE household_id = ?",
+                    (household_id,),
+                ).fetchone()["count"]
+            )
+            active_category_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM budget_categories c
+                    JOIN budget_groups g ON g.id = c.budget_group_id
+                    JOIN budget_months b ON b.id = g.budget_month_id
+                    WHERE b.id = ?
+                        AND b.household_id = ?
+                        AND g.archived = 0
+                        AND c.archived = 0
+                    """,
+                    (active_budget_month_id, household_id),
+                ).fetchone()["count"]
+            ) if active_budget_month_id is not None else 0
+            split_mismatch_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM (
+                        SELECT t.id
+                        FROM account_transactions t
+                        JOIN cash_accounts a ON a.id = t.cash_account_id
+                        JOIN budget_months b ON b.id = a.budget_month_id
+                        JOIN transaction_category_assignments assn
+                            ON assn.transaction_id = t.id
+                            AND assn.active = 1
+                            AND assn.source = 'split'
+                        WHERE b.household_id = ?
+                        GROUP BY t.id, t.amount_cents
+                        HAVING SUM(assn.amount_cents) != ABS(t.amount_cents)
+                    )
+                    """,
+                    (household_id,),
+                ).fetchone()["count"]
+            )
+            ignored_assignment_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM transaction_category_assignments assn
+                    JOIN account_transactions t ON t.id = assn.transaction_id
+                    JOIN cash_accounts a ON a.id = t.cash_account_id
+                    JOIN budget_months b ON b.id = a.budget_month_id
+                    WHERE b.household_id = ?
+                        AND t.ignored = 1
+                        AND assn.active = 1
+                    """,
+                    (household_id,),
+                ).fetchone()["count"]
+            )
+            archived_assignment_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM transaction_category_assignments assn
+                    JOIN budget_categories c ON c.id = assn.budget_category_id
+                    JOIN budget_groups g ON g.id = c.budget_group_id
+                    JOIN budget_months b ON b.id = g.budget_month_id
+                    WHERE b.household_id = ?
+                        AND assn.active = 1
+                        AND (c.archived = 1 OR g.archived = 1)
+                    """,
+                    (household_id,),
+                ).fetchone()["count"]
+            )
+            archived_rule_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM merchant_category_rules r
+                    JOIN budget_categories c ON c.id = r.budget_category_id
+                    JOIN budget_groups g ON g.id = c.budget_group_id
+                    WHERE r.household_id = ?
+                        AND r.active = 1
+                        AND (c.archived = 1 OR g.archived = 1)
+                    """,
+                    (household_id,),
+                ).fetchone()["count"]
+            )
+        checks.append(diagnostic_check("budget_month_exists", month_count > 0, "Budget month exists.", "No budget month exists yet.", month_count))
+        checks.append(diagnostic_check(
+            "active_categories_available",
+            active_budget_month_id is not None and active_category_count > 0,
+            "Active budget month has active categories.",
+            "No active budget month/categories are ready for daily use.",
+            active_category_count,
+        ))
+        checks.append(diagnostic_check("split_totals_match", split_mismatch_count == 0, "Transaction splits total correctly.", "One or more transaction splits do not total the transaction amount.", split_mismatch_count))
+        checks.append(diagnostic_check("ignored_transactions_not_counted", ignored_assignment_count == 0, "Ignored transactions have no active budget assignments.", "Ignored transactions still have active budget assignments.", ignored_assignment_count))
+        archived_misuse_count = archived_assignment_count + archived_rule_count
+        checks.append(diagnostic_check("archived_categories_unused", archived_misuse_count == 0, "Archived categories are not used by active assignments or rules.", "Archived categories are still used by active assignments or rules.", archived_misuse_count))
+        checks.append(self._safe_to_spend_diagnostic(active_budget_month_id))
+        return {
+            "backend_reachable": True,
+            "database_initialized": setup["initialized"],
+            "plaid_mode": "sandbox",
+            "plaid_sandbox_only": True,
+            "current_user": auth_context["user"],
+            "current_household": auth_context["household"],
+            "active_budget_month_id": active_budget_month_id,
+            "integrity": {
+                "ok": all(bool(check["ok"]) for check in checks),
+                "checks": checks,
+            },
+        }
+
+    def _safe_to_spend_diagnostic(self, budget_month_id: int | None) -> dict[str, object]:
+        if budget_month_id is None:
+            return diagnostic_check("safe_to_spend_ready", False, "", "No active budget month is available for safe-to-spend.", 0)
+        try:
+            snapshot = self._load_snapshot(budget_month_id)
+            category = next((item for item in snapshot["categories"] if not item.archived), None)
+            if category is None:
+                return diagnostic_check("safe_to_spend_ready", False, "", "No active category is available for safe-to-spend.", 0)
+            calculate_safe_to_spend(
+                category=category,
+                purchase_amount_cents=1,
+                included_account_balance_cents=snapshot["included_account_balance_cents"],
+                expected_bills=snapshot["expected_bills"],
+                paydays=snapshot["paydays"],
+                today=date.today(),
+                urgency="planned_want",
+                low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
+            )
+            return diagnostic_check("safe_to_spend_ready", True, "Safe-to-spend can be calculated for the active budget month.", "", 1)
+        except Exception as exc:
+            return diagnostic_check("safe_to_spend_ready", False, "", str(exc), 0)
+
     def initialize_private_household(self, *, household_name: str, users: Iterable[dict[str, str]]) -> dict[str, Any]:
         household_name = clean_required_text(household_name, "household_name")
         cleaned_users = [clean_setup_user(user) for user in users]
@@ -321,8 +466,7 @@ class BudgetRepository:
     def change_user_password(self, *, user_id: int, current_password: str, new_password: str) -> None:
         if not current_password:
             raise PermissionError("Current password is required")
-        if not new_password:
-            raise ValueError("New password is required")
+        validate_local_password(new_password, "new_password")
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             if row is None:
@@ -438,6 +582,9 @@ class BudgetRepository:
         low_cushion_daily_cents: int = 5_000,
         copy_from_budget_month_id: int | None = None,
     ) -> int:
+        month = validate_budget_month_value(month)
+        validate_nonnegative_cents(included_account_balance_cents, "included_account_balance_cents")
+        validate_nonnegative_cents(low_cushion_daily_cents, "low_cushion_daily_cents")
         with self.connect() as connection:
             if copy_from_budget_month_id is not None:
                 source = connection.execute(
@@ -522,12 +669,15 @@ class BudgetRepository:
         assignments: list[str] = []
         values: list[Any] = []
         if month is not None:
+            month = validate_budget_month_value(month)
             assignments.append("month = ?")
             values.append(month)
         if included_account_balance_cents is not None:
+            validate_nonnegative_cents(included_account_balance_cents, "included_account_balance_cents")
             assignments.append("included_account_balance_cents = ?")
             values.append(included_account_balance_cents)
         if low_cushion_daily_cents is not None:
+            validate_nonnegative_cents(low_cushion_daily_cents, "low_cushion_daily_cents")
             assignments.append("low_cushion_daily_cents = ?")
             values.append(low_cushion_daily_cents)
         if not assignments:
@@ -687,7 +837,9 @@ class BudgetRepository:
         balance_cents: int,
         included_in_cash_reality: bool = True,
     ) -> int:
+        name = clean_required_text(name, "name")
         validate_account_type(account_type)
+        validate_nonnegative_cents(balance_cents, "balance_cents")
         with self.connect() as connection:
             return insert_and_return_id(
                 connection,
@@ -2157,6 +2309,10 @@ class BudgetRepository:
         received_cents: int = 0,
         actor_user_id: int | None = None,
     ) -> int:
+        name = clean_required_text(name, "name")
+        validate_income_kind(kind)
+        validate_nonnegative_cents(planned_cents, "planned_cents")
+        validate_nonnegative_cents(received_cents, "received_cents")
         with self.connect() as connection:
             context = self._notification_context_for_budget_month(connection, budget_month_id)
             income_id = insert_and_return_id(
@@ -2201,15 +2357,19 @@ class BudgetRepository:
         assignments: list[str] = []
         values: list[Any] = []
         if name is not None:
+            name = clean_required_text(name, "name")
             assignments.append("name = ?")
             values.append(name)
         if kind is not None:
+            validate_income_kind(kind)
             assignments.append("kind = ?")
             values.append(kind)
         if planned_cents is not None:
+            validate_nonnegative_cents(planned_cents, "planned_cents")
             assignments.append("planned_cents = ?")
             values.append(planned_cents)
         if received_cents is not None:
+            validate_nonnegative_cents(received_cents, "received_cents")
             assignments.append("received_cents = ?")
             values.append(received_cents)
         if not assignments:
@@ -2265,6 +2425,7 @@ class BudgetRepository:
         display_order: int = 0,
         actor_user_id: int | None = None,
     ) -> int:
+        name = clean_required_text(name, "name")
         with self.connect() as connection:
             context = self._notification_context_for_budget_month(connection, budget_month_id)
             group_id = insert_and_return_id(
@@ -2299,6 +2460,7 @@ class BudgetRepository:
         assignments: list[str] = []
         values: list[Any] = []
         if name is not None:
+            name = clean_required_text(name, "name")
             assignments.append("name = ?")
             values.append(name)
         if display_order is not None:
@@ -2347,6 +2509,8 @@ class BudgetRepository:
         display_order: int = 0,
         actor_user_id: int | None = None,
     ) -> int:
+        name = clean_required_text(name, "name")
+        validate_nonnegative_cents(planned_cents, "planned_cents")
         with self.connect() as connection:
             context = self._notification_context_for_budget_group(connection, budget_group_id)
             category_id = insert_and_return_id(
@@ -2386,12 +2550,14 @@ class BudgetRepository:
         assignments: list[str] = []
         values: list[Any] = []
         if name is not None:
+            name = clean_required_text(name, "name")
             assignments.append("name = ?")
             values.append(name)
         if budget_group_id is not None:
             assignments.append("budget_group_id = ?")
             values.append(budget_group_id)
         if planned_cents is not None:
+            validate_nonnegative_cents(planned_cents, "planned_cents")
             assignments.append("planned_cents = ?")
             values.append(planned_cents)
         if display_order is not None:
@@ -2455,6 +2621,7 @@ class BudgetRepository:
         occurred_on: date,
         note: str | None = None,
     ) -> int:
+        validate_positive_cents(amount_cents, "amount_cents")
         with self.connect() as connection:
             context = self._notification_context_for_category(connection, category_id)
             if bool(context["archived"]):
@@ -2478,6 +2645,8 @@ class BudgetRepository:
         paid: bool = False,
         actor_user_id: int | None = None,
     ) -> int:
+        name = clean_required_text(name, "name")
+        validate_positive_cents(amount_cents, "amount_cents")
         with self.connect() as connection:
             context = self._notification_context_for_budget_month(connection, budget_month_id)
             bill_id = insert_and_return_id(
@@ -2516,9 +2685,11 @@ class BudgetRepository:
         assignments: list[str] = []
         values: list[Any] = []
         if name is not None:
+            name = clean_required_text(name, "name")
             assignments.append("name = ?")
             values.append(name)
         if amount_cents is not None:
+            validate_positive_cents(amount_cents, "amount_cents")
             assignments.append("amount_cents = ?")
             values.append(amount_cents)
         if due_on is not None:
@@ -2579,16 +2750,17 @@ class BudgetRepository:
     ) -> int:
         with self.connect() as connection:
             self._require_household(connection, household_id)
-            payday_id = insert_and_return_id(
-                connection,
-                "INSERT OR IGNORE INTO paydays(household_id, payday_date) VALUES (?, ?)",
-                (household_id, payday_date.isoformat()),
-            )
-            row = connection.execute(
+            existing = connection.execute(
                 "SELECT id FROM paydays WHERE household_id = ? AND payday_date = ?",
                 (household_id, payday_date.isoformat()),
             ).fetchone()
-            payday_id = int(row["id"]) if row is not None else payday_id
+            if existing is not None:
+                return int(existing["id"])
+            payday_id = insert_and_return_id(
+                connection,
+                "INSERT INTO paydays(household_id, payday_date) VALUES (?, ?)",
+                (household_id, payday_date.isoformat()),
+            )
             self._insert_notification_event(
                 connection,
                 household_id=household_id,
@@ -3486,11 +3658,20 @@ def clean_required_text(value: str | None, field_name: str) -> str:
     return cleaned
 
 
+def diagnostic_check(name: str, ok: bool, ok_message: str, failure_message: str, count: int) -> dict[str, object]:
+    return {
+        "name": name,
+        "ok": ok,
+        "severity": "info" if ok else "important",
+        "message": ok_message if ok else failure_message,
+        "count": count,
+    }
+
+
 def clean_setup_user(user: dict[str, str]) -> dict[str, str | None]:
     username = require_login_value(user.get("username"), "username")
     password = user.get("password") or ""
-    if not password:
-        raise ValueError("password is required")
+    validate_local_password(password, "password")
     return {
         "name": clean_required_text(user.get("name"), "name"),
         "username": username,
@@ -3498,6 +3679,13 @@ def clean_setup_user(user: dict[str, str]) -> dict[str, str | None]:
         "password": password,
         "role": clean_required_text(user.get("role") or "spouse", "role"),
     }
+
+
+def validate_local_password(password: str, field_name: str) -> None:
+    if not password:
+        raise ValueError(f"{field_name} is required")
+    if len(password) < 8:
+        raise ValueError(f"{field_name} must be at least 8 characters")
 
 
 def safe_user_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -3538,6 +3726,31 @@ def same_day_in_month(source_iso_date: str, target_month: str) -> str:
     target_year, target_month_number = (int(part) for part in target_month.split("-", maxsplit=1))
     target_day = min(source.day, calendar.monthrange(target_year, target_month_number)[1])
     return date(target_year, target_month_number, target_day).isoformat()
+
+
+def validate_budget_month_value(month: str) -> str:
+    cleaned = clean_required_text(month, "month")
+    try:
+        year, month_number = (int(part) for part in cleaned.split("-", maxsplit=1))
+        date(year, month_number, 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("month must use YYYY-MM") from exc
+    return cleaned
+
+
+def validate_nonnegative_cents(value: int, field_name: str) -> None:
+    if int(value) < 0:
+        raise ValueError(f"{field_name} must be zero or more")
+
+
+def validate_positive_cents(value: int, field_name: str) -> None:
+    if int(value) <= 0:
+        raise ValueError(f"{field_name} must be positive")
+
+
+def validate_income_kind(kind: str) -> None:
+    if kind not in {"main", "sporadic"}:
+        raise ValueError("kind must be main or sporadic")
 
 
 def validate_account_type(account_type: str) -> None:

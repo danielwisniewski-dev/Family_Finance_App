@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from datetime import date
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,16 +27,29 @@ from .db import (
     transaction_detail_to_dict,
 )
 from .plaid import (
+    PlaidIntegrationError,
     PlaidConnectionService,
     build_plaid_service_from_env,
     link_token_to_dict,
     plaid_connection_result_to_dict,
     plaid_sync_outcome_to_dict,
+    sanitize_plaid_error,
 )
 
 
 class UnauthorizedError(Exception):
     pass
+
+
+ERROR_CODES = {
+    HTTPStatus.BAD_REQUEST: "validation_error",
+    HTTPStatus.UNAUTHORIZED: "unauthorized",
+    HTTPStatus.FORBIDDEN: "forbidden",
+    HTTPStatus.NOT_FOUND: "not_found",
+    HTTPStatus.CONFLICT: "conflict",
+    HTTPStatus.SERVICE_UNAVAILABLE: "service_unavailable",
+    HTTPStatus.INTERNAL_SERVER_ERROR: "backend_error",
+}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -58,16 +72,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/app/diagnostics":
                 auth = self.require_auth()
-                self.send_json(
-                    {
-                        "backend_reachable": True,
-                        "database_initialized": self.repository.setup_status()["initialized"],
-                        "plaid_mode": "sandbox",
-                        "plaid_sandbox_only": True,
-                        "current_user": auth["user"],
-                        "current_household": auth["household"],
-                    }
-                )
+                self.send_json(self.repository.app_diagnostics(auth))
                 return
             if parsed.path == "/budget-months":
                 auth = self.require_auth()
@@ -185,12 +190,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(transaction_detail_to_dict(detail))
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
-        except UnauthorizedError as exc:
-            self.send_error_json(HTTPStatus.UNAUTHORIZED, str(exc))
-        except PermissionError as exc:
-            self.send_error_json(HTTPStatus.FORBIDDEN, str(exc))
         except Exception as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            self.send_exception(exc)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -454,12 +455,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json({"id": rule_id}, status=HTTPStatus.CREATED)
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
-        except UnauthorizedError as exc:
-            self.send_error_json(HTTPStatus.UNAUTHORIZED, str(exc))
-        except PermissionError as exc:
-            self.send_error_json(HTTPStatus.FORBIDDEN, str(exc))
         except Exception as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            self.send_exception(exc)
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
@@ -701,12 +698,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
-        except UnauthorizedError as exc:
-            self.send_error_json(HTTPStatus.UNAUTHORIZED, str(exc))
-        except PermissionError as exc:
-            self.send_error_json(HTTPStatus.FORBIDDEN, str(exc))
         except Exception as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            self.send_exception(exc)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -750,12 +743,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")
-        except UnauthorizedError as exc:
-            self.send_error_json(HTTPStatus.UNAUTHORIZED, str(exc))
-        except PermissionError as exc:
-            self.send_error_json(HTTPStatus.FORBIDDEN, str(exc))
         except Exception as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            self.send_exception(exc)
 
     def require_auth(self) -> dict[str, Any]:
         header = self.headers.get("Authorization", "")
@@ -793,14 +782,80 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_error_json(self, status: HTTPStatus, message: str) -> None:
-        self.send_json({"error": message}, status=status)
+        self.send_json(
+            {
+                "error": message,
+                "message": message,
+                "code": ERROR_CODES.get(status, "api_error"),
+                "status": status.value,
+            },
+            status=status,
+        )
+
+    def send_exception(self, exc: Exception) -> None:
+        status, message = error_response_for_exception(exc)
+        self.send_error_json(status, message)
 
     def log_message(self, format: str, *args: object) -> None:
         return
 
 
+def error_response_for_exception(exc: Exception) -> tuple[HTTPStatus, str]:
+    if isinstance(exc, UnauthorizedError):
+        return HTTPStatus.UNAUTHORIZED, "Authentication required" if not str(exc) else sanitize_api_error(str(exc))
+    if isinstance(exc, PermissionError):
+        return HTTPStatus.FORBIDDEN, sanitize_api_error(str(exc) or "Forbidden")
+    if isinstance(exc, LookupError):
+        return HTTPStatus.NOT_FOUND, sanitize_api_error(str(exc) or "Not found")
+    if isinstance(exc, PlaidIntegrationError):
+        return HTTPStatus.SERVICE_UNAVAILABLE, sanitize_plaid_error(str(exc))
+    if isinstance(exc, sqlite3.IntegrityError):
+        return HTTPStatus.CONFLICT, "Request conflicts with existing data"
+    if isinstance(exc, (json.JSONDecodeError, ValueError, KeyError, TypeError)):
+        return HTTPStatus.BAD_REQUEST, sanitize_api_error(validation_message(exc))
+    return HTTPStatus.INTERNAL_SERVER_ERROR, "Backend error"
+
+
+def validation_message(exc: Exception) -> str:
+    message = str(exc)
+    if isinstance(exc, json.JSONDecodeError):
+        return "Request body must be valid JSON"
+    if isinstance(exc, KeyError):
+        key = str(exc).strip("'")
+        return f"{key} is required" if key else "Required field is missing"
+    if "invalid literal for int()" in message:
+        return "Numeric fields must be valid whole numbers"
+    if "Invalid isoformat string" in message:
+        return "Date fields must use YYYY-MM-DD"
+    if not message:
+        return "Invalid request"
+    return message
+
+
+def sanitize_api_error(message: str) -> str:
+    forbidden_terms = (
+        "access_token",
+        "access token",
+        "token_ref",
+        "password_hash",
+        "session token",
+        "openai_api_key",
+        "api_key",
+        "secret",
+        "traceback",
+        ".env",
+    )
+    lowered = message.casefold()
+    if any(term in lowered for term in forbidden_terms):
+        return "Request failed; sensitive details were redacted."
+    return message
+
+
 def parse_date(value: str) -> date:
-    return date.fromisoformat(value)
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Date fields must use YYYY-MM-DD") from exc
 
 
 def require_int(payload: dict[str, Any], key: str, fallback_key: str | None = None) -> int:
