@@ -2221,22 +2221,32 @@ class BudgetRepository:
         with self.connect() as connection:
             before = self._require_merchant_rule(connection, rule_id)
             category_context = self._notification_context_for_category(connection, int(before["budget_category_id"]))
-            connection.execute("DELETE FROM merchant_category_rules WHERE id = ?", (rule_id,))
+            connection.execute(
+                """
+                UPDATE merchant_category_rules
+                SET active = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (rule_id,),
+            )
             self._insert_notification_event(
                 connection,
                 household_id=int(before["household_id"]),
                 budget_month_id=category_context["budget_month_id"],
-                event_type="merchant_rule_deleted",
+                event_type="merchant_rule_archived",
                 actor_user_id=actor_user_id,
                 affected_entity_type="merchant_rule",
                 affected_entity_id=rule_id,
-                title="Merchant rule deleted",
-                message=f"Merchant rule '{before['merchant_match_text']}' was deleted.",
+                title="Merchant rule archived",
+                message=f"Merchant rule '{before['merchant_match_text']}' was archived.",
                 severity="caution",
                 metadata={
                     "rule_id": rule_id,
                     "category_id": int(before["budget_category_id"]),
                     "merchant_match_text": before["merchant_match_text"],
+                    "previously_active": bool(before["active"]),
+                    "active": False,
                 },
             )
 
