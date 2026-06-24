@@ -11,11 +11,43 @@ public final class BudgetSummary {
     public final int budgetMonthId;
     public final String month;
     public final int includedAccountBalanceCents;
+    public final int plannedIncomeTotalCents;
+    public final int assignedTotalCents;
+    public final int remainingToAssignCents;
+    public final int totalSpentCents;
     public final int billsBeforePaydayCents;
     public final int cashAfterBillsCents;
     public final int daysUntilPayday;
     public final String nextPayday;
     public final List<BudgetCategory> categories;
+
+    public BudgetSummary(
+            int budgetMonthId,
+            String month,
+            int includedAccountBalanceCents,
+            int plannedIncomeTotalCents,
+            int assignedTotalCents,
+            int remainingToAssignCents,
+            int totalSpentCents,
+            int billsBeforePaydayCents,
+            int cashAfterBillsCents,
+            int daysUntilPayday,
+            String nextPayday,
+            List<BudgetCategory> categories
+    ) {
+        this.budgetMonthId = budgetMonthId;
+        this.month = month;
+        this.includedAccountBalanceCents = includedAccountBalanceCents;
+        this.plannedIncomeTotalCents = plannedIncomeTotalCents;
+        this.assignedTotalCents = assignedTotalCents;
+        this.remainingToAssignCents = remainingToAssignCents;
+        this.totalSpentCents = totalSpentCents;
+        this.billsBeforePaydayCents = billsBeforePaydayCents;
+        this.cashAfterBillsCents = cashAfterBillsCents;
+        this.daysUntilPayday = daysUntilPayday;
+        this.nextPayday = nextPayday;
+        this.categories = Collections.unmodifiableList(new ArrayList<>(categories));
+    }
 
     public BudgetSummary(
             int budgetMonthId,
@@ -27,14 +59,20 @@ public final class BudgetSummary {
             String nextPayday,
             List<BudgetCategory> categories
     ) {
-        this.budgetMonthId = budgetMonthId;
-        this.month = month;
-        this.includedAccountBalanceCents = includedAccountBalanceCents;
-        this.billsBeforePaydayCents = billsBeforePaydayCents;
-        this.cashAfterBillsCents = cashAfterBillsCents;
-        this.daysUntilPayday = daysUntilPayday;
-        this.nextPayday = nextPayday;
-        this.categories = Collections.unmodifiableList(new ArrayList<>(categories));
+        this(
+                budgetMonthId,
+                month,
+                includedAccountBalanceCents,
+                0,
+                0,
+                0,
+                0,
+                billsBeforePaydayCents,
+                cashAfterBillsCents,
+                daysUntilPayday,
+                nextPayday,
+                categories
+        );
     }
 
     public static BudgetSummary fromJson(JSONObject json) {
@@ -49,6 +87,10 @@ public final class BudgetSummary {
                 json.optInt("budget_month_id"),
                 json.optString("month", "Unknown month"),
                 json.optInt("included_account_balance_cents"),
+                json.optInt("planned_income_total_cents", json.optInt("income_available_cents")),
+                json.optInt("assigned_total_cents", json.optInt("planned_cents")),
+                json.optInt("remaining_to_assign_cents", json.optInt("unassigned_cents")),
+                json.optInt("total_spent_cents"),
                 json.optInt("bills_before_payday_cents"),
                 json.optInt("cash_after_bills_cents"),
                 json.optInt("days_until_payday"),

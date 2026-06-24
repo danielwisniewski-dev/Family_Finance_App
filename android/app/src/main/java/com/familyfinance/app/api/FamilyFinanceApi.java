@@ -1,6 +1,8 @@
 package com.familyfinance.app.api;
 
 import com.familyfinance.app.model.BudgetSummary;
+import com.familyfinance.app.model.BudgetDetail;
+import com.familyfinance.app.model.BudgetMonth;
 import com.familyfinance.app.model.CashAccount;
 import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.SafeToSpendResult;
@@ -47,6 +49,47 @@ public final class FamilyFinanceApi {
 
     public BudgetSummary getSummary(int budgetMonthId) throws ApiException {
         return BudgetSummary.fromJson(client.get("/budget-months/" + budgetMonthId + "/summary"));
+    }
+
+    public BudgetDetail getBudgetDetail(int budgetMonthId) throws ApiException {
+        return BudgetDetail.fromJson(client.get("/budget-months/" + budgetMonthId + "/budget-detail"));
+    }
+
+    public List<BudgetMonth> getBudgetMonths() throws ApiException {
+        JSONArray json = client.get("/budget-months").optJSONArray("budget_months");
+        ArrayList<BudgetMonth> months = new ArrayList<>();
+        if (json != null) {
+            for (int i = 0; i < json.length(); i++) {
+                months.add(BudgetMonth.fromJson(json.optJSONObject(i)));
+            }
+        }
+        return months;
+    }
+
+    public int createBudgetMonth(int householdId, String month, Integer copyFromBudgetMonthId) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("household_id", householdId);
+            payload.put("month", month);
+            if (copyFromBudgetMonthId != null) {
+                payload.put("copy_from_budget_month_id", copyFromBudgetMonthId);
+            }
+            return client.post("/budget-months", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create budget month", exception);
+        }
+    }
+
+    public void activateBudgetMonth(int budgetMonthId) throws ApiException {
+        try {
+            client.patch("/budget-months/" + budgetMonthId + "/activate", new JSONObject());
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not activate budget month", exception);
+        }
     }
 
     public List<CashAccount> getAccounts(int budgetMonthId) throws ApiException {
@@ -107,6 +150,159 @@ public final class FamilyFinanceApi {
         } catch (Exception exception) {
             throw new ApiException("Could not update account inclusion", exception);
         }
+    }
+
+    public int createIncome(int budgetMonthId, String name, String kind, int plannedCents, int receivedCents) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("budget_month_id", budgetMonthId);
+            payload.put("name", name);
+            payload.put("kind", kind);
+            payload.put("planned_cents", plannedCents);
+            payload.put("received_cents", receivedCents);
+            return client.post("/income", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create income", exception);
+        }
+    }
+
+    public void updateIncome(int incomeId, String name, String kind, int plannedCents, int receivedCents) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("name", name);
+            payload.put("kind", kind);
+            payload.put("planned_cents", plannedCents);
+            payload.put("received_cents", receivedCents);
+            client.patch("/income/" + incomeId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update income", exception);
+        }
+    }
+
+    public void deleteIncome(int incomeId) throws ApiException {
+        client.delete("/income/" + incomeId);
+    }
+
+    public int createBudgetGroup(int budgetMonthId, String name) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("budget_month_id", budgetMonthId);
+            payload.put("name", name);
+            return client.post("/budget-groups", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create budget group", exception);
+        }
+    }
+
+    public void updateBudgetGroup(int groupId, String name, boolean archived) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("name", name);
+            payload.put("archived", archived);
+            client.patch("/budget-groups/" + groupId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update budget group", exception);
+        }
+    }
+
+    public int createCategory(int budgetGroupId, String name, int plannedCents) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("budget_group_id", budgetGroupId);
+            payload.put("name", name);
+            payload.put("planned_cents", plannedCents);
+            return client.post("/categories", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create category", exception);
+        }
+    }
+
+    public void updateCategory(int categoryId, String name, int plannedCents, boolean archived) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("name", name);
+            payload.put("planned_cents", plannedCents);
+            payload.put("archived", archived);
+            client.patch("/categories/" + categoryId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update category", exception);
+        }
+    }
+
+    public int createExpectedBill(int budgetMonthId, String name, int amountCents, String dueOn, boolean paid) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("budget_month_id", budgetMonthId);
+            payload.put("name", name);
+            payload.put("amount_cents", amountCents);
+            payload.put("due_on", dueOn);
+            payload.put("paid", paid);
+            return client.post("/expected-bills", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create expected bill", exception);
+        }
+    }
+
+    public void updateExpectedBill(int billId, String name, int amountCents, String dueOn, boolean paid) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("name", name);
+            payload.put("amount_cents", amountCents);
+            payload.put("due_on", dueOn);
+            payload.put("paid", paid);
+            client.patch("/expected-bills/" + billId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update expected bill", exception);
+        }
+    }
+
+    public void deleteExpectedBill(int billId) throws ApiException {
+        client.delete("/expected-bills/" + billId);
+    }
+
+    public int createPayday(int householdId, String paydayDate) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("household_id", householdId);
+            payload.put("payday_date", paydayDate);
+            return client.post("/paydays", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create payday", exception);
+        }
+    }
+
+    public void updatePayday(int paydayId, String paydayDate) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("payday_date", paydayDate);
+            client.patch("/paydays/" + paydayId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update payday", exception);
+        }
+    }
+
+    public void deletePayday(int paydayId) throws ApiException {
+        client.delete("/paydays/" + paydayId);
     }
 
     public List<TransactionDetail> getTransactions(int budgetMonthId) throws ApiException {

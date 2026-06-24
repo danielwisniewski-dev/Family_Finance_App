@@ -20,10 +20,16 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.familyfinance.app.api.FamilyFinanceApi;
+import com.familyfinance.app.model.BudgetDetail;
+import com.familyfinance.app.model.BudgetGroup;
+import com.familyfinance.app.model.BudgetMonth;
 import com.familyfinance.app.model.BudgetCategory;
 import com.familyfinance.app.model.BudgetSummary;
 import com.familyfinance.app.model.CashAccount;
+import com.familyfinance.app.model.ExpectedBill;
 import com.familyfinance.app.model.NotificationEvent;
+import com.familyfinance.app.model.Payday;
+import com.familyfinance.app.model.PlannedIncome;
 import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
@@ -42,6 +48,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.time.YearMonth;
 
 import kotlin.Unit;
 
@@ -63,6 +70,8 @@ public final class MainActivity extends Activity {
     private String authToken;
     private FamilyFinanceApi api;
     private BudgetSummary summary;
+    private BudgetDetail budgetDetail;
+    private List<BudgetMonth> budgetMonths = new ArrayList<>();
     private List<TransactionDetail> transactions = new ArrayList<>();
     private List<TransactionDetail> reviewQueue = new ArrayList<>();
     private List<CashAccount> accounts = new ArrayList<>();
@@ -160,6 +169,8 @@ public final class MainActivity extends Activity {
                 .apply();
         loadPreferences();
         summary = null;
+        budgetDetail = null;
+        budgetMonths = new ArrayList<>();
         transactions = new ArrayList<>();
         reviewQueue = new ArrayList<>();
         accounts = new ArrayList<>();
@@ -171,14 +182,17 @@ public final class MainActivity extends Activity {
     private void refreshData(Runnable afterLoad) {
         executor.execute(() -> {
             try {
-                BudgetSummary loadedSummary = api.getSummary(budgetMonthId);
+                BudgetDetail loadedBudgetDetail = api.getBudgetDetail(budgetMonthId);
+                List<BudgetMonth> loadedBudgetMonths = api.getBudgetMonths();
                 List<TransactionDetail> loadedTransactions = api.getTransactions(budgetMonthId);
                 List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(budgetMonthId);
                 List<CashAccount> loadedAccounts = api.getAccounts(budgetMonthId);
                 List<NotificationEvent> loadedNotifications = api.getNotifications(budgetMonthId);
                 int loadedUnreadNotificationCount = api.getUnreadNotificationCount(budgetMonthId);
                 mainHandler.post(() -> {
-                    summary = loadedSummary;
+                    budgetDetail = loadedBudgetDetail;
+                    summary = loadedBudgetDetail.summary;
+                    budgetMonths = loadedBudgetMonths;
                     transactions = loadedTransactions;
                     reviewQueue = loadedReviewQueue;
                     accounts = loadedAccounts;
@@ -269,6 +283,10 @@ public final class MainActivity extends Activity {
             addNav();
             return;
         }
+        addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
+        addMetric("Assigned total", MoneyFormatter.dollars(summary.assignedTotalCents));
+        addMetric("Remaining to assign", MoneyFormatter.dollars(summary.remainingToAssignCents));
+        addMetric("Total spent", MoneyFormatter.dollars(summary.totalSpentCents));
         addMetric("Included account balance", MoneyFormatter.dollars(summary.includedAccountBalanceCents));
         addMetric("Bills before next payday", MoneyFormatter.dollars(summary.billsBeforePaydayCents));
         addMetric("Cash remaining after upcoming bills", MoneyFormatter.dollars(summary.cashAfterBillsCents));
@@ -318,24 +336,45 @@ public final class MainActivity extends Activity {
 
     private void showBudget() {
         beginScreen("Monthly Budget");
-        if (summary == null) {
+        if (summary == null || budgetDetail == null) {
             addBody("No budget loaded.");
             addNav();
             return;
         }
         addMetric("Budget month", summary.month);
-        addSection("Current budget");
-        addBody("Budget group names are not exposed by the current backend summary route yet.");
-        for (BudgetCategory category : summary.categories) {
-            String marker = category.isOverspent() ? "OVERSPENT  " : "";
-            addButton(
-                    marker + category.name
-                            + " | planned " + MoneyFormatter.dollars(category.plannedCents)
-                            + " | spent " + MoneyFormatter.dollars(category.spentCents)
-                            + " | remaining " + MoneyFormatter.dollars(category.remainingCents),
-                    () -> showCategoryDetail(category.id)
-            );
+        addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
+        addMetric("Assigned", MoneyFormatter.dollars(summary.assignedTotalCents));
+        addMetric("Remaining to assign", MoneyFormatter.dollars(summary.remainingToAssignCents));
+        addMetric("Total spent", MoneyFormatter.dollars(summary.totalSpentCents));
+        addButton("Switch / create budget month", this::showBudgetMonths);
+        addButton("Income planning", this::showIncomePlanning);
+        addButton("Bills and paydays", this::showBillsAndPaydays);
+
+        addSection("Budget groups");
+        if (budgetDetail.groups.isEmpty()) {
+            addBody("No budget groups yet.");
+        } else {
+            for (BudgetGroup group : budgetDetail.groups) {
+                addSection(group.name);
+                addButton("Rename group", () -> showGroupEditor(group));
+                addButton("Add category to " + group.name, () -> showCategoryEditor(null, group.id));
+                if (group.categories.isEmpty()) {
+                    addBody("No categories in this group.");
+                } else {
+                    for (BudgetCategory category : group.categories) {
+                        String marker = category.isOverspent() ? "OVERSPENT  " : "";
+                        addButton(
+                                marker + category.name
+                                        + " | planned " + MoneyFormatter.dollars(category.plannedCents)
+                                        + " | spent " + MoneyFormatter.dollars(category.spentCents)
+                                        + " | remaining " + MoneyFormatter.dollars(category.remainingCents),
+                                () -> showCategoryDetail(category.id)
+                        );
+                    }
+                }
+            }
         }
+        addButton("Add budget group", () -> showGroupEditor(null));
         addNav();
     }
 
@@ -351,7 +390,12 @@ public final class MainActivity extends Activity {
         addMetric("Planned", MoneyFormatter.dollars(category.plannedCents));
         addMetric("Spent", MoneyFormatter.dollars(category.spentCents));
         addMetric("Remaining", MoneyFormatter.dollars(category.remainingCents));
-        addBody("Funding edits are intentionally placeholder-only until budget editing is explicitly scoped.");
+        addButton("Rename / fund category", () -> showCategoryEditor(category, category.budgetGroupId));
+        addButton("Archive category", () -> runMutation(
+                "Archiving category...",
+                () -> api.updateCategory(category.id, category.name, category.plannedCents, true),
+                () -> refreshData(this::showBudget)
+        ));
 
         addSection("Assigned transactions");
         List<TransactionDetail> categoryTransactions = BudgetScreenState.transactionsForCategory(category.id, transactions);
@@ -362,6 +406,299 @@ public final class MainActivity extends Activity {
                 addTransactionButton(detail);
             }
         }
+        addNav();
+    }
+
+    private void showBudgetMonths() {
+        beginScreen("Budget Months");
+        addMetric("Current month", summary == null ? "-" : summary.month);
+        for (BudgetMonth month : budgetMonths) {
+            addButton(
+                    (month.active ? "Active  " : "") + month.month + " | ID " + month.id,
+                    () -> runMutation(
+                            "Switching budget month...",
+                            () -> {
+                                api.activateBudgetMonth(month.id);
+                                saveConnectionPreferences(baseUrl, month.id);
+                            },
+                            () -> refreshData(this::showBudget)
+                    )
+            );
+        }
+        addButton("Create next month from current", () -> {
+            if (summary == null || householdId == 0) {
+                toast("No current budget month loaded.");
+                return;
+            }
+            String nextMonth = YearMonth.parse(summary.month).plusMonths(1).toString();
+            runMutation(
+                    "Creating next month...",
+                    () -> {
+                        int newMonthId = api.createBudgetMonth(householdId, nextMonth, budgetMonthId);
+                        api.activateBudgetMonth(newMonthId);
+                        saveConnectionPreferences(baseUrl, newMonthId);
+                    },
+                    () -> refreshData(this::showBudget)
+            );
+        });
+        addNav();
+    }
+
+    private void showGroupEditor(BudgetGroup group) {
+        beginScreen(group == null ? "Add Budget Group" : "Edit Budget Group");
+        EditText name = new EditText(this);
+        name.setHint("Group name");
+        name.setSingleLine(true);
+        name.setText(group == null ? "" : group.name);
+        root.addView(name);
+        addButton(group == null ? "Add group" : "Save group", () -> {
+            String cleaned = name.getText().toString().trim();
+            if (cleaned.isEmpty()) {
+                toast("Enter a group name.");
+                return;
+            }
+            runMutation(
+                    "Saving group...",
+                    () -> {
+                        if (group == null) {
+                            api.createBudgetGroup(budgetMonthId, cleaned);
+                        } else {
+                            api.updateBudgetGroup(group.id, cleaned, false);
+                        }
+                    },
+                    () -> refreshData(this::showBudget)
+            );
+        });
+        addNav();
+    }
+
+    private void showCategoryEditor(BudgetCategory category, int groupId) {
+        beginScreen(category == null ? "Add Category" : "Edit Category");
+        EditText name = new EditText(this);
+        name.setHint("Category name");
+        name.setSingleLine(true);
+        name.setText(category == null ? "" : category.name);
+        root.addView(name);
+        EditText planned = new EditText(this);
+        planned.setHint("Planned amount, e.g. 250.00");
+        planned.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        planned.setText(category == null ? "" : MoneyFormatter.dollarsWithoutSymbol(category.plannedCents));
+        root.addView(planned);
+        addButton(category == null ? "Add category" : "Save category", () -> {
+            String cleaned = name.getText().toString().trim();
+            if (cleaned.isEmpty()) {
+                toast("Enter a category name.");
+                return;
+            }
+            int plannedCents;
+            try {
+                plannedCents = MoneyFormatter.parseDollarAmountToCents(planned.getText().toString());
+            } catch (NumberFormatException exception) {
+                toast("Enter a valid planned amount.");
+                return;
+            }
+            runMutation(
+                    "Saving category...",
+                    () -> {
+                        if (category == null) {
+                            api.createCategory(groupId, cleaned, plannedCents);
+                        } else {
+                            api.updateCategory(category.id, cleaned, plannedCents, false);
+                        }
+                    },
+                    () -> refreshData(this::showBudget)
+            );
+        });
+        addNav();
+    }
+
+    private void showIncomePlanning() {
+        beginScreen("Income Planning");
+        if (summary != null) {
+            addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
+            addMetric("Assigned", MoneyFormatter.dollars(summary.assignedTotalCents));
+            addMetric("Remaining to assign", MoneyFormatter.dollars(summary.remainingToAssignCents));
+        }
+        if (budgetDetail == null || budgetDetail.income.isEmpty()) {
+            addBody("No planned income yet.");
+        } else {
+            for (PlannedIncome income : budgetDetail.income) {
+                addBody(income.name
+                        + " | " + income.kind
+                        + " | planned " + MoneyFormatter.dollars(income.plannedCents)
+                        + " | received " + MoneyFormatter.dollars(income.receivedCents));
+                addButton("Edit " + income.name, () -> showIncomeEditor(income));
+                addButton("Remove " + income.name, () -> runMutation(
+                        "Removing income...",
+                        () -> api.deleteIncome(income.id),
+                        () -> refreshData(this::showIncomePlanning)
+                ));
+            }
+        }
+        addButton("Add income", () -> showIncomeEditor(null));
+        addNav();
+    }
+
+    private void showIncomeEditor(PlannedIncome income) {
+        beginScreen(income == null ? "Add Income" : "Edit Income");
+        EditText name = new EditText(this);
+        name.setHint("Income name");
+        name.setSingleLine(true);
+        name.setText(income == null ? "" : income.name);
+        root.addView(name);
+        Spinner kind = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new String[]{"main", "sporadic"});
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        kind.setAdapter(adapter);
+        if (income != null && "sporadic".equals(income.kind)) {
+            kind.setSelection(1);
+        }
+        root.addView(kind);
+        EditText planned = moneyInput("Planned amount", income == null ? 0 : income.plannedCents);
+        EditText received = moneyInput("Received amount", income == null ? 0 : income.receivedCents);
+        addButton(income == null ? "Add income" : "Save income", () -> {
+            String cleaned = name.getText().toString().trim();
+            if (cleaned.isEmpty()) {
+                toast("Enter an income name.");
+                return;
+            }
+            int plannedCents;
+            int receivedCents;
+            try {
+                plannedCents = MoneyFormatter.parseDollarAmountToCents(planned.getText().toString());
+                receivedCents = MoneyFormatter.parseDollarAmountToCents(received.getText().toString());
+            } catch (NumberFormatException exception) {
+                toast("Enter valid amounts.");
+                return;
+            }
+            String selectedKind = kind.getSelectedItem().toString();
+            runMutation(
+                    "Saving income...",
+                    () -> {
+                        if (income == null) {
+                            api.createIncome(budgetMonthId, cleaned, selectedKind, plannedCents, receivedCents);
+                        } else {
+                            api.updateIncome(income.id, cleaned, selectedKind, plannedCents, receivedCents);
+                        }
+                    },
+                    () -> refreshData(this::showIncomePlanning)
+            );
+        });
+        addNav();
+    }
+
+    private void showBillsAndPaydays() {
+        beginScreen("Bills and Paydays");
+        if (summary != null) {
+            addMetric("Bills before next payday", MoneyFormatter.dollars(summary.billsBeforePaydayCents));
+            addMetric("Cash after bills", MoneyFormatter.dollars(summary.cashAfterBillsCents));
+            addMetric("Next payday", summary.nextPayday);
+            addMetric("Days until payday", Integer.toString(summary.daysUntilPayday));
+        }
+        addSection("Expected bills");
+        if (budgetDetail == null || budgetDetail.expectedBills.isEmpty()) {
+            addBody("No expected bills yet.");
+        } else {
+            for (ExpectedBill bill : budgetDetail.expectedBills) {
+                addBody(bill.name + " | " + MoneyFormatter.dollars(bill.amountCents) + " | due " + bill.dueOn + (bill.paid ? " | paid" : ""));
+                addButton("Edit " + bill.name, () -> showBillEditor(bill));
+                addButton("Remove " + bill.name, () -> runMutation(
+                        "Removing bill...",
+                        () -> api.deleteExpectedBill(bill.id),
+                        () -> refreshData(this::showBillsAndPaydays)
+                ));
+            }
+        }
+        addButton("Add bill", () -> showBillEditor(null));
+        addSection("Paydays");
+        if (budgetDetail == null || budgetDetail.paydays.isEmpty()) {
+            addBody("No paydays configured.");
+        } else {
+            for (Payday payday : budgetDetail.paydays) {
+                addBody(payday.paydayDate);
+                addButton("Edit " + payday.paydayDate, () -> showPaydayEditor(payday));
+                addButton("Remove " + payday.paydayDate, () -> runMutation(
+                        "Removing payday...",
+                        () -> api.deletePayday(payday.id),
+                        () -> refreshData(this::showBillsAndPaydays)
+                ));
+            }
+        }
+        addButton("Add payday", () -> showPaydayEditor(null));
+        addNav();
+    }
+
+    private void showBillEditor(ExpectedBill bill) {
+        beginScreen(bill == null ? "Add Bill" : "Edit Bill");
+        EditText name = new EditText(this);
+        name.setHint("Bill name");
+        name.setSingleLine(true);
+        name.setText(bill == null ? "" : bill.name);
+        root.addView(name);
+        EditText amount = moneyInput("Amount", bill == null ? 0 : bill.amountCents);
+        EditText dueOn = new EditText(this);
+        dueOn.setHint("Due date YYYY-MM-DD");
+        dueOn.setSingleLine(true);
+        dueOn.setText(bill == null ? "" : bill.dueOn);
+        root.addView(dueOn);
+        CheckBox paid = new CheckBox(this);
+        paid.setText("Paid");
+        paid.setChecked(bill != null && bill.paid);
+        root.addView(paid);
+        addButton(bill == null ? "Add bill" : "Save bill", () -> {
+            String cleaned = name.getText().toString().trim();
+            String due = dueOn.getText().toString().trim();
+            if (cleaned.isEmpty() || due.isEmpty()) {
+                toast("Enter a bill name and due date.");
+                return;
+            }
+            int amountCents;
+            try {
+                amountCents = MoneyFormatter.parseDollarAmountToCents(amount.getText().toString());
+            } catch (NumberFormatException exception) {
+                toast("Enter a valid bill amount.");
+                return;
+            }
+            runMutation(
+                    "Saving bill...",
+                    () -> {
+                        if (bill == null) {
+                            api.createExpectedBill(budgetMonthId, cleaned, amountCents, due, paid.isChecked());
+                        } else {
+                            api.updateExpectedBill(bill.id, cleaned, amountCents, due, paid.isChecked());
+                        }
+                    },
+                    () -> refreshData(this::showBillsAndPaydays)
+            );
+        });
+        addNav();
+    }
+
+    private void showPaydayEditor(Payday payday) {
+        beginScreen(payday == null ? "Add Payday" : "Edit Payday");
+        EditText paydayDate = new EditText(this);
+        paydayDate.setHint("Payday YYYY-MM-DD");
+        paydayDate.setSingleLine(true);
+        paydayDate.setText(payday == null ? "" : payday.paydayDate);
+        root.addView(paydayDate);
+        addButton(payday == null ? "Add payday" : "Save payday", () -> {
+            String cleaned = paydayDate.getText().toString().trim();
+            if (cleaned.isEmpty()) {
+                toast("Enter a payday date.");
+                return;
+            }
+            runMutation(
+                    "Saving payday...",
+                    () -> {
+                        if (payday == null) {
+                            api.createPayday(householdId, cleaned);
+                        } else {
+                            api.updatePayday(payday.id, cleaned);
+                        }
+                    },
+                    () -> refreshData(this::showBillsAndPaydays)
+            );
+        });
         addNav();
     }
 
@@ -703,6 +1040,8 @@ public final class MainActivity extends Activity {
         addSection("Navigation");
         addButton("Dashboard", this::showDashboard);
         addButton("Monthly budget", this::showBudget);
+        addButton("Income planning", this::showIncomePlanning);
+        addButton("Bills and paydays", this::showBillsAndPaydays);
         addButton("Transactions", () -> showTransactions(false));
         addButton("Uncategorized review", () -> showTransactions(true));
         addButton("Safe to spend", this::showSafeToSpend);
@@ -758,6 +1097,18 @@ public final class MainActivity extends Activity {
         button.setText(label);
         button.setOnClickListener(view -> action.run());
         root.addView(button);
+    }
+
+    private EditText moneyInput(String hint, int cents) {
+        EditText input = new EditText(this);
+        input.setHint(hint);
+        input.setSingleLine(true);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        if (cents != 0) {
+            input.setText(MoneyFormatter.dollarsWithoutSymbol(cents));
+        }
+        root.addView(input);
+        return input;
     }
 
     private Spinner categorySpinner() {

@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, and Milestone 8 Plaid Sandbox linking/sync.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, and Milestone 9 budget setup/monthly planning.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -105,6 +105,17 @@ Milestone 8 adds Plaid Sandbox linking and sync:
 
 This is Sandbox-only. `PLAID_ENV` must be `sandbox`; production Plaid is intentionally unsupported in this app.
 
+Milestone 9 adds budget setup and monthly planning edits:
+
+- Budget month list, selection, activation, and copy-forward creation
+- Budget detail API with planned income, assigned/funded total, remaining-to-assign, total spent, overspent categories, groups, categories, bills, and paydays
+- Category create/edit/funding/archive flows with archived categories excluded from new spending, categorization, and safe-to-spend
+- Planned income add/edit/remove
+- Expected bill add/edit/remove feeding cash-reality and safe-to-spend calculations
+- Payday add/edit/remove feeding next-payday and days-until-payday calculations
+- Accountability notification events for budget setup changes
+- Android screens for budget months, category funding, income planning, and bills/paydays
+
 Environment variables:
 
 - `PLAID_CLIENT_ID`
@@ -145,7 +156,6 @@ Still intentionally excluded:
 - Credit cards
 - MCP/tool layer
 - Push notifications
-- Budget editing workflows beyond placeholder copy
 - Transaction split editing in Android
 
 ## Transaction Review API Notes
@@ -368,6 +378,9 @@ With the demo API running and the Pixel 8 emulator open, verify:
 - Logout clears the local MVP token and returns to the login screen.
 - Monthly budget shows backend categories.
 - Tapping a budget category opens category detail.
+- Monthly budget supports budget month switching/copy-forward, category add/edit/archive, and category funding edits.
+- Income planning supports income add/edit/remove.
+- Bills and paydays supports expected bill and payday add/edit/remove.
 - Transactions shows seeded mock transactions.
 - Uncategorized review shows items from the demo seed.
 - Tapping a transaction opens transaction detail.

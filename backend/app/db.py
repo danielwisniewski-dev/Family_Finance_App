@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import calendar
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import date
@@ -69,6 +70,8 @@ class BudgetRepository:
             connection.executescript(schema_path.read_text(encoding="utf-8"))
             ensure_column(connection, "users", "username", "TEXT")
             ensure_column(connection, "users", "password_hash", "TEXT")
+            ensure_column(connection, "households", "active_budget_month_id", "INTEGER")
+            ensure_column(connection, "budget_groups", "archived", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "reviewed", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "ignored", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "ignored_reason", "TEXT")
@@ -188,9 +191,21 @@ class BudgetRepository:
         month: str,
         included_account_balance_cents: int = 0,
         low_cushion_daily_cents: int = 5_000,
+        copy_from_budget_month_id: int | None = None,
     ) -> int:
         with self.connect() as connection:
-            return insert_and_return_id(
+            if copy_from_budget_month_id is not None:
+                source = connection.execute(
+                    "SELECT * FROM budget_months WHERE id = ? AND household_id = ?",
+                    (copy_from_budget_month_id, household_id),
+                ).fetchone()
+                if source is None:
+                    raise PermissionError("Source budget month is not available to this household")
+                if included_account_balance_cents == 0:
+                    included_account_balance_cents = int(source["included_account_balance_cents"])
+                if low_cushion_daily_cents == 5_000:
+                    low_cushion_daily_cents = int(source["low_cushion_daily_cents"])
+            budget_month_id = insert_and_return_id(
                 connection,
                 """
                 INSERT INTO budget_months(
@@ -203,6 +218,213 @@ class BudgetRepository:
                 """,
                 (household_id, month, included_account_balance_cents, low_cushion_daily_cents),
             )
+            if copy_from_budget_month_id is not None:
+                self._copy_budget_month_structure(
+                    connection,
+                    source_budget_month_id=copy_from_budget_month_id,
+                    target_budget_month_id=budget_month_id,
+                    target_month=month,
+                )
+            active = connection.execute(
+                "SELECT active_budget_month_id FROM households WHERE id = ?",
+                (household_id,),
+            ).fetchone()
+            if active is not None and active["active_budget_month_id"] is None:
+                connection.execute(
+                    "UPDATE households SET active_budget_month_id = ? WHERE id = ?",
+                    (budget_month_id, household_id),
+                )
+            return budget_month_id
+
+    def list_budget_months(self, household_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            active_row = connection.execute(
+                "SELECT active_budget_month_id FROM households WHERE id = ?",
+                (household_id,),
+            ).fetchone()
+            if active_row is None:
+                raise LookupError(f"Household {household_id} not found")
+            active_budget_month_id = active_row["active_budget_month_id"]
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM budget_months
+                WHERE household_id = ?
+                ORDER BY month DESC, id DESC
+                """,
+                (household_id,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "household_id": int(row["household_id"]),
+                "month": row["month"],
+                "included_account_balance_cents": int(row["included_account_balance_cents"]),
+                "low_cushion_daily_cents": int(row["low_cushion_daily_cents"]),
+                "is_active": active_budget_month_id == row["id"],
+            }
+            for row in rows
+        ]
+
+    def update_budget_month(
+        self,
+        *,
+        budget_month_id: int,
+        month: str | None = None,
+        included_account_balance_cents: int | None = None,
+        low_cushion_daily_cents: int | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        if month is not None:
+            assignments.append("month = ?")
+            values.append(month)
+        if included_account_balance_cents is not None:
+            assignments.append("included_account_balance_cents = ?")
+            values.append(included_account_balance_cents)
+        if low_cushion_daily_cents is not None:
+            assignments.append("low_cushion_daily_cents = ?")
+            values.append(low_cushion_daily_cents)
+        if not assignments:
+            return
+        values.append(budget_month_id)
+        with self.connect() as connection:
+            self._require_budget_month(connection, budget_month_id)
+            connection.execute(
+                f"UPDATE budget_months SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+
+    def set_active_budget_month(self, *, household_id: int, budget_month_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM budget_months WHERE id = ? AND household_id = ?",
+                (budget_month_id, household_id),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("Budget month is not available to this household")
+            connection.execute(
+                "UPDATE households SET active_budget_month_id = ? WHERE id = ?",
+                (budget_month_id, household_id),
+            )
+
+    def get_budget_detail(self, budget_month_id: int, today: date) -> dict[str, Any]:
+        summary = self.get_summary(budget_month_id, today)
+        with self.connect() as connection:
+            budget_month = self._require_budget_month(connection, budget_month_id)
+            income_rows = connection.execute(
+                "SELECT * FROM income_plan WHERE budget_month_id = ? ORDER BY id",
+                (budget_month_id,),
+            ).fetchall()
+            group_rows = connection.execute(
+                """
+                SELECT *
+                FROM budget_groups
+                WHERE budget_month_id = ? AND archived = 0
+                ORDER BY display_order, id
+                """,
+                (budget_month_id,),
+            ).fetchall()
+            category_rows = connection.execute(
+                """
+                SELECT
+                    c.id,
+                    c.budget_group_id,
+                    c.name,
+                    c.planned_cents,
+                    c.archived,
+                    c.display_order,
+                    COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0) AS spent_cents
+                FROM budget_categories c
+                LEFT JOIN (
+                    SELECT budget_category_id, SUM(amount_cents) AS manual_spent_cents
+                    FROM manual_spending
+                    GROUP BY budget_category_id
+                ) ms ON ms.budget_category_id = c.id
+                LEFT JOIN (
+                    SELECT a.budget_category_id, SUM(a.amount_cents) AS transaction_spent_cents
+                    FROM transaction_category_assignments a
+                    JOIN account_transactions t ON t.id = a.transaction_id
+                    JOIN cash_accounts ca ON ca.id = t.cash_account_id
+                    WHERE a.active = 1
+                        AND t.ignored = 0
+                        AND ca.budget_month_id = ?
+                    GROUP BY a.budget_category_id
+                ) ts ON ts.budget_category_id = c.id
+                JOIN budget_groups g ON g.id = c.budget_group_id
+                WHERE g.budget_month_id = ?
+                    AND g.archived = 0
+                    AND c.archived = 0
+                ORDER BY g.display_order, c.display_order, c.id
+                """,
+                (budget_month_id, budget_month_id),
+            ).fetchall()
+            bill_rows = connection.execute(
+                "SELECT * FROM expected_bills WHERE budget_month_id = ? ORDER BY due_on, id",
+                (budget_month_id,),
+            ).fetchall()
+            payday_rows = connection.execute(
+                "SELECT * FROM paydays WHERE household_id = ? ORDER BY payday_date, id",
+                (budget_month["household_id"],),
+            ).fetchall()
+
+        categories_by_group: dict[int, list[dict[str, Any]]] = {}
+        for row in category_rows:
+            category = {
+                "id": int(row["id"]),
+                "budget_group_id": int(row["budget_group_id"]),
+                "name": row["name"],
+                "planned_cents": int(row["planned_cents"]),
+                "spent_cents": int(row["spent_cents"]),
+                "remaining_cents": int(row["planned_cents"]) - int(row["spent_cents"]),
+                "archived": bool(row["archived"]),
+                "display_order": int(row["display_order"]),
+            }
+            categories_by_group.setdefault(int(row["budget_group_id"]), []).append(category)
+
+        detail = summary_to_dict(summary)
+        detail["income"] = [
+            {
+                "id": int(row["id"]),
+                "budget_month_id": int(row["budget_month_id"]),
+                "name": row["name"],
+                "kind": row["kind"],
+                "planned_cents": int(row["planned_cents"]),
+                "received_cents": int(row["received_cents"]),
+            }
+            for row in income_rows
+        ]
+        detail["groups"] = [
+            {
+                "id": int(row["id"]),
+                "budget_month_id": int(row["budget_month_id"]),
+                "name": row["name"],
+                "display_order": int(row["display_order"]),
+                "archived": bool(row["archived"]),
+                "categories": categories_by_group.get(int(row["id"]), []),
+            }
+            for row in group_rows
+        ]
+        detail["expected_bills"] = [
+            {
+                "id": int(row["id"]),
+                "budget_month_id": int(row["budget_month_id"]),
+                "name": row["name"],
+                "amount_cents": int(row["amount_cents"]),
+                "due_on": row["due_on"],
+                "paid": bool(row["paid"]),
+            }
+            for row in bill_rows
+        ]
+        detail["paydays"] = [
+            {
+                "id": int(row["id"]),
+                "household_id": int(row["household_id"]),
+                "payday_date": row["payday_date"],
+            }
+            for row in payday_rows
+        ]
+        return detail
 
     def update_account_balance(self, budget_month_id: int, included_account_balance_cents: int) -> None:
         with self.connect() as connection:
@@ -336,6 +558,43 @@ class BudgetRepository:
             ).fetchone()
         if row is None:
             raise PermissionError("Budget group is not available to this household")
+
+    def require_income_access(self, income_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT i.id
+                FROM income_plan i
+                JOIN budget_months b ON b.id = i.budget_month_id
+                WHERE i.id = ? AND b.household_id = ?
+                """,
+                (income_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Income line is not available to this household")
+
+    def require_bill_access(self, bill_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT eb.id
+                FROM expected_bills eb
+                JOIN budget_months b ON b.id = eb.budget_month_id
+                WHERE eb.id = ? AND b.household_id = ?
+                """,
+                (bill_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Expected bill is not available to this household")
+
+    def require_payday_access(self, payday_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM paydays WHERE id = ? AND household_id = ?",
+                (payday_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Payday is not available to this household")
 
     def require_transaction_access(self, transaction_id: int, household_id: int) -> None:
         with self.connect() as connection:
@@ -1340,9 +1599,11 @@ class BudgetRepository:
         kind: str,
         planned_cents: int,
         received_cents: int = 0,
+        actor_user_id: int | None = None,
     ) -> int:
         with self.connect() as connection:
-            return insert_and_return_id(
+            context = self._notification_context_for_budget_month(connection, budget_month_id)
+            income_id = insert_and_return_id(
                 connection,
                 """
                 INSERT INTO income_plan(budget_month_id, name, kind, planned_cents, received_cents)
@@ -1350,13 +1611,175 @@ class BudgetRepository:
                 """,
                 (budget_month_id, name, kind, planned_cents, received_cents),
             )
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=budget_month_id,
+                event_type="income_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="income",
+                affected_entity_id=income_id,
+                title="Income changed",
+                message=f"{name} was added to planned income.",
+                severity="info",
+                metadata={
+                    "income_id": income_id,
+                    "kind": kind,
+                    "planned_cents": planned_cents,
+                    "received_cents": received_cents,
+                    "action": "created",
+                },
+            )
+            return income_id
 
-    def add_budget_group(self, *, budget_month_id: int, name: str, display_order: int = 0) -> int:
+    def update_income(
+        self,
+        *,
+        income_id: int,
+        name: str | None = None,
+        kind: str | None = None,
+        planned_cents: int | None = None,
+        received_cents: int | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        if name is not None:
+            assignments.append("name = ?")
+            values.append(name)
+        if kind is not None:
+            assignments.append("kind = ?")
+            values.append(kind)
+        if planned_cents is not None:
+            assignments.append("planned_cents = ?")
+            values.append(planned_cents)
+        if received_cents is not None:
+            assignments.append("received_cents = ?")
+            values.append(received_cents)
+        if not assignments:
+            return
+        values.append(income_id)
         with self.connect() as connection:
-            return insert_and_return_id(
+            before = self._notification_context_for_income(connection, income_id)
+            connection.execute(f"UPDATE income_plan SET {', '.join(assignments)} WHERE id = ?", values)
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=before["budget_month_id"],
+                event_type="income_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="income",
+                affected_entity_id=income_id,
+                title="Income changed",
+                message=f"{name or before['name']} was updated in planned income.",
+                severity="caution",
+                metadata={
+                    "income_id": income_id,
+                    "previous_name": before["name"],
+                    "previous_kind": before["kind"],
+                    "previous_planned_cents": int(before["planned_cents"]),
+                    "previous_received_cents": int(before["received_cents"]),
+                    "action": "updated",
+                },
+            )
+
+    def remove_income(self, *, income_id: int, actor_user_id: int | None = None) -> None:
+        with self.connect() as connection:
+            before = self._notification_context_for_income(connection, income_id)
+            connection.execute("DELETE FROM income_plan WHERE id = ?", (income_id,))
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=before["budget_month_id"],
+                event_type="income_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="income",
+                affected_entity_id=income_id,
+                title="Income changed",
+                message=f"{before['name']} was removed from planned income.",
+                severity="caution",
+                metadata={"income_id": income_id, "action": "removed"},
+            )
+
+    def add_budget_group(
+        self,
+        *,
+        budget_month_id: int,
+        name: str,
+        display_order: int = 0,
+        actor_user_id: int | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            context = self._notification_context_for_budget_month(connection, budget_month_id)
+            group_id = insert_and_return_id(
                 connection,
                 "INSERT INTO budget_groups(budget_month_id, name, display_order) VALUES (?, ?, ?)",
                 (budget_month_id, name, display_order),
+            )
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=budget_month_id,
+                event_type="budget_group_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="budget_group",
+                affected_entity_id=group_id,
+                title="Budget group changed",
+                message=f"{name} was added to the budget.",
+                severity="info",
+                metadata={"budget_group_id": group_id, "action": "created"},
+            )
+            return group_id
+
+    def update_budget_group(
+        self,
+        *,
+        budget_group_id: int,
+        name: str | None = None,
+        display_order: int | None = None,
+        archived: bool | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        if name is not None:
+            assignments.append("name = ?")
+            values.append(name)
+        if display_order is not None:
+            assignments.append("display_order = ?")
+            values.append(display_order)
+        if archived is not None:
+            assignments.append("archived = ?")
+            values.append(1 if archived else 0)
+        if not assignments:
+            return
+        values.append(budget_group_id)
+        with self.connect() as connection:
+            before = self._notification_context_for_budget_group(connection, budget_group_id)
+            if archived:
+                active_categories = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM budget_categories
+                    WHERE budget_group_id = ? AND archived = 0
+                    """,
+                    (budget_group_id,),
+                ).fetchone()
+                if int(active_categories["count"]) > 0:
+                    raise ValueError("Archive active categories before archiving a budget group")
+            connection.execute(f"UPDATE budget_groups SET {', '.join(assignments)} WHERE id = ?", values)
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=before["budget_month_id"],
+                event_type="budget_group_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="budget_group",
+                affected_entity_id=budget_group_id,
+                title="Budget group changed",
+                message=f"{name or before['group_name']} was updated.",
+                severity="info",
+                metadata={"budget_group_id": budget_group_id, "action": "updated", "archived": archived},
             )
 
     def add_category(
@@ -1398,7 +1821,9 @@ class BudgetRepository:
         *,
         category_id: int,
         name: str | None = None,
+        budget_group_id: int | None = None,
         planned_cents: int | None = None,
+        display_order: int | None = None,
         archived: bool | None = None,
         actor_user_id: int | None = None,
     ) -> None:
@@ -1407,9 +1832,15 @@ class BudgetRepository:
         if name is not None:
             assignments.append("name = ?")
             values.append(name)
+        if budget_group_id is not None:
+            assignments.append("budget_group_id = ?")
+            values.append(budget_group_id)
         if planned_cents is not None:
             assignments.append("planned_cents = ?")
             values.append(planned_cents)
+        if display_order is not None:
+            assignments.append("display_order = ?")
+            values.append(display_order)
         if archived is not None:
             assignments.append("archived = ?")
             values.append(1 if archived else 0)
@@ -1418,6 +1849,10 @@ class BudgetRepository:
         values.append(category_id)
         with self.connect() as connection:
             before = self._notification_context_for_category(connection, category_id)
+            if budget_group_id is not None:
+                target = self._notification_context_for_budget_group(connection, budget_group_id)
+                if target["budget_month_id"] != before["budget_month_id"]:
+                    raise ValueError("Category can only move within the same budget month")
             connection.execute(
                 f"UPDATE budget_categories SET {', '.join(assignments)} WHERE id = ?",
                 values,
@@ -1465,6 +1900,9 @@ class BudgetRepository:
         note: str | None = None,
     ) -> int:
         with self.connect() as connection:
+            context = self._notification_context_for_category(connection, category_id)
+            if bool(context["archived"]):
+                raise ValueError("Cannot record spending against an archived category")
             return insert_and_return_id(
                 connection,
                 """
@@ -1482,9 +1920,11 @@ class BudgetRepository:
         amount_cents: int,
         due_on: date,
         paid: bool = False,
+        actor_user_id: int | None = None,
     ) -> int:
         with self.connect() as connection:
-            return insert_and_return_id(
+            context = self._notification_context_for_budget_month(connection, budget_month_id)
+            bill_id = insert_and_return_id(
                 connection,
                 """
                 INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid)
@@ -1492,13 +1932,165 @@ class BudgetRepository:
                 """,
                 (budget_month_id, name, amount_cents, due_on.isoformat(), 1 if paid else 0),
             )
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=budget_month_id,
+                event_type="bill_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="expected_bill",
+                affected_entity_id=bill_id,
+                title="Bill changed",
+                message=f"{name} was added as an expected bill.",
+                severity="caution",
+                metadata={"bill_id": bill_id, "amount_cents": amount_cents, "due_on": due_on.isoformat(), "action": "created"},
+            )
+            return bill_id
 
-    def add_payday(self, *, household_id: int, payday_date: date) -> int:
+    def update_expected_bill(
+        self,
+        *,
+        bill_id: int,
+        name: str | None = None,
+        amount_cents: int | None = None,
+        due_on: date | None = None,
+        paid: bool | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        if name is not None:
+            assignments.append("name = ?")
+            values.append(name)
+        if amount_cents is not None:
+            assignments.append("amount_cents = ?")
+            values.append(amount_cents)
+        if due_on is not None:
+            assignments.append("due_on = ?")
+            values.append(due_on.isoformat())
+        if paid is not None:
+            assignments.append("paid = ?")
+            values.append(1 if paid else 0)
+        if not assignments:
+            return
+        values.append(bill_id)
         with self.connect() as connection:
-            return insert_and_return_id(
+            before = self._notification_context_for_bill(connection, bill_id)
+            connection.execute(f"UPDATE expected_bills SET {', '.join(assignments)} WHERE id = ?", values)
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=before["budget_month_id"],
+                event_type="bill_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="expected_bill",
+                affected_entity_id=bill_id,
+                title="Bill changed",
+                message=f"{name or before['name']} was updated.",
+                severity="caution",
+                metadata={
+                    "bill_id": bill_id,
+                    "previous_amount_cents": int(before["amount_cents"]),
+                    "previous_due_on": before["due_on"],
+                    "action": "updated",
+                },
+            )
+
+    def remove_expected_bill(self, *, bill_id: int, actor_user_id: int | None = None) -> None:
+        with self.connect() as connection:
+            before = self._notification_context_for_bill(connection, bill_id)
+            connection.execute("DELETE FROM expected_bills WHERE id = ?", (bill_id,))
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=before["budget_month_id"],
+                event_type="bill_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="expected_bill",
+                affected_entity_id=bill_id,
+                title="Bill changed",
+                message=f"{before['name']} was removed from expected bills.",
+                severity="caution",
+                metadata={"bill_id": bill_id, "action": "removed"},
+            )
+
+    def add_payday(
+        self,
+        *,
+        household_id: int,
+        payday_date: date,
+        actor_user_id: int | None = None,
+    ) -> int:
+        with self.connect() as connection:
+            self._require_household(connection, household_id)
+            payday_id = insert_and_return_id(
                 connection,
                 "INSERT OR IGNORE INTO paydays(household_id, payday_date) VALUES (?, ?)",
                 (household_id, payday_date.isoformat()),
+            )
+            row = connection.execute(
+                "SELECT id FROM paydays WHERE household_id = ? AND payday_date = ?",
+                (household_id, payday_date.isoformat()),
+            ).fetchone()
+            payday_id = int(row["id"]) if row is not None else payday_id
+            self._insert_notification_event(
+                connection,
+                household_id=household_id,
+                budget_month_id=None,
+                event_type="payday_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="payday",
+                affected_entity_id=payday_id,
+                title="Payday changed",
+                message=f"{payday_date.isoformat()} was added as a payday.",
+                severity="caution",
+                metadata={"payday_id": payday_id, "payday_date": payday_date.isoformat(), "action": "created"},
+            )
+            return payday_id
+
+    def update_payday(
+        self,
+        *,
+        payday_id: int,
+        payday_date: date,
+        actor_user_id: int | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            before = self._notification_context_for_payday(connection, payday_id)
+            connection.execute(
+                "UPDATE paydays SET payday_date = ? WHERE id = ?",
+                (payday_date.isoformat(), payday_id),
+            )
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=None,
+                event_type="payday_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="payday",
+                affected_entity_id=payday_id,
+                title="Payday changed",
+                message=f"Payday moved from {before['payday_date']} to {payday_date.isoformat()}.",
+                severity="caution",
+                metadata={"payday_id": payday_id, "previous_payday_date": before["payday_date"], "payday_date": payday_date.isoformat(), "action": "updated"},
+            )
+
+    def remove_payday(self, *, payday_id: int, actor_user_id: int | None = None) -> None:
+        with self.connect() as connection:
+            before = self._notification_context_for_payday(connection, payday_id)
+            connection.execute("DELETE FROM paydays WHERE id = ?", (payday_id,))
+            self._insert_notification_event(
+                connection,
+                household_id=before["household_id"],
+                budget_month_id=None,
+                event_type="payday_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="payday",
+                affected_entity_id=payday_id,
+                title="Payday changed",
+                message=f"{before['payday_date']} was removed from paydays.",
+                severity="caution",
+                metadata={"payday_id": payday_id, "action": "removed"},
             )
 
     def get_summary(self, budget_month_id: int, today: date) -> BudgetSummary:
@@ -1590,7 +2182,7 @@ class BudgetRepository:
     ) -> dict[str, Any]:
         row = connection.execute(
             """
-            SELECT b.household_id, b.id AS budget_month_id
+            SELECT b.household_id, b.id AS budget_month_id, g.name AS group_name
             FROM budget_groups g
             JOIN budget_months b ON b.id = g.budget_month_id
             WHERE g.id = ?
@@ -1599,6 +2191,80 @@ class BudgetRepository:
         ).fetchone()
         if row is None:
             raise LookupError(f"Budget group {budget_group_id} not found")
+        return dict(row)
+
+    def _notification_context_for_budget_month(
+        self,
+        connection: sqlite3.Connection,
+        budget_month_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT household_id, id AS budget_month_id, month FROM budget_months WHERE id = ?",
+            (budget_month_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Budget month {budget_month_id} not found")
+        return dict(row)
+
+    def _notification_context_for_income(
+        self,
+        connection: sqlite3.Connection,
+        income_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT
+                b.household_id,
+                b.id AS budget_month_id,
+                i.name,
+                i.kind,
+                i.planned_cents,
+                i.received_cents
+            FROM income_plan i
+            JOIN budget_months b ON b.id = i.budget_month_id
+            WHERE i.id = ?
+            """,
+            (income_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Income {income_id} not found")
+        return dict(row)
+
+    def _notification_context_for_bill(
+        self,
+        connection: sqlite3.Connection,
+        bill_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT
+                b.household_id,
+                b.id AS budget_month_id,
+                eb.name,
+                eb.amount_cents,
+                eb.due_on,
+                eb.paid
+            FROM expected_bills eb
+            JOIN budget_months b ON b.id = eb.budget_month_id
+            WHERE eb.id = ?
+            """,
+            (bill_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Expected bill {bill_id} not found")
+        return dict(row)
+
+    def _notification_context_for_payday(
+        self,
+        connection: sqlite3.Connection,
+        payday_id: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT household_id, payday_date FROM paydays WHERE id = ?",
+            (payday_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Payday {payday_id} not found")
         return dict(row)
 
     def _notification_context_for_category(
@@ -1716,6 +2382,91 @@ class BudgetRepository:
         ).fetchone()
         if row is None:
             raise LookupError(f"Household {household_id} not found")
+
+    def _require_budget_month(self, connection: sqlite3.Connection, budget_month_id: int) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM budget_months WHERE id = ?",
+            (budget_month_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Budget month {budget_month_id} not found")
+        return row
+
+    def _copy_budget_month_structure(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_budget_month_id: int,
+        target_budget_month_id: int,
+        target_month: str,
+    ) -> None:
+        income_rows = connection.execute(
+            "SELECT * FROM income_plan WHERE budget_month_id = ? ORDER BY id",
+            (source_budget_month_id,),
+        ).fetchall()
+        for row in income_rows:
+            connection.execute(
+                """
+                INSERT INTO income_plan(budget_month_id, name, kind, planned_cents, received_cents)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (target_budget_month_id, row["name"], row["kind"], row["planned_cents"], row["received_cents"]),
+            )
+
+        group_id_map: dict[int, int] = {}
+        group_rows = connection.execute(
+            "SELECT * FROM budget_groups WHERE budget_month_id = ? AND archived = 0 ORDER BY display_order, id",
+            (source_budget_month_id,),
+        ).fetchall()
+        for row in group_rows:
+            new_group_id = insert_and_return_id(
+                connection,
+                "INSERT INTO budget_groups(budget_month_id, name, display_order, archived) VALUES (?, ?, ?, 0)",
+                (target_budget_month_id, row["name"], row["display_order"]),
+            )
+            group_id_map[int(row["id"])] = new_group_id
+
+        category_rows = connection.execute(
+            """
+            SELECT *
+            FROM budget_categories
+            WHERE budget_group_id IN (
+                SELECT id FROM budget_groups WHERE budget_month_id = ?
+            )
+                AND archived = 0
+            ORDER BY display_order, id
+            """,
+            (source_budget_month_id,),
+        ).fetchall()
+        for row in category_rows:
+            new_group_id = group_id_map.get(int(row["budget_group_id"]))
+            if new_group_id is None:
+                continue
+            connection.execute(
+                """
+                INSERT INTO budget_categories(budget_group_id, name, planned_cents, archived, display_order)
+                VALUES (?, ?, ?, 0, ?)
+                """,
+                (new_group_id, row["name"], row["planned_cents"], row["display_order"]),
+            )
+
+        bill_rows = connection.execute(
+            "SELECT * FROM expected_bills WHERE budget_month_id = ? ORDER BY due_on, id",
+            (source_budget_month_id,),
+        ).fetchall()
+        for row in bill_rows:
+            connection.execute(
+                """
+                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid)
+                VALUES (?, ?, ?, ?, 0)
+                """,
+                (
+                    target_budget_month_id,
+                    row["name"],
+                    row["amount_cents"],
+                    same_day_in_month(row["due_on"], target_month),
+                ),
+            )
 
     def _require_notification_event(self, connection: sqlite3.Connection, event_id: int) -> sqlite3.Row:
         row = connection.execute(
@@ -1994,6 +2745,7 @@ class BudgetRepository:
                     GROUP BY a.budget_category_id
                 ) ts ON ts.budget_category_id = c.id
                 WHERE g.budget_month_id = ?
+                    AND g.archived = 0
                 ORDER BY g.display_order, c.display_order, c.id
                 """,
                 (budget_month_id, budget_month_id),
@@ -2109,6 +2861,13 @@ def json_dumps(value: dict[str, object]) -> str:
     return json.dumps(value, sort_keys=True)
 
 
+def same_day_in_month(source_iso_date: str, target_month: str) -> str:
+    source = date.fromisoformat(source_iso_date)
+    target_year, target_month_number = (int(part) for part in target_month.split("-", maxsplit=1))
+    target_day = min(source.day, calendar.monthrange(target_year, target_month_number)[1])
+    return date(target_year, target_month_number, target_day).isoformat()
+
+
 def validate_account_type(account_type: str) -> None:
     if account_type not in {"checking", "savings"}:
         raise ValueError("Only checking and savings accounts are supported")
@@ -2198,6 +2957,21 @@ def summary_to_dict(summary: BudgetSummary) -> dict[str, Any]:
     payload = asdict(summary)
     payload["next_payday"] = summary.next_payday.isoformat()
     payload["categories"] = [asdict(category) | {"remaining_cents": category.remaining_cents} for category in summary.categories]
+    total_spent_cents = sum(category.spent_cents for category in summary.categories)
+    overspent_categories = [
+        {
+            "id": category.id,
+            "name": category.name,
+            "remaining_cents": category.remaining_cents,
+        }
+        for category in summary.categories
+        if category.remaining_cents < 0
+    ]
+    payload["planned_income_total_cents"] = summary.income_available_cents
+    payload["assigned_total_cents"] = summary.planned_cents
+    payload["remaining_to_assign_cents"] = summary.unassigned_cents
+    payload["total_spent_cents"] = total_spent_cents
+    payload["overspent_categories"] = overspent_categories
     return payload
 
 
