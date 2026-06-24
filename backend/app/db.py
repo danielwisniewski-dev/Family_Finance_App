@@ -16,6 +16,7 @@ from .domain import (
     CategoryLine,
     ExpectedBill,
     IncomeLine,
+    MerchantRule,
     NotificationEvent,
     PlaidItemLine,
     SafeToSpendResult,
@@ -75,6 +76,7 @@ class BudgetRepository:
             ensure_column(connection, "account_transactions", "reviewed", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "ignored", "INTEGER NOT NULL DEFAULT 0")
             ensure_column(connection, "account_transactions", "ignored_reason", "TEXT")
+            ensure_column(connection, "merchant_category_rules", "updated_at", "TEXT")
 
     def create_household(self, name: str, spouses: Iterable[dict[str, str]] = ()) -> int:
         with self.connect() as connection:
@@ -620,6 +622,15 @@ class BudgetRepository:
         if row is None:
             raise PermissionError("Notification is not available to this household")
 
+    def require_merchant_rule_access(self, rule_id: int, household_id: int) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM merchant_category_rules WHERE id = ? AND household_id = ?",
+                (rule_id, household_id),
+            ).fetchone()
+        if row is None:
+            raise PermissionError("Merchant rule is not available to this household")
+
     def require_plaid_item_access(self, plaid_item_id: int, household_id: int) -> None:
         with self.connect() as connection:
             row = connection.execute(
@@ -1022,7 +1033,7 @@ class BudgetRepository:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT t.*
+                SELECT t.*, a.name AS account_name
                 FROM account_transactions t
                 JOIN cash_accounts a ON a.id = t.cash_account_id
                 WHERE a.budget_month_id = ?
@@ -1040,16 +1051,69 @@ class BudgetRepository:
         ]
 
     def list_transaction_review_queue(self, budget_month_id: int) -> list[TransactionDetail]:
-        return [
-            detail
-            for detail in self.list_budget_transactions(budget_month_id)
-            if detail.needs_review
-        ]
+        return self.list_review_transactions(budget_month_id, status="needs_review")
+
+    def list_review_transactions(
+        self,
+        budget_month_id: int,
+        *,
+        status: str = "needs_review",
+        start_date: date | None = None,
+        end_date: date | None = None,
+        account_id: int | None = None,
+    ) -> list[TransactionDetail]:
+        if status not in {"needs_review", "uncategorized", "reviewed", "ignored", "all"}:
+            raise ValueError("status must be needs_review, uncategorized, reviewed, ignored, or all")
+        clauses = ["a.budget_month_id = ?"]
+        values: list[Any] = [budget_month_id]
+        if start_date is not None:
+            clauses.append("t.occurred_on >= ?")
+            values.append(start_date.isoformat())
+        if end_date is not None:
+            clauses.append("t.occurred_on <= ?")
+            values.append(end_date.isoformat())
+        if account_id is not None:
+            clauses.append("t.cash_account_id = ?")
+            values.append(account_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT t.*, a.name AS account_name
+                FROM account_transactions t
+                JOIN cash_accounts a ON a.id = t.cash_account_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY t.occurred_on, t.id
+                """,
+                values,
+            ).fetchall()
+            details = [self._transaction_detail_from_row(connection, row) for row in rows]
+        if status == "all":
+            return details
+        if status == "needs_review":
+            return [detail for detail in details if detail.needs_review]
+        if status == "uncategorized":
+            return [
+                detail
+                for detail in details
+                if not detail.transaction.ignored and not detail.assignments
+            ]
+        if status == "reviewed":
+            return [
+                detail
+                for detail in details
+                if detail.transaction.reviewed and not detail.transaction.ignored
+            ]
+        return [detail for detail in details if detail.transaction.ignored]
 
     def get_transaction_detail(self, transaction_id: int) -> TransactionDetail:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM account_transactions WHERE id = ?",
+                """
+                SELECT t.*, a.name AS account_name
+                FROM account_transactions t
+                JOIN cash_accounts a ON a.id = t.cash_account_id
+                WHERE t.id = ?
+                """,
                 (transaction_id,),
             ).fetchone()
             if row is None:
@@ -1220,6 +1284,7 @@ class BudgetRepository:
         transaction_id: int,
         splits: Iterable[dict[str, int]],
         reviewed: bool = True,
+        actor_user_id: int | None = None,
     ) -> None:
         split_rows = tuple(splits)
         if not split_rows:
@@ -1268,6 +1333,72 @@ class BudgetRepository:
                 amount_cents=actual_total,
                 metadata={"split_count": len(split_rows)},
             )
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type="transaction_split",
+                actor_user_id=actor_user_id,
+                affected_entity_type="transaction",
+                affected_entity_id=transaction_id,
+                title="Transaction split",
+                message=f"{context['transaction_name']} was split across {len(split_rows)} categories.",
+                severity="info",
+                metadata={
+                    "transaction_id": transaction_id,
+                    "split_count": len(split_rows),
+                    "amount_cents": actual_total,
+                    "category_ids": [int(row["category_id"]) for row in split_rows],
+                },
+            )
+
+    def remove_transaction_split(
+        self,
+        transaction_id: int,
+        reviewed: bool = False,
+        actor_user_id: int | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            self._require_transaction(connection, transaction_id)
+            previous_assignments = self._active_assignments(connection, transaction_id)
+            if not previous_assignments:
+                return
+            if not all(row["source"] == "split" for row in previous_assignments):
+                raise ValueError("Transaction does not have an active split")
+            self._supersede_active_assignments(connection, transaction_id)
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET reviewed = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (1 if reviewed else 0, transaction_id),
+            )
+            self._record_transaction_event(
+                connection,
+                transaction_id=transaction_id,
+                event_type="split_removed",
+                metadata={"split_count": len(previous_assignments)},
+            )
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            self._insert_notification_event(
+                connection,
+                household_id=context["household_id"],
+                budget_month_id=context["budget_month_id"],
+                event_type="transaction_split_removed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="transaction",
+                affected_entity_id=transaction_id,
+                title="Transaction split removed",
+                message=f"{context['transaction_name']} was returned to uncategorized review.",
+                severity="caution",
+                metadata={
+                    "transaction_id": transaction_id,
+                    "previous_category_ids": [int(row["budget_category_id"]) for row in previous_assignments],
+                    "reviewed": reviewed,
+                },
+            )
 
     def set_transaction_ignored(
         self,
@@ -1287,11 +1418,11 @@ class BudgetRepository:
                 SET
                     ignored = ?,
                     ignored_reason = ?,
-                    reviewed = 1,
+                    reviewed = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (1 if ignored else 0, reason if ignored else None, transaction_id),
+                (1 if ignored else 0, reason if ignored else None, 1 if ignored else 0, transaction_id),
             )
             self._record_transaction_event(
                 connection,
@@ -1511,26 +1642,208 @@ class BudgetRepository:
         merchant_match_text: str,
         category_id: int,
         priority: int = 100,
+        actor_user_id: int | None = None,
+        apply_to_existing_unreviewed: bool = False,
     ) -> int:
         cleaned = merchant_match_text.strip().casefold()
         if not cleaned:
             raise ValueError("merchant_match_text is required")
         with self.connect() as connection:
             self._validate_category_for_household(connection, household_id, category_id)
-            rule_id = insert_and_return_id(
-                connection,
+            category_context = self._notification_context_for_category(connection, category_id)
+            existing_rule = connection.execute(
                 """
-                INSERT INTO merchant_category_rules(
-                    household_id,
-                    budget_category_id,
-                    merchant_match_text,
-                    priority
-                )
-                VALUES (?, ?, ?, ?)
+                SELECT id, active
+                FROM merchant_category_rules
+                WHERE household_id = ?
+                    AND merchant_match_text = ?
+                    AND budget_category_id = ?
                 """,
-                (household_id, category_id, cleaned, priority),
+                (household_id, cleaned, category_id),
+            ).fetchone()
+            if existing_rule is not None:
+                rule_id = int(existing_rule["id"])
+                connection.execute(
+                    """
+                    UPDATE merchant_category_rules
+                    SET active = 1,
+                        priority = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (priority, rule_id),
+                )
+                reactivated = not bool(existing_rule["active"])
+            else:
+                rule_id = insert_and_return_id(
+                    connection,
+                    """
+                    INSERT INTO merchant_category_rules(
+                        household_id,
+                        budget_category_id,
+                        merchant_match_text,
+                        priority
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (household_id, category_id, cleaned, priority),
+                )
+                reactivated = False
+            applied_count = (
+                self._apply_matching_rule_to_existing_unreviewed(connection, rule_id)
+                if apply_to_existing_unreviewed
+                else 0
+            )
+            self._insert_notification_event(
+                connection,
+                household_id=household_id,
+                budget_month_id=category_context["budget_month_id"],
+                event_type="merchant_rule_created",
+                actor_user_id=actor_user_id,
+                affected_entity_type="merchant_rule",
+                affected_entity_id=rule_id,
+                title="Merchant rule created",
+                message=f"Future transactions matching '{cleaned}' will use {category_context['category_name']}.",
+                severity="info",
+                metadata={
+                    "rule_id": rule_id,
+                    "category_id": category_id,
+                    "merchant_match_text": cleaned,
+                    "priority": priority,
+                    "applied_existing_count": applied_count,
+                    "reactivated": reactivated,
+                },
             )
             return rule_id
+
+    def list_merchant_rules(self, household_id: int, *, include_inactive: bool = False) -> list[MerchantRule]:
+        clauses = ["r.household_id = ?"]
+        values: list[Any] = [household_id]
+        if not include_inactive:
+            clauses.append("r.active = 1")
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    r.*,
+                    c.name AS category_name
+                FROM merchant_category_rules r
+                JOIN budget_categories c ON c.id = r.budget_category_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY r.active DESC, r.priority, r.id
+                """,
+                values,
+            ).fetchall()
+        return [merchant_rule_from_row(row) for row in rows]
+
+    def get_merchant_rule(self, rule_id: int) -> MerchantRule:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    r.*,
+                    c.name AS category_name
+                FROM merchant_category_rules r
+                JOIN budget_categories c ON c.id = r.budget_category_id
+                WHERE r.id = ?
+                """,
+                (rule_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"Merchant rule {rule_id} not found")
+        return merchant_rule_from_row(row)
+
+    def update_merchant_rule(
+        self,
+        *,
+        rule_id: int,
+        merchant_match_text: str | None = None,
+        category_id: int | None = None,
+        priority: int | None = None,
+        active: bool | None = None,
+        actor_user_id: int | None = None,
+        apply_to_existing_unreviewed: bool = False,
+    ) -> None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        cleaned_match: str | None = None
+        if merchant_match_text is not None:
+            cleaned_match = merchant_match_text.strip().casefold()
+            if not cleaned_match:
+                raise ValueError("merchant_match_text is required")
+            assignments.append("merchant_match_text = ?")
+            values.append(cleaned_match)
+        if category_id is not None:
+            assignments.append("budget_category_id = ?")
+            values.append(category_id)
+        if priority is not None:
+            assignments.append("priority = ?")
+            values.append(priority)
+        if active is not None:
+            assignments.append("active = ?")
+            values.append(1 if active else 0)
+        if not assignments:
+            return
+        assignments.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(rule_id)
+        with self.connect() as connection:
+            before = self._require_merchant_rule(connection, rule_id)
+            target_category_id = category_id if category_id is not None else int(before["budget_category_id"])
+            self._validate_category_for_household(connection, int(before["household_id"]), target_category_id)
+            category_context = self._notification_context_for_category(connection, target_category_id)
+            connection.execute(
+                f"UPDATE merchant_category_rules SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+            applied_count = (
+                self._apply_matching_rule_to_existing_unreviewed(connection, rule_id)
+                if apply_to_existing_unreviewed
+                else 0
+            )
+            self._insert_notification_event(
+                connection,
+                household_id=int(before["household_id"]),
+                budget_month_id=category_context["budget_month_id"],
+                event_type="merchant_rule_changed",
+                actor_user_id=actor_user_id,
+                affected_entity_type="merchant_rule",
+                affected_entity_id=rule_id,
+                title="Merchant rule changed",
+                message=f"Merchant rule '{cleaned_match or before['merchant_match_text']}' was updated.",
+                severity="caution" if active is False else "info",
+                metadata={
+                    "rule_id": rule_id,
+                    "previous_category_id": int(before["budget_category_id"]),
+                    "category_id": target_category_id,
+                    "merchant_match_text": cleaned_match or before["merchant_match_text"],
+                    "priority": priority if priority is not None else int(before["priority"]),
+                    "active": active if active is not None else bool(before["active"]),
+                    "applied_existing_count": applied_count,
+                },
+            )
+
+    def delete_merchant_rule(self, *, rule_id: int, actor_user_id: int | None = None) -> None:
+        with self.connect() as connection:
+            before = self._require_merchant_rule(connection, rule_id)
+            category_context = self._notification_context_for_category(connection, int(before["budget_category_id"]))
+            connection.execute("DELETE FROM merchant_category_rules WHERE id = ?", (rule_id,))
+            self._insert_notification_event(
+                connection,
+                household_id=int(before["household_id"]),
+                budget_month_id=category_context["budget_month_id"],
+                event_type="merchant_rule_deleted",
+                actor_user_id=actor_user_id,
+                affected_entity_type="merchant_rule",
+                affected_entity_id=rule_id,
+                title="Merchant rule deleted",
+                message=f"Merchant rule '{before['merchant_match_text']}' was deleted.",
+                severity="caution",
+                metadata={
+                    "rule_id": rule_id,
+                    "category_id": int(before["budget_category_id"]),
+                    "merchant_match_text": before["merchant_match_text"],
+                },
+            )
 
     def update_plaid_item_cursor(self, plaid_item_id: int, sync_cursor: str | None) -> None:
         with self.connect() as connection:
@@ -2477,6 +2790,15 @@ class BudgetRepository:
             raise LookupError(f"Notification event {event_id} not found")
         return row
 
+    def _require_merchant_rule(self, connection: sqlite3.Connection, rule_id: int) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM merchant_category_rules WHERE id = ?",
+            (rule_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"Merchant rule {rule_id} not found")
+        return row
+
     def _validate_user_for_notification_scope(
         self,
         connection: sqlite3.Connection,
@@ -2521,10 +2843,15 @@ class BudgetRepository:
             """,
             (transaction_id,),
         ).fetchall()
+        suggestion = self._suggestion_for_transaction(connection, row, assignment_rows)
         return TransactionDetail(
             transaction=transaction_from_row(row),
             assignments=tuple(assignment_from_row(item) for item in assignment_rows),
             audit_events=tuple(dict(item) for item in event_rows),
+            suggested_category_id=suggestion["category_id"],
+            suggestion_source=suggestion["source"],
+            suggestion_reason=suggestion["reason"],
+            matching_rule_id=suggestion["rule_id"],
         )
 
     def _require_transaction(self, connection: sqlite3.Connection, transaction_id: int) -> sqlite3.Row:
@@ -2610,31 +2937,57 @@ class BudgetRepository:
             (transaction_id, category_id, amount_cents, source),
         )
 
-    def _apply_best_rule_if_allowed(self, connection: sqlite3.Connection, transaction_id: int) -> None:
-        transaction = self._require_transaction(connection, transaction_id)
+    def _suggestion_for_transaction(
+        self,
+        connection: sqlite3.Connection,
+        transaction: sqlite3.Row,
+        assignment_rows: Iterable[sqlite3.Row],
+    ) -> dict[str, Any]:
+        assignments = tuple(assignment_rows)
         if transaction["ignored"]:
-            return
-        active_assignments = connection.execute(
-            """
-            SELECT source
-            FROM transaction_category_assignments
-            WHERE transaction_id = ? AND active = 1
-            """,
-            (transaction_id,),
-        ).fetchall()
-        if any(row["source"] in {"manual", "split"} for row in active_assignments):
-            return
-        if active_assignments:
-            self._supersede_active_assignments(connection, transaction_id)
+            return {"category_id": None, "source": "ignored", "reason": "Ignored transaction", "rule_id": None}
+        if len(assignments) == 1:
+            assignment = assignments[0]
+            return {
+                "category_id": int(assignment["budget_category_id"]),
+                "source": str(assignment["source"]),
+                "reason": f"Saved {assignment['source']} assignment",
+                "rule_id": None,
+            }
+        if len(assignments) > 1:
+            return {"category_id": None, "source": "split", "reason": "Split transaction", "rule_id": None}
+        rule = self._best_matching_rule_for_transaction(connection, transaction)
+        if rule is not None:
+            return {
+                "category_id": int(rule["budget_category_id"]),
+                "source": "rule",
+                "reason": f"Matches merchant rule '{rule['merchant_match_text']}'",
+                "rule_id": int(rule["id"]),
+            }
+        if transaction["category_hint"]:
+            return {
+                "category_id": None,
+                "source": "plaid_hint",
+                "reason": str(transaction["category_hint"]),
+                "rule_id": None,
+            }
+        return {"category_id": None, "source": None, "reason": None, "rule_id": None}
 
-        haystack = " ".join(
+    def _transaction_match_text(self, transaction: sqlite3.Row) -> str:
+        return " ".join(
             value
             for value in (transaction["merchant_name"], transaction["name"])
             if value
         ).casefold()
-        if not haystack:
-            return
 
+    def _best_matching_rule_for_transaction(
+        self,
+        connection: sqlite3.Connection,
+        transaction: sqlite3.Row,
+    ) -> sqlite3.Row | None:
+        haystack = self._transaction_match_text(transaction)
+        if not haystack:
+            return None
         rule_rows = connection.execute(
             """
             SELECT r.*
@@ -2653,24 +3006,72 @@ class BudgetRepository:
         ).fetchall()
         for rule in rule_rows:
             if rule["merchant_match_text"] in haystack:
-                amount_cents = budget_amount_cents(transaction["amount_cents"])
-                self._insert_assignment(
-                    connection,
-                    transaction_id=transaction_id,
-                    category_id=int(rule["budget_category_id"]),
-                    amount_cents=amount_cents,
-                    source="rule",
-                )
-                self._record_transaction_event(
-                    connection,
-                    transaction_id=transaction_id,
-                    event_type="rule_applied",
-                    source="rule",
-                    category_id=int(rule["budget_category_id"]),
-                    amount_cents=amount_cents,
-                    metadata={"rule_id": int(rule["id"])},
-                )
-                return
+                return rule
+        return None
+
+    def _apply_matching_rule_to_existing_unreviewed(self, connection: sqlite3.Connection, rule_id: int) -> int:
+        rule = self._require_merchant_rule(connection, rule_id)
+        if not rule["active"]:
+            return 0
+        rows = connection.execute(
+            """
+            SELECT t.*, a.name AS account_name
+            FROM account_transactions t
+            JOIN cash_accounts a ON a.id = t.cash_account_id
+            JOIN budget_months b ON b.id = a.budget_month_id
+            WHERE b.household_id = ?
+                AND t.reviewed = 0
+                AND t.ignored = 0
+            ORDER BY t.occurred_on, t.id
+            """,
+            (rule["household_id"],),
+        ).fetchall()
+        applied_count = 0
+        for transaction in rows:
+            if rule["merchant_match_text"] not in self._transaction_match_text(transaction):
+                continue
+            self._apply_best_rule_if_allowed(connection, int(transaction["id"]))
+            active = self._active_assignments(connection, int(transaction["id"]))
+            if len(active) == 1 and int(active[0]["budget_category_id"]) == int(rule["budget_category_id"]):
+                applied_count += 1
+        return applied_count
+
+    def _apply_best_rule_if_allowed(self, connection: sqlite3.Connection, transaction_id: int) -> None:
+        transaction = self._require_transaction(connection, transaction_id)
+        if transaction["ignored"]:
+            return
+        active_assignments = connection.execute(
+            """
+            SELECT source
+            FROM transaction_category_assignments
+            WHERE transaction_id = ? AND active = 1
+            """,
+            (transaction_id,),
+        ).fetchall()
+        if any(row["source"] in {"manual", "split"} for row in active_assignments):
+            return
+        if active_assignments:
+            self._supersede_active_assignments(connection, transaction_id)
+        rule = self._best_matching_rule_for_transaction(connection, transaction)
+        if rule is None:
+            return
+        amount_cents = budget_amount_cents(transaction["amount_cents"])
+        self._insert_assignment(
+            connection,
+            transaction_id=transaction_id,
+            category_id=int(rule["budget_category_id"]),
+            amount_cents=amount_cents,
+            source="rule",
+        )
+        self._record_transaction_event(
+            connection,
+            transaction_id=transaction_id,
+            event_type="rule_applied",
+            source="rule",
+            category_id=int(rule["budget_category_id"]),
+            amount_cents=amount_cents,
+            metadata={"rule_id": int(rule["id"])},
+        )
 
     def _record_transaction_event(
         self,
@@ -2907,6 +3308,7 @@ def plaid_item_from_row(row: sqlite3.Row) -> PlaidItemLine:
 
 
 def transaction_from_row(row: sqlite3.Row) -> TransactionLine:
+    account_name = row["account_name"] if "account_name" in row.keys() else None
     return TransactionLine(
         id=row["id"],
         cash_account_id=row["cash_account_id"],
@@ -2920,6 +3322,7 @@ def transaction_from_row(row: sqlite3.Row) -> TransactionLine:
         reviewed=bool(row["reviewed"]),
         ignored=bool(row["ignored"]),
         ignored_reason=row["ignored_reason"],
+        account_name=account_name,
     )
 
 
@@ -2950,6 +3353,20 @@ def notification_from_row(row: sqlite3.Row) -> NotificationEvent:
         read_at=row["viewer_read_at"],
         read_by_user_id=row["viewer_read_by_user_id"],
         created_at=row["created_at"],
+    )
+
+
+def merchant_rule_from_row(row: sqlite3.Row) -> MerchantRule:
+    return MerchantRule(
+        id=int(row["id"]),
+        household_id=int(row["household_id"]),
+        category_id=int(row["budget_category_id"]),
+        merchant_match_text=row["merchant_match_text"],
+        priority=int(row["priority"]),
+        active=bool(row["active"]),
+        category_name=row["category_name"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"] if "updated_at" in row.keys() else None,
     )
 
 
@@ -3010,7 +3427,15 @@ def transaction_detail_to_dict(detail: TransactionDetail) -> dict[str, Any]:
         "final_category_id": detail.final_category_id,
         "categorization_status": detail.categorization_status,
         "needs_review": detail.needs_review,
+        "suggested_category_id": detail.suggested_category_id,
+        "suggestion_source": detail.suggestion_source,
+        "suggestion_reason": detail.suggestion_reason,
+        "matching_rule_id": detail.matching_rule_id,
     }
+
+
+def merchant_rule_to_dict(rule: MerchantRule) -> dict[str, Any]:
+    return asdict(rule)
 
 
 def safe_to_spend_to_dict(result: SafeToSpendResult) -> dict[str, Any]:

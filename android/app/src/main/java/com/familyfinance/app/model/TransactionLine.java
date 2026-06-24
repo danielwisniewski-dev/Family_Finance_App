@@ -13,6 +13,7 @@ public final class TransactionLine {
     public final boolean reviewed;
     public final boolean ignored;
     public final String ignoredReason;
+    public final String accountName;
 
     public TransactionLine(
             int id,
@@ -24,7 +25,8 @@ public final class TransactionLine {
             String categoryHint,
             boolean reviewed,
             boolean ignored,
-            String ignoredReason
+            String ignoredReason,
+            String accountName
     ) {
         this.id = id;
         this.amountCents = amountCents;
@@ -36,6 +38,7 @@ public final class TransactionLine {
         this.reviewed = reviewed;
         this.ignored = ignored;
         this.ignoredReason = ignoredReason;
+        this.accountName = accountName;
     }
 
     public static TransactionLine fromJson(JSONObject json) {
@@ -49,7 +52,8 @@ public final class TransactionLine {
                 json.optString("category_hint", ""),
                 json.optBoolean("reviewed"),
                 json.optBoolean("ignored"),
-                json.optString("ignored_reason", "")
+                json.optString("ignored_reason", ""),
+                json.optString("account_name", "")
         );
     }
 

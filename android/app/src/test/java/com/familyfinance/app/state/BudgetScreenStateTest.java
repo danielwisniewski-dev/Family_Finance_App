@@ -52,11 +52,15 @@ public final class BudgetScreenStateTest {
             List<TransactionAssignment> assignments
     ) {
         return new TransactionDetail(
-                new TransactionLine(id, -1200, "2026-06-21", "Store", "Store", false, "", false, false, ""),
+                new TransactionLine(id, -1200, "2026-06-21", "Store", "Store", false, "", false, false, "", "Main Checking"),
                 assignments,
                 finalCategoryId,
                 finalCategoryId == null ? "split" : "manual",
-                false
+                false,
+                finalCategoryId,
+                finalCategoryId == null ? "split" : "manual",
+                "",
+                null
         );
     }
 }

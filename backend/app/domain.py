@@ -95,6 +95,7 @@ class TransactionLine:
     reviewed: bool = False
     ignored: bool = False
     ignored_reason: str | None = None
+    account_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,10 @@ class TransactionDetail:
     transaction: TransactionLine
     assignments: tuple[TransactionCategoryAssignment, ...]
     audit_events: tuple[dict[str, object], ...]
+    suggested_category_id: int | None = None
+    suggestion_source: str | None = None
+    suggestion_reason: str | None = None
+    matching_rule_id: int | None = None
 
     @property
     def final_category_id(self) -> int | None:
@@ -138,6 +143,19 @@ class TransactionDetail:
 class TransactionUpsertResult:
     transaction_id: int
     created: bool
+
+
+@dataclass(frozen=True)
+class MerchantRule:
+    id: int
+    household_id: int
+    category_id: int
+    merchant_match_text: str
+    priority: int
+    active: bool
+    category_name: str
+    created_at: str
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)

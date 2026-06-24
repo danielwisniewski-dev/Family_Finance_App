@@ -164,6 +164,39 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         self.assertIn("Transaction", detail_error["error"])
         self.assertIn("Budget month", list_error["error"])
 
+    def test_user_cannot_access_another_households_merchant_rules(self) -> None:
+        token = str(self.login("daniel", "daniel-local-test")["token"])
+        kara_rule_id = ApiHandler.repository.create_merchant_rule(
+            household_id=self.kara["household_id"],
+            merchant_match_text="fresh",
+            category_id=self.kara["category_id"],
+        )
+
+        create_error = self.post(
+            "/merchant-category-rules",
+            {
+                "merchant_match_text": "fresh",
+                "category_id": self.kara["category_id"],
+            },
+            token=token,
+            expect_status=403,
+        )
+        update_error = self.patch(
+            f"/merchant-category-rules/{kara_rule_id}",
+            {"active": False},
+            token=token,
+            expect_status=403,
+        )
+        delete_error = self.delete(
+            f"/merchant-category-rules/{kara_rule_id}",
+            token=token,
+            expect_status=403,
+        )
+
+        self.assertIn("Category", create_error["error"])
+        self.assertIn("Merchant rule", update_error["error"])
+        self.assertIn("Merchant rule", delete_error["error"])
+
     def test_user_cannot_access_another_households_notifications(self) -> None:
         token = str(self.login("daniel", "daniel-local-test")["token"])
 
@@ -564,6 +597,16 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             headers=self.auth_headers(token) | {"Content-Type": "application/json"},
             method="PATCH",
         )
+        return self.open_json(request, expect_status)
+
+    def delete(
+        self,
+        path: str,
+        *,
+        token: str | None = None,
+        expect_status: int = 200,
+    ) -> dict[str, object]:
+        request = Request(f"{self.base_url}{path}", headers=self.auth_headers(token), method="DELETE")
         return self.open_json(request, expect_status)
 
     def open_json(self, request: Request, expect_status: int) -> dict[str, object]:
