@@ -22,6 +22,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.familyfinance.app.api.FamilyFinanceApi;
+import com.familyfinance.app.model.AppDiagnostics;
 import com.familyfinance.app.model.BudgetDetail;
 import com.familyfinance.app.model.BudgetGroup;
 import com.familyfinance.app.model.BudgetMonth;
@@ -34,15 +35,18 @@ import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.Payday;
 import com.familyfinance.app.model.PlannedIncome;
 import com.familyfinance.app.model.SafeToSpendResult;
+import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
 import com.familyfinance.app.state.BudgetScreenState;
+import com.familyfinance.app.state.LoginErrorMessages;
 import com.familyfinance.app.state.MoneyFormatter;
 import com.plaid.link.Plaid;
 import com.plaid.link.PlaidHandler;
 import com.plaid.link.configuration.LinkTokenConfiguration;
 import com.plaid.link.result.LinkResultHandler;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.LinkedHashSet;
@@ -110,7 +114,7 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         loadPreferences();
         if (authToken == null || authToken.isEmpty()) {
-            showLogin(null);
+            checkSetupThenShowLogin(null);
         } else {
             showLoading("Loading dashboard...");
             refreshData(this::showDashboard);
@@ -181,24 +185,43 @@ public final class MainActivity extends Activity {
         merchantRules = new ArrayList<>();
         notifications = new ArrayList<>();
         unreadNotificationCount = 0;
-        showLogin("Logged out.");
+        checkSetupThenShowLogin("Logged out.");
     }
 
     private void refreshData(Runnable afterLoad) {
         executor.execute(() -> {
             try {
-                BudgetDetail loadedBudgetDetail = api.getBudgetDetail(budgetMonthId);
                 List<BudgetMonth> loadedBudgetMonths = api.getBudgetMonths();
-                List<TransactionDetail> loadedTransactions = api.getTransactions(budgetMonthId);
-                List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(budgetMonthId);
-                List<CashAccount> loadedAccounts = api.getAccounts(budgetMonthId);
+                if (loadedBudgetMonths.isEmpty()) {
+                    mainHandler.post(() -> {
+                        budgetMonths = loadedBudgetMonths;
+                        budgetDetail = null;
+                        summary = null;
+                        transactions = new ArrayList<>();
+                        reviewQueue = new ArrayList<>();
+                        accounts = new ArrayList<>();
+                        merchantRules = new ArrayList<>();
+                        notifications = new ArrayList<>();
+                        unreadNotificationCount = 0;
+                        afterLoad.run();
+                    });
+                    return;
+                }
+                int selectedBudgetMonthId = selectBudgetMonthId(loadedBudgetMonths);
+                BudgetDetail loadedBudgetDetail = api.getBudgetDetail(selectedBudgetMonthId);
+                List<TransactionDetail> loadedTransactions = api.getTransactions(selectedBudgetMonthId);
+                List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(selectedBudgetMonthId);
+                List<CashAccount> loadedAccounts = api.getAccounts(selectedBudgetMonthId);
                 List<MerchantRule> loadedMerchantRules = api.getMerchantRules();
-                List<NotificationEvent> loadedNotifications = api.getNotifications(budgetMonthId);
-                int loadedUnreadNotificationCount = api.getUnreadNotificationCount(budgetMonthId);
+                List<NotificationEvent> loadedNotifications = api.getNotifications(selectedBudgetMonthId);
+                int loadedUnreadNotificationCount = api.getUnreadNotificationCount(selectedBudgetMonthId);
                 mainHandler.post(() -> {
                     budgetDetail = loadedBudgetDetail;
                     summary = loadedBudgetDetail.summary;
                     budgetMonths = loadedBudgetMonths;
+                    if (selectedBudgetMonthId != budgetMonthId) {
+                        saveConnectionPreferences(baseUrl, selectedBudgetMonthId);
+                    }
                     transactions = loadedTransactions;
                     reviewQueue = loadedReviewQueue;
                     accounts = loadedAccounts;
@@ -211,6 +234,158 @@ public final class MainActivity extends Activity {
                 mainHandler.post(() -> showError("Could not load backend data", exception));
             }
         });
+    }
+
+    private int selectBudgetMonthId(List<BudgetMonth> months) {
+        for (BudgetMonth month : months) {
+            if (month.id == budgetMonthId) {
+                return budgetMonthId;
+            }
+        }
+        for (BudgetMonth month : months) {
+            if (month.active) {
+                return month.id;
+            }
+        }
+        return months.get(0).id;
+    }
+
+    private void checkSetupThenShowLogin(String message) {
+        showLoading("Checking setup status...");
+        executor.execute(() -> {
+            try {
+                SetupStatus status = new FamilyFinanceApi(baseUrl).getSetupStatus();
+                mainHandler.post(() -> {
+                    if (status.canInitialize) {
+                        showFirstRunSetup(message);
+                    } else {
+                        showLogin(message);
+                    }
+                });
+            } catch (Exception exception) {
+                mainHandler.post(() -> showLogin(
+                        "Backend is unreachable at " + baseUrl + ". Check the server URL and try again."
+                ));
+            }
+        });
+    }
+
+    private void showFirstRunSetup(String message) {
+        beginScreen("First-Run Setup");
+        if (message != null && !message.trim().isEmpty()) {
+            addBody(message.trim());
+        }
+        addSection("Backend connection");
+        EditText baseUrlInput = new EditText(this);
+        baseUrlInput.setSingleLine(true);
+        baseUrlInput.setText(baseUrl);
+        root.addView(baseUrlInput);
+
+        addSection("Private household");
+        EditText householdInput = new EditText(this);
+        householdInput.setHint("Household name");
+        householdInput.setSingleLine(true);
+        householdInput.setText("Daniel and Kara");
+        root.addView(householdInput);
+
+        addSection("Primary local user");
+        EditText danielName = new EditText(this);
+        danielName.setHint("Display name");
+        danielName.setSingleLine(true);
+        danielName.setText("Daniel");
+        root.addView(danielName);
+        EditText danielUsername = new EditText(this);
+        danielUsername.setHint("Username");
+        danielUsername.setSingleLine(true);
+        root.addView(danielUsername);
+        EditText danielEmail = new EditText(this);
+        danielEmail.setHint("Email optional");
+        danielEmail.setSingleLine(true);
+        root.addView(danielEmail);
+        EditText danielPassword = new EditText(this);
+        danielPassword.setHint("Password");
+        danielPassword.setSingleLine(true);
+        danielPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        root.addView(danielPassword);
+
+        addSection("Kara local user optional");
+        EditText karaName = new EditText(this);
+        karaName.setHint("Display name");
+        karaName.setSingleLine(true);
+        karaName.setText("Kara");
+        root.addView(karaName);
+        EditText karaUsername = new EditText(this);
+        karaUsername.setHint("Username");
+        karaUsername.setSingleLine(true);
+        root.addView(karaUsername);
+        EditText karaEmail = new EditText(this);
+        karaEmail.setHint("Email optional");
+        karaEmail.setSingleLine(true);
+        root.addView(karaEmail);
+        EditText karaPassword = new EditText(this);
+        karaPassword.setHint("Password");
+        karaPassword.setSingleLine(true);
+        karaPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        root.addView(karaPassword);
+
+        addButton("Create private household", () -> {
+            String newBaseUrl = baseUrlInput.getText().toString().trim();
+            String householdName = householdInput.getText().toString().trim();
+            String primaryUsername = danielUsername.getText().toString().trim();
+            String primaryPassword = danielPassword.getText().toString();
+            String primaryName = danielName.getText().toString();
+            String primaryEmail = danielEmail.getText().toString();
+            String spouseName = karaName.getText().toString();
+            String spouseUsername = karaUsername.getText().toString().trim();
+            String spouseEmail = karaEmail.getText().toString();
+            String spousePassword = karaPassword.getText().toString();
+            if (householdName.isEmpty() || primaryUsername.isEmpty() || primaryPassword.isEmpty()) {
+                toast("Household name, primary username, and primary password are required.");
+                return;
+            }
+            showLoading("Creating private household...");
+            executor.execute(() -> {
+                try {
+                    JSONArray users = new JSONArray();
+                    users.put(setupUserJson(
+                            primaryName,
+                            primaryUsername,
+                            primaryEmail,
+                            primaryPassword
+                    ));
+                    if (!spouseUsername.isEmpty() || !spousePassword.isEmpty()) {
+                        if (spouseUsername.isEmpty() || spousePassword.isEmpty()) {
+                            throw new IllegalArgumentException("Kara username and password must both be filled or both left blank.");
+                        }
+                        users.put(setupUserJson(
+                                spouseName,
+                                spouseUsername,
+                                spouseEmail,
+                                spousePassword
+                        ));
+                    }
+                    new FamilyFinanceApi(newBaseUrl).initializeHousehold(householdName, users);
+                    mainHandler.post(() -> {
+                        saveConnectionPreferences(newBaseUrl, budgetMonthId);
+                        showLogin("Household created. Log in with the local credentials you just set.");
+                    });
+                } catch (Exception exception) {
+                    mainHandler.post(() -> showFirstRunSetup(exception.getMessage()));
+                }
+            });
+        });
+        addButton("Back to login", () -> showLogin(null));
+    }
+
+    private JSONObject setupUserJson(String name, String username, String email, String password) throws Exception {
+        JSONObject user = new JSONObject();
+        user.put("name", name == null || name.trim().isEmpty() ? username.trim() : name.trim());
+        user.put("username", username.trim());
+        if (email != null && !email.trim().isEmpty()) {
+            user.put("email", email.trim());
+        }
+        user.put("password", password);
+        return user;
     }
 
     private void showLogin(String message) {
@@ -235,7 +410,6 @@ public final class MainActivity extends Activity {
         EditText usernameInput = new EditText(this);
         usernameInput.setHint("Username or email");
         usernameInput.setSingleLine(true);
-        usernameInput.setText("daniel");
         root.addView(usernameInput);
 
         EditText passwordInput = new EditText(this);
@@ -275,9 +449,13 @@ public final class MainActivity extends Activity {
                         refreshData(this::showDashboard);
                     });
                 } catch (Exception exception) {
-                    mainHandler.post(() -> showLogin(exception.getMessage() == null ? exception.toString() : exception.getMessage()));
+                    mainHandler.post(() -> showLogin(LoginErrorMessages.fromException(exception, newBaseUrl)));
                 }
             });
+        });
+        addButton("Check first-run setup", () -> {
+            saveConnectionPreferences(baseUrlInput.getText().toString(), budgetMonthId);
+            checkSetupThenShowLogin(null);
         });
     }
 
@@ -286,7 +464,12 @@ public final class MainActivity extends Activity {
         addFact("Backend", baseUrl + "  |  Budget month ID " + budgetMonthId);
         addFact("Signed in", blankAsDash(currentUserName) + "  |  " + blankAsDash(householdName));
         if (summary == null) {
-            addBody("No summary loaded.");
+            if (budgetMonths.isEmpty()) {
+                addBody("No budget month exists yet for this household.");
+                addButton("Create starter budget month", this::showStarterBudget);
+            } else {
+                addBody("No summary loaded.");
+            }
             addNav();
             return;
         }
@@ -318,6 +501,32 @@ public final class MainActivity extends Activity {
                 );
             }
         }
+        addNav();
+    }
+
+    private void showStarterBudget() {
+        beginScreen("Starter Budget");
+        addBody("Create the current budget month with starter categories. This will only work when this household has no budget months.");
+        EditText nextPayday = new EditText(this);
+        nextPayday.setHint("Next payday YYYY-MM-DD");
+        nextPayday.setSingleLine(true);
+        root.addView(nextPayday);
+        addButton("Create current month", () -> {
+            String payday = nextPayday.getText().toString().trim();
+            if (payday.isEmpty()) {
+                toast("Enter the next payday date.");
+                return;
+            }
+            runMutation(
+                    "Creating starter budget...",
+                    () -> {
+                        int newMonthId = api.createStarterBudget(payday);
+                        api.activateBudgetMonth(newMonthId);
+                        saveConnectionPreferences(baseUrl, newMonthId);
+                    },
+                    () -> refreshData(this::showBudget)
+            );
+        });
         addNav();
     }
 
@@ -1088,7 +1297,27 @@ public final class MainActivity extends Activity {
     }
 
     private void showSettings() {
+        if (authToken == null || authToken.isEmpty()) {
+            showLogin("Log in to view settings.");
+            return;
+        }
+        showLoading("Loading settings...");
+        executor.execute(() -> {
+            try {
+                JSONObject accountSettings = api.getAccountSettings();
+                AppDiagnostics diagnostics = api.getDiagnostics();
+                mainHandler.post(() -> renderSettings(accountSettings, diagnostics, null));
+            } catch (Exception exception) {
+                mainHandler.post(() -> renderSettings(null, null, exception.getMessage()));
+            }
+        });
+    }
+
+    private void renderSettings(JSONObject accountSettings, AppDiagnostics diagnostics, String errorMessage) {
         beginScreen("Accounts / Settings");
+        if (errorMessage != null && !errorMessage.trim().isEmpty()) {
+            addWarning("Could not load diagnostics: " + errorMessage);
+        }
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
         baseUrlInput.setSingleLine(true);
@@ -1103,6 +1332,15 @@ public final class MainActivity extends Activity {
         addFact("Signed in", blankAsDash(currentUserName) + "  |  " + blankAsDash(householdName));
         addFact("Current user ID", currentUserId == 0 ? "-" : Integer.toString(currentUserId));
         addFact("Household ID", householdId == 0 ? "-" : Integer.toString(householdId));
+        addFact("Plaid mode", "Sandbox");
+        if (diagnostics != null) {
+            addSection("Diagnostics");
+            addFact("Backend reachable", diagnostics.backendReachable ? "Yes" : "No");
+            addFact("Database initialized", diagnostics.databaseInitialized ? "Yes" : "No");
+            addFact("Plaid sandbox only", diagnostics.plaidSandboxOnly ? "Yes" : "No");
+            addFact("Diagnostic user", blankAsDash(diagnostics.userName));
+            addFact("Diagnostic household", blankAsDash(diagnostics.householdName));
+        }
         addButton("Save and reload", () -> {
             int parsedId;
             try {
@@ -1115,11 +1353,61 @@ public final class MainActivity extends Activity {
             showLoading("Reloading...");
             refreshData(this::showDashboard);
         });
-        addButton("Health check", () -> runMutation(
-                "Checking health...",
-                () -> api.health(),
-                () -> toast("Backend health check passed.")
-        ));
+        addButton("Refresh diagnostics", this::showSettings);
+
+        addSection("Account");
+        JSONObject user = accountSettings == null ? null : accountSettings.optJSONObject("user");
+        JSONObject household = accountSettings == null ? null : accountSettings.optJSONObject("household");
+        addFact("User", user == null ? blankAsDash(currentUserName) : blankAsDash(user.optString("name")));
+        addFact("Username", user == null ? "-" : blankAsDash(user.optString("username")));
+        addFact("Household", household == null ? blankAsDash(householdName) : blankAsDash(household.optString("name")));
+        EditText displayNameInput = new EditText(this);
+        displayNameInput.setHint("Display name");
+        displayNameInput.setSingleLine(true);
+        displayNameInput.setText(user == null ? currentUserName : user.optString("name"));
+        root.addView(displayNameInput);
+        addButton("Update display name", () -> {
+            String displayName = displayNameInput.getText().toString().trim();
+            if (displayName.isEmpty()) {
+                toast("Enter a display name.");
+                return;
+            }
+            runMutation(
+                    "Updating display name...",
+                    () -> api.updateDisplayName(displayName),
+                    () -> {
+                        currentUserName = displayName;
+                        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("current_user_name", displayName).apply();
+                        showSettings();
+                    }
+            );
+        });
+        EditText currentPasswordInput = new EditText(this);
+        currentPasswordInput.setHint("Current password");
+        currentPasswordInput.setSingleLine(true);
+        currentPasswordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        root.addView(currentPasswordInput);
+        EditText newPasswordInput = new EditText(this);
+        newPasswordInput.setHint("New password");
+        newPasswordInput.setSingleLine(true);
+        newPasswordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        root.addView(newPasswordInput);
+        addButton("Change password", () -> {
+            String currentPassword = currentPasswordInput.getText().toString();
+            String newPassword = newPasswordInput.getText().toString();
+            if (currentPassword.isEmpty() || newPassword.isEmpty()) {
+                toast("Enter current and new passwords.");
+                return;
+            }
+            runMutation(
+                    "Changing password...",
+                    () -> api.changePassword(currentPassword, newPassword),
+                    () -> {
+                        toast("Password changed.");
+                        showSettings();
+                    }
+            );
+        });
         addButton("Log out", this::logout);
 
         addSection("Plaid Sandbox");

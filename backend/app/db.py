@@ -186,6 +186,249 @@ class BudgetRepository:
                 "household": safe_household_from_user_row(row),
             }
 
+    def setup_status(self, auth_context: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.connect() as connection:
+            household_count = int(connection.execute("SELECT COUNT(*) AS count FROM households").fetchone()["count"])
+            user_count = int(connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"])
+        payload: dict[str, Any] = {
+            "initialized": household_count > 0 or user_count > 0,
+            "household_exists": household_count > 0,
+            "users_exist": user_count > 0,
+            "can_initialize": household_count == 0 and user_count == 0,
+        }
+        if auth_context is not None:
+            payload["current_user"] = auth_context["user"]
+            payload["current_household"] = auth_context["household"]
+        return payload
+
+    def initialize_private_household(self, *, household_name: str, users: Iterable[dict[str, str]]) -> dict[str, Any]:
+        household_name = clean_required_text(household_name, "household_name")
+        cleaned_users = [clean_setup_user(user) for user in users]
+        if not cleaned_users:
+            raise ValueError("At least one local user is required")
+        with self.connect() as connection:
+            household_count = int(connection.execute("SELECT COUNT(*) AS count FROM households").fetchone()["count"])
+            user_count = int(connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"])
+            if household_count > 0 or user_count > 0:
+                raise PermissionError("Setup is only available before the app is initialized")
+            household_id = insert_and_return_id(connection, "INSERT INTO households(name) VALUES (?)", (household_name,))
+            user_rows: list[sqlite3.Row] = []
+            for user in cleaned_users:
+                user_id = insert_and_return_id(
+                    connection,
+                    """
+                    INSERT INTO users(household_id, name, username, email, password_hash, role)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        household_id,
+                        user["name"],
+                        user["username"],
+                        user["email"],
+                        hash_password(user["password"]),
+                        user["role"],
+                    ),
+                )
+                user_rows.append(connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
+            household_row = connection.execute("SELECT * FROM households WHERE id = ?", (household_id,)).fetchone()
+            self._insert_notification_event(
+                connection,
+                household_id=household_id,
+                budget_month_id=None,
+                event_type="household_initialized",
+                actor_user_id=int(user_rows[0]["id"]),
+                affected_entity_type="household",
+                affected_entity_id=household_id,
+                title="Household initialized",
+                message=f"{household_name} was initialized for private local use.",
+                severity="important",
+                metadata={"household_id": household_id, "user_count": len(user_rows)},
+            )
+        return {
+            "household": safe_household_from_household_row(household_row),
+            "users": [safe_user_from_row(row) for row in user_rows],
+        }
+
+    def account_settings_summary(self, user_id: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    u.*,
+                    h.name AS household_name
+                FROM users u
+                JOIN households h ON h.id = u.household_id
+                WHERE u.id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("User not found")
+            active = connection.execute(
+                "SELECT active_budget_month_id FROM households WHERE id = ?",
+                (row["household_id"],),
+            ).fetchone()
+        summary = {
+            "user": safe_user_from_row(row),
+            "household": safe_household_from_user_row(row),
+            "active_budget_month_id": active["active_budget_month_id"] if active is not None else None,
+        }
+        return summary
+
+    def update_user_display_name(self, *, user_id: int, display_name: str) -> dict[str, Any]:
+        display_name = clean_required_text(display_name, "display_name")
+        with self.connect() as connection:
+            before = connection.execute(
+                """
+                SELECT
+                    u.*,
+                    h.name AS household_name
+                FROM users u
+                JOIN households h ON h.id = u.household_id
+                WHERE u.id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            if before is None:
+                raise LookupError("User not found")
+            connection.execute("UPDATE users SET name = ? WHERE id = ?", (display_name, user_id))
+            after = connection.execute(
+                """
+                SELECT
+                    u.*,
+                    h.name AS household_name
+                FROM users u
+                JOIN households h ON h.id = u.household_id
+                WHERE u.id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            self._insert_notification_event(
+                connection,
+                household_id=int(before["household_id"]),
+                budget_month_id=None,
+                event_type="user_display_name_changed",
+                actor_user_id=user_id,
+                affected_entity_type="user",
+                affected_entity_id=user_id,
+                title="Display name changed",
+                message=f"{display_name} updated their display name.",
+                severity="info",
+                metadata={"user_id": user_id},
+            )
+        return safe_user_from_row(after)
+
+    def change_user_password(self, *, user_id: int, current_password: str, new_password: str) -> None:
+        if not current_password:
+            raise PermissionError("Current password is required")
+        if not new_password:
+            raise ValueError("New password is required")
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row is None:
+                raise LookupError("User not found")
+            if not verify_password(current_password, row["password_hash"]):
+                raise PermissionError("Current password is incorrect")
+            connection.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(new_password), user_id),
+            )
+            self._insert_notification_event(
+                connection,
+                household_id=int(row["household_id"]),
+                budget_month_id=None,
+                event_type="password_changed",
+                actor_user_id=user_id,
+                affected_entity_type="user",
+                affected_entity_id=user_id,
+                title="Password changed",
+                message=f"{row['name']} changed their local password.",
+                severity="important",
+                metadata={"user_id": user_id},
+            )
+
+    def create_starter_budget_for_current_month(
+        self,
+        *,
+        household_id: int,
+        actor_user_id: int,
+        today: date,
+        next_payday: date | None = None,
+    ) -> dict[str, Any]:
+        month = today.strftime("%Y-%m")
+        starter_groups = (
+            ("Giving", ("Giving",)),
+            ("Food", ("Groceries", "Eating Out")),
+            ("Transportation", ("Gas", "Auto Maintenance")),
+            ("Housing", ("Mortgage or Rent", "Utilities")),
+            ("Savings", ("Emergency Fund",)),
+            ("Personal", ("Household Supplies", "Clothing", "Miscellaneous")),
+        )
+        with self.connect() as connection:
+            self._require_household(connection, household_id)
+            month_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM budget_months WHERE household_id = ?",
+                    (household_id,),
+                ).fetchone()["count"]
+            )
+            if month_count > 0:
+                raise PermissionError("Starter budget can only be created when no budget month exists")
+            budget_month_id = insert_and_return_id(
+                connection,
+                """
+                INSERT INTO budget_months(
+                    household_id,
+                    month,
+                    included_account_balance_cents,
+                    low_cushion_daily_cents
+                )
+                VALUES (?, ?, 0, 5000)
+                """,
+                (household_id, month),
+            )
+            connection.execute(
+                "UPDATE households SET active_budget_month_id = ? WHERE id = ?",
+                (budget_month_id, household_id),
+            )
+            if next_payday is not None:
+                connection.execute(
+                    "INSERT INTO paydays(household_id, payday_date) VALUES (?, ?)",
+                    (household_id, next_payday.isoformat()),
+                )
+            for group_order, (group_name, category_names) in enumerate(starter_groups):
+                group_id = insert_and_return_id(
+                    connection,
+                    "INSERT INTO budget_groups(budget_month_id, name, display_order) VALUES (?, ?, ?)",
+                    (budget_month_id, group_name, group_order),
+                )
+                for category_order, category_name in enumerate(category_names):
+                    connection.execute(
+                        """
+                        INSERT INTO budget_categories(budget_group_id, name, planned_cents, display_order)
+                        VALUES (?, ?, 0, ?)
+                        """,
+                        (group_id, category_name, category_order),
+                    )
+            self._insert_notification_event(
+                connection,
+                household_id=household_id,
+                budget_month_id=budget_month_id,
+                event_type="starter_budget_created",
+                actor_user_id=actor_user_id,
+                affected_entity_type="budget_month",
+                affected_entity_id=budget_month_id,
+                title="Starter budget created",
+                message=f"Starter budget for {month} was created.",
+                severity="info",
+                metadata={
+                    "budget_month_id": budget_month_id,
+                    "month": month,
+                    "next_payday_configured": next_payday is not None,
+                },
+            )
+        return {"id": budget_month_id, "month": month}
+
     def create_budget_month(
         self,
         *,
@@ -3236,6 +3479,27 @@ def require_login_value(value: str | None, field_name: str) -> str:
     return cleaned
 
 
+def clean_required_text(value: str | None, field_name: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} is required")
+    return cleaned
+
+
+def clean_setup_user(user: dict[str, str]) -> dict[str, str | None]:
+    username = require_login_value(user.get("username"), "username")
+    password = user.get("password") or ""
+    if not password:
+        raise ValueError("password is required")
+    return {
+        "name": clean_required_text(user.get("name"), "name"),
+        "username": username,
+        "email": normalize_login(user.get("email")),
+        "password": password,
+        "role": clean_required_text(user.get("role") or "spouse", "role"),
+    }
+
+
 def safe_user_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
@@ -3251,6 +3515,13 @@ def safe_household_from_user_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": int(row["household_id"]),
         "name": row["household_name"],
+    }
+
+
+def safe_household_from_household_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
     }
 
 

@@ -49,6 +49,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/health":
                 self.send_json({"ok": True})
                 return
+            if parsed.path == "/setup/status":
+                self.send_json(self.repository.setup_status(self.optional_auth()))
+                return
+            if parsed.path == "/settings/account":
+                auth = self.require_auth()
+                self.send_json(self.repository.account_settings_summary(auth["user_id"]))
+                return
+            if parsed.path == "/app/diagnostics":
+                auth = self.require_auth()
+                self.send_json(
+                    {
+                        "backend_reachable": True,
+                        "database_initialized": self.repository.setup_status()["initialized"],
+                        "plaid_mode": "sandbox",
+                        "plaid_sandbox_only": True,
+                        "current_user": auth["user"],
+                        "current_household": auth["household"],
+                    }
+                )
+                return
             if parsed.path == "/budget-months":
                 auth = self.require_auth()
                 self.send_json({"budget_months": self.repository.list_budget_months(auth["household_id"])})
@@ -185,9 +205,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                     raise UnauthorizedError("Invalid credentials")
                 self.send_json(auth_payload)
                 return
+            if parsed.path == "/setup/initialize":
+                result = self.repository.initialize_private_household(
+                    household_name=str(payload.get("household_name") or payload.get("name") or ""),
+                    users=payload.get("users") or [],
+                )
+                self.send_json(result, status=HTTPStatus.CREATED)
+                return
             if parsed.path == "/households":
                 self.require_auth()
                 raise PermissionError("Household creation is not available through the API")
+                return
+            if parsed.path == "/starter-budget/current-month":
+                auth = self.require_auth()
+                result = self.repository.create_starter_budget_for_current_month(
+                    household_id=auth["household_id"],
+                    actor_user_id=auth["user_id"],
+                    today=parse_date(payload.get("today", date.today().isoformat())),
+                    next_payday=parse_date(payload["next_payday"]) if payload.get("next_payday") else None,
+                )
+                self.send_json(result, status=HTTPStatus.CREATED)
                 return
             if parsed.path == "/budget-months":
                 auth = self.require_auth()
@@ -428,6 +465,23 @@ class ApiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = self.read_json()
+            if parsed.path == "/settings/display-name":
+                auth = self.require_auth()
+                user = self.repository.update_user_display_name(
+                    user_id=auth["user_id"],
+                    display_name=str(payload.get("display_name") or payload.get("name") or ""),
+                )
+                self.send_json({"user": user})
+                return
+            if parsed.path == "/settings/password":
+                auth = self.require_auth()
+                self.repository.change_user_password(
+                    user_id=auth["user_id"],
+                    current_password=str(payload.get("current_password") or ""),
+                    new_password=str(payload.get("new_password") or ""),
+                )
+                self.send_json({"ok": True})
+                return
             if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/activate"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
@@ -708,6 +762,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         scheme, _, token = header.partition(" ")
         if scheme.casefold() != "bearer" or not token.strip():
             raise UnauthorizedError("Authentication required")
+        context = self.repository.auth_context_for_token(token.strip())
+        if context is None:
+            raise UnauthorizedError("Authentication required")
+        return context
+
+    def optional_auth(self) -> dict[str, Any] | None:
+        header = self.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.casefold() != "bearer" or not token.strip():
+            return None
         context = self.repository.auth_context_for_token(token.strip())
         if context is None:
             raise UnauthorizedError("Authentication required")

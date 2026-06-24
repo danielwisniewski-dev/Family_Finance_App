@@ -1,12 +1,14 @@
 package com.familyfinance.app.api;
 
 import com.familyfinance.app.model.BudgetSummary;
+import com.familyfinance.app.model.AppDiagnostics;
 import com.familyfinance.app.model.BudgetDetail;
 import com.familyfinance.app.model.BudgetMonth;
 import com.familyfinance.app.model.CashAccount;
 import com.familyfinance.app.model.MerchantRule;
 import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.SafeToSpendResult;
+import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionDetail;
 
 import org.json.JSONArray;
@@ -35,6 +37,26 @@ public final class FamilyFinanceApi {
         return client.get("/health");
     }
 
+    public SetupStatus getSetupStatus() throws ApiException {
+        return SetupStatus.fromJson(client.get("/setup/status"));
+    }
+
+    public JSONObject initializeHousehold(
+            String householdName,
+            JSONArray users
+    ) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("household_name", householdName);
+            payload.put("users", users);
+            return client.post("/setup/initialize", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not initialize household", exception);
+        }
+    }
+
     public JSONObject login(String usernameOrEmail, String password) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
@@ -45,6 +67,39 @@ public final class FamilyFinanceApi {
             throw exception;
         } catch (Exception exception) {
             throw new ApiException("Could not build login request", exception);
+        }
+    }
+
+    public JSONObject getAccountSettings() throws ApiException {
+        return client.get("/settings/account");
+    }
+
+    public AppDiagnostics getDiagnostics() throws ApiException {
+        return AppDiagnostics.fromJson(client.get("/app/diagnostics"));
+    }
+
+    public JSONObject updateDisplayName(String displayName) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("display_name", displayName);
+            return client.patch("/settings/display-name", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update display name", exception);
+        }
+    }
+
+    public void changePassword(String currentPassword, String newPassword) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("current_password", currentPassword);
+            payload.put("new_password", newPassword);
+            client.patch("/settings/password", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not change password", exception);
         }
     }
 
@@ -80,6 +135,21 @@ public final class FamilyFinanceApi {
             throw exception;
         } catch (Exception exception) {
             throw new ApiException("Could not create budget month", exception);
+        }
+    }
+
+    public int createStarterBudget(String nextPayday) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("today", LocalDate.now().toString());
+            if (nextPayday != null && !nextPayday.trim().isEmpty()) {
+                payload.put("next_payday", nextPayday.trim());
+            }
+            return client.post("/starter-budget/current-month", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not create starter budget", exception);
         }
     }
 
