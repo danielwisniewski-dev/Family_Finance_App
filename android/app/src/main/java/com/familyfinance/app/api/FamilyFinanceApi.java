@@ -526,10 +526,6 @@ public final class FamilyFinanceApi {
         }
     }
 
-    public void deleteMerchantRule(int ruleId) throws ApiException {
-        client.delete("/merchant-category-rules/" + ruleId);
-    }
-
     public void markNotificationRead(int notificationId) throws ApiException {
         try {
             JSONObject payload = new JSONObject();

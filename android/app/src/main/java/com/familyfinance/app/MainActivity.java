@@ -1191,11 +1191,6 @@ public final class MainActivity extends Activity {
                     () -> api.archiveMerchantRule(matchingRule.id),
                     () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
             ));
-            addButton("Delete matching rule", () -> runMutation(
-                    "Deleting merchant rule...",
-                    () -> api.deleteMerchantRule(matchingRule.id),
-                    () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
-            ));
             return;
         }
         addBody("A new rule affects future matching transactions. Current unreviewed matches are optional.");

@@ -3,6 +3,11 @@ __pycache__/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+.env
+.env.*
+.venv/
+.pytest_cache/
+*.log
 work/
 .idea/
 android/.idea/

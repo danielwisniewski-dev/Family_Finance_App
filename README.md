@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, and Milestone 12 MVP usability hardening/data integrity.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, Milestone 12 MVP usability hardening/data integrity, and Milestone 13 MVP release-candidate stabilization.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -124,6 +124,13 @@ Milestone 12 hardens MVP daily-use behavior:
 - Clear safe-to-spend errors when budget, category, or payday data is missing
 - Sanitized Plaid Sandbox configuration and request failures
 - Android empty/loading/error states for setup, dashboard, budget, review queue, safe-to-spend, Plaid/accounts, settings, and diagnostics
+
+Milestone 13 stabilizes the local MVP release candidate:
+
+- Keeps the app local/private and Plaid Sandbox-only
+- Preserves merchant-rule history through archive/reactivation instead of destructive removal
+- Confirms local demo seed, backend startup, Android navigation, diagnostics, transaction review, and safe-to-spend smoke paths
+- Documents fresh setup, demo seed, emulator URL, Sandbox setup, smoke checks, and MVP limitations
 
 Environment variables:
 
@@ -251,6 +258,16 @@ Health check:
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8080/health
 ```
+
+## Fresh First-Run Setup
+
+For a fresh local database, start the API with an empty or deleted local SQLite file:
+
+```powershell
+python -m backend.app.api --db work\family_finance.sqlite --host 127.0.0.1 --port 8080
+```
+
+In Android, open the app with backend URL `http://10.0.2.2:8080`, tap `Check first-run setup`, create the private household and local users, then log in. After login, create the starter budget month if no budget month exists. This setup flow is for the private local MVP only; it is not public signup or production identity management.
 
 ## Plaid Sandbox Setup
 
@@ -399,14 +416,22 @@ Real in current MVP:
 - Deterministic backend financial calculations
 - Local mock/demo account and transaction data
 
-Placeholder or intentionally limited:
+Known MVP limitations:
 
 - Login/household access is a private local access layer, not production auth
+- Local token storage is suitable for this local/Sandbox MVP only, not production-grade credential storage
+- Local/private MVP only; there is no hosted deployment
+- Plaid is Sandbox-only and requires local Plaid env vars for live linking
+- Production Plaid is not supported
+- Credit cards are not supported
+- Receipt scanning is not included
+- Cloud push notifications are not included
+- Public signup, password reset, email verification, OAuth, and a production auth provider are not included
 - Budget change approval is not implemented
 - Budget group names are not exposed by the current backend summary route
 - Funding edits are placeholder-only
-- Plaid is Sandbox-only and requires local Plaid env vars for live linking
-- AI, receipt scanning, credit cards, MCP, and push notifications are not included
+- AI autonomous budget changes are not included
+- MCP/tool integration is not included
 
 ## Coach API Notes
 

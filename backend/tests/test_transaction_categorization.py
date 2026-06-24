@@ -387,7 +387,7 @@ class TransactionCategorizationTests(unittest.TestCase):
         self.assertEqual(detail.assignments[0].source, "manual")
         self.assertEqual(detail.final_category_id, self.dining_id)
 
-    def test_merchant_rule_can_be_updated_archived_and_deleted(self) -> None:
+    def test_merchant_rule_can_be_updated_and_archived_without_losing_history(self) -> None:
         rule_id = self.repository.create_merchant_rule(
             household_id=self.household_id,
             merchant_match_text="fresh",
@@ -412,7 +412,16 @@ class TransactionCategorizationTests(unittest.TestCase):
 
         self.repository.delete_merchant_rule(rule_id=rule_id)
 
-        self.assertEqual(self.repository.list_merchant_rules(self.household_id, include_inactive=True), [])
+        inactive_rules = self.repository.list_merchant_rules(self.household_id, include_inactive=True)
+        active_rules = self.repository.list_merchant_rules(self.household_id)
+        self.assertEqual(len(inactive_rules), 1)
+        self.assertEqual(inactive_rules[0].id, rule_id)
+        self.assertFalse(inactive_rules[0].active)
+        self.assertEqual(active_rules, [])
+
+        events = self.repository.list_notification_events(household_id=self.household_id)
+        event_types = [event.event_type for event in events]
+        self.assertIn("merchant_rule_archived", event_types)
 
     def test_archived_merchant_rule_can_be_reactivated_without_bulk_apply(self) -> None:
         transaction_id = self.import_transaction(
