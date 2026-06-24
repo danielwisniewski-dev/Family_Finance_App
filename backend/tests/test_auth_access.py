@@ -11,6 +11,14 @@ from urllib.request import Request, urlopen
 
 from backend.app.auth import hash_session_token
 from backend.app.api import ApiHandler, build_server
+from backend.app.plaid import (
+    InMemoryPlaidTokenStore,
+    PlaidAccountSnapshot,
+    PlaidConnectionService,
+    PlaidLinkToken,
+    PlaidPublicTokenExchange,
+    PlaidTransactionSync,
+)
 
 
 class PrivateHouseholdAccessTests(unittest.TestCase):
@@ -36,6 +44,11 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             password="kara-local-test",
             month="2026-07",
             transaction_id="kara-txn-1",
+        )
+        ApiHandler.plaid_service = PlaidConnectionService(
+            ApiHandler.repository,
+            client=ApiFakePlaidClient(),
+            token_store=InMemoryPlaidTokenStore(),
         )
 
     def tearDown(self) -> None:
@@ -225,6 +238,48 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         self.assertIn("Budget month", coach_error["error"])
         self.assertIn("Budget month", plaid_exchange_error["error"])
         self.assertIn("Plaid item", plaid_sync_error["error"])
+
+    def test_plaid_link_token_route_requires_authentication(self) -> None:
+        unauthenticated = self.post("/plaid/link-token", {}, expect_status=401)
+        token = str(self.login("daniel", "daniel-local-test")["token"])
+        authenticated = self.post("/plaid/link-token", {}, token=token, expect_status=201)
+
+        self.assertEqual(unauthenticated["error"], "Authentication required")
+        self.assertEqual(authenticated["link_token"], "link-token-api-test")
+
+    def test_plaid_public_token_exchange_requires_authentication(self) -> None:
+        error = self.post(
+            "/plaid/exchange-public-token",
+            {
+                "budget_month_id": self.daniel["budget_month_id"],
+                "public_token": "public-sandbox-token",
+            },
+            expect_status=401,
+        )
+
+        self.assertEqual(error["error"], "Authentication required")
+
+    def test_plaid_public_token_exchange_uses_authenticated_household_and_sanitizes_response(self) -> None:
+        token = str(self.login("daniel", "daniel-local-test")["token"])
+
+        result = self.post(
+            "/plaid/exchange-public-token",
+            {
+                "budget_month_id": self.daniel["budget_month_id"],
+                "public_token": "public-sandbox-token",
+            },
+            token=token,
+            expect_status=201,
+        )
+        plaid_item = ApiHandler.repository.get_plaid_item(int(result["plaid_item"]["id"]))
+        serialized = json.dumps(result)
+
+        self.assertEqual(plaid_item.household_id, self.daniel["household_id"])
+        self.assertNotIn("access-token", serialized)
+        self.assertNotIn("access_token", serialized)
+        self.assertNotIn("access_token_ref", serialized)
+        self.assertNotIn(plaid_item.access_token_ref, serialized)
+        self.assertEqual(result["accounts"][0]["account_type"], "checking")
 
     def test_safe_to_spend_uses_authenticated_household_context(self) -> None:
         token = str(self.login("daniel", "daniel-local-test")["token"])
@@ -527,6 +582,38 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         if token is None:
             return {}
         return {"Authorization": f"Bearer {token}"}
+
+
+class ApiFakePlaidClient:
+    def create_link_token(self, household_id: int) -> PlaidLinkToken:
+        return PlaidLinkToken(
+            link_token="link-token-api-test",
+            expiration="2026-06-21T12:00:00Z",
+            request_id=f"request-household-{household_id}",
+        )
+
+    def exchange_public_token(self, public_token: str) -> PlaidPublicTokenExchange:
+        return PlaidPublicTokenExchange(
+            access_token="access-token-api-secret",
+            plaid_item_id="item-api-test",
+            institution_id="ins-api-test",
+            institution_name="API Test Bank",
+            accounts=(
+                PlaidAccountSnapshot(
+                    plaid_account_id="checking-api",
+                    name="API Checking",
+                    account_type="checking",
+                    balance_cents=80_000,
+                    included_in_cash_reality=True,
+                ),
+            ),
+        )
+
+    def get_balances(self, access_token: str) -> tuple[PlaidAccountSnapshot, ...]:
+        return ()
+
+    def sync_transactions(self, access_token: str, cursor: str | None) -> PlaidTransactionSync:
+        return PlaidTransactionSync(next_cursor=cursor)
 
 
 if __name__ == "__main__":

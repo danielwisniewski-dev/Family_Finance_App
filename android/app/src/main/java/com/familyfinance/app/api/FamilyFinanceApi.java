@@ -60,6 +60,55 @@ public final class FamilyFinanceApi {
         return accounts;
     }
 
+    public String createPlaidLinkToken() throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            return client.post("/plaid/link-token", payload).optString("link_token", "");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not request Plaid link token", exception);
+        }
+    }
+
+    public JSONObject exchangePlaidPublicToken(int budgetMonthId, String publicToken) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("budget_month_id", budgetMonthId);
+            payload.put("public_token", publicToken);
+            return client.post("/plaid/exchange-public-token", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not exchange Plaid public token", exception);
+        }
+    }
+
+    public JSONObject syncPlaid(int plaidItemId, String syncType) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("plaid_item_id", plaidItemId);
+            payload.put("sync_type", syncType);
+            return client.post("/plaid/sync", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not sync Plaid item", exception);
+        }
+    }
+
+    public void setAccountIncluded(int accountId, boolean included) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("included_in_cash_reality", included);
+            client.patch("/accounts/" + accountId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not update account inclusion", exception);
+        }
+    }
+
     public List<TransactionDetail> getTransactions(int budgetMonthId) throws ApiException {
         return parseTransactions(client.get("/budget-months/" + budgetMonthId + "/transactions"));
     }

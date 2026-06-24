@@ -440,6 +440,25 @@ class BudgetRepository:
                 ),
             )
 
+    def store_plaid_access_token(self, token_ref: str, access_token: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO plaid_access_tokens(token_ref, access_token)
+                VALUES (?, ?)
+                ON CONFLICT(token_ref) DO UPDATE SET access_token = excluded.access_token
+                """,
+                (token_ref, access_token),
+            )
+
+    def retrieve_plaid_access_token(self, token_ref: str) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT access_token FROM plaid_access_tokens WHERE token_ref = ?",
+                (token_ref,),
+            ).fetchone()
+        return str(row["access_token"]) if row is not None else None
+
     def get_plaid_item(self, plaid_item_row_id: int) -> PlaidItemLine:
         with self.connect() as connection:
             row = connection.execute(
@@ -697,6 +716,35 @@ class BudgetRepository:
             )
             self._apply_best_rule_if_allowed(connection, transaction_id)
             return TransactionUpsertResult(transaction_id=transaction_id, created=True)
+
+    def mark_plaid_transaction_removed(self, plaid_transaction_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM account_transactions WHERE plaid_transaction_id = ?",
+                (plaid_transaction_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            already_removed = bool(row["ignored"]) and row["ignored_reason"] == "Removed by Plaid sync"
+            connection.execute(
+                """
+                UPDATE account_transactions
+                SET
+                    ignored = 1,
+                    ignored_reason = 'Removed by Plaid sync',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (row["id"],),
+            )
+            if not already_removed:
+                self._record_transaction_event(
+                    connection,
+                    transaction_id=int(row["id"]),
+                    event_type="removed_by_plaid",
+                    metadata={"plaid_transaction_id": plaid_transaction_id},
+                )
+            return True
 
     def list_transactions(self, cash_account_id: int) -> list[TransactionLine]:
         with self.connect() as connection:
@@ -2164,7 +2212,6 @@ def plaid_item_to_public_dict(item: PlaidItemLine) -> dict[str, Any]:
         "plaid_item_id": item.plaid_item_id,
         "institution_id": item.institution_id,
         "institution_name": item.institution_name,
-        "sync_cursor": item.sync_cursor,
         "status": item.status,
         "last_error_code": item.last_error_code,
         "last_error_message": item.last_error_message,

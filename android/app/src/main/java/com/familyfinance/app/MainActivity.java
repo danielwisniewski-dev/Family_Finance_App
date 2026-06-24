@@ -1,6 +1,7 @@
 package com.familyfinance.app;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
@@ -28,13 +29,21 @@ import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
 import com.familyfinance.app.state.BudgetScreenState;
 import com.familyfinance.app.state.MoneyFormatter;
+import com.plaid.link.Plaid;
+import com.plaid.link.PlaidHandler;
+import com.plaid.link.configuration.LinkTokenConfiguration;
+import com.plaid.link.result.LinkResultHandler;
 
 import org.json.JSONObject;
 
+import java.util.LinkedHashSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import kotlin.Unit;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "family_finance";
@@ -59,6 +68,29 @@ public final class MainActivity extends Activity {
     private List<CashAccount> accounts = new ArrayList<>();
     private List<NotificationEvent> notifications = new ArrayList<>();
     private int unreadNotificationCount;
+    private PlaidHandler plaidHandler;
+    private final LinkResultHandler plaidResultHandler = new LinkResultHandler(
+            linkSuccess -> {
+                String publicToken = linkSuccess.getPublicToken();
+                if (publicToken == null || publicToken.trim().isEmpty()) {
+                    toast("Plaid Link did not return a public token.");
+                    return Unit.INSTANCE;
+                }
+                exchangePlaidPublicToken(publicToken);
+                return Unit.INSTANCE;
+            },
+            linkExit -> {
+                String message = "Plaid Link was cancelled.";
+                if (linkExit.getError() != null) {
+                    String display = linkExit.getError().getDisplayMessage();
+                    String code = String.valueOf(linkExit.getError().getErrorCode());
+                    message = (display == null || display.isEmpty() ? "Plaid Link failed" : display)
+                            + (code == null || code.isEmpty() ? "" : " (" + code + ")");
+                }
+                toast(message);
+                return Unit.INSTANCE;
+            }
+    );
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -76,6 +108,12 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         executor.shutdownNow();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        plaidResultHandler.onActivityResult(requestCode, resultCode, data);
     }
 
     private void loadPreferences() {
@@ -497,18 +535,97 @@ public final class MainActivity extends Activity {
         ));
         addButton("Log out", this::logout);
 
+        addSection("Plaid Sandbox");
+        addButton("Link bank with Plaid Sandbox", this::preparePlaidLink);
+        addButton("Sync balances", () -> syncPlaidItems("balance"));
+        addButton("Sync transactions", () -> syncPlaidItems("transaction"));
+
         addSection("Account inclusion");
         if (accounts.isEmpty()) {
-            addBody("No account records returned. Plaid linking is intentionally not built in this milestone.");
+            addBody("No linked checking or savings accounts returned.");
         } else {
             for (CashAccount account : accounts) {
                 addBody(account.name
                         + " | " + account.accountType
                         + " | " + MoneyFormatter.dollars(account.balanceCents)
+                        + " | mask " + blankAsDash(account.mask)
                         + " | " + (account.includedInCashReality ? "included" : "excluded"));
+                addButton(
+                        account.includedInCashReality ? "Exclude " + account.name : "Include " + account.name,
+                        () -> runMutation(
+                                "Updating account inclusion...",
+                                () -> api.setAccountIncluded(account.id, !account.includedInCashReality),
+                                () -> refreshData(this::showSettings)
+                        )
+                );
             }
         }
         addNav();
+    }
+
+    private void preparePlaidLink() {
+        showLoading("Preparing Plaid Sandbox Link...");
+        executor.execute(() -> {
+            try {
+                String linkToken = api.createPlaidLinkToken();
+                if (linkToken == null || linkToken.trim().isEmpty()) {
+                    throw new IllegalStateException("Backend did not return a Plaid link token.");
+                }
+                mainHandler.post(() -> openPlaidLink(linkToken));
+            } catch (Exception exception) {
+                mainHandler.post(() -> showError("Could not start Plaid Link", exception));
+            }
+        });
+    }
+
+    private void openPlaidLink(String linkToken) {
+        try {
+            plaidHandler = Plaid.create(
+                    getApplication(),
+                    new LinkTokenConfiguration.Builder()
+                            .token(linkToken)
+                            .build()
+            );
+            plaidHandler.open(this);
+        } catch (Exception exception) {
+            showError("Could not open Plaid Link", exception);
+        }
+    }
+
+    private void exchangePlaidPublicToken(String publicToken) {
+        showLoading("Connecting Plaid account...");
+        executor.execute(() -> {
+            try {
+                api.exchangePlaidPublicToken(budgetMonthId, publicToken);
+                mainHandler.post(() -> refreshData(this::showSettings));
+            } catch (Exception exception) {
+                mainHandler.post(() -> showError("Plaid public token exchange failed", exception));
+            }
+        });
+    }
+
+    private void syncPlaidItems(String syncType) {
+        Set<Integer> plaidItemIds = new LinkedHashSet<>();
+        for (CashAccount account : accounts) {
+            if (account.plaidItemId > 0) {
+                plaidItemIds.add(account.plaidItemId);
+            }
+        }
+        if (plaidItemIds.isEmpty()) {
+            toast("No linked Plaid checking or savings accounts to sync.");
+            return;
+        }
+        showLoading("Running Plaid " + syncType + " sync...");
+        executor.execute(() -> {
+            try {
+                for (Integer plaidItemId : plaidItemIds) {
+                    api.syncPlaid(plaidItemId, syncType);
+                }
+                mainHandler.post(() -> refreshData(this::showSettings));
+            } catch (Exception exception) {
+                mainHandler.post(() -> showError("Plaid sync failed", exception));
+            }
+        });
     }
 
     private void addTransactionButton(TransactionDetail detail) {
