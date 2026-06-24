@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS budget_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month_id INTEGER NOT NULL REFERENCES budget_months(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    display_order INTEGER NOT NULL DEFAULT 0
+    display_order INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS budget_categories (

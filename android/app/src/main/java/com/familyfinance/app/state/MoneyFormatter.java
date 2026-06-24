@@ -12,6 +12,10 @@ public final class MoneyFormatter {
         return format.format(cents / 100.0);
     }
 
+    public static String dollarsWithoutSymbol(int cents) {
+        return String.format(Locale.US, "%.2f", cents / 100.0);
+    }
+
     public static int parseDollarAmountToCents(String value) {
         if (value == null || value.trim().isEmpty()) {
             return 0;

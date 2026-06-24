@@ -36,6 +36,10 @@ public final class JsonHttpClient {
         return request("PATCH", path, payload);
     }
 
+    public JSONObject delete(String path) throws ApiException {
+        return request("DELETE", path, null);
+    }
+
     private JSONObject request(String method, String path, JSONObject payload) throws ApiException {
         HttpURLConnection connection = null;
         try {
