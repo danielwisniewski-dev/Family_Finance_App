@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS merchant_category_rules (
     priority INTEGER NOT NULL DEFAULT 100,
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT,
     UNIQUE(household_id, merchant_match_text, budget_category_id)
 );
 

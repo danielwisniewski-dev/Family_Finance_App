@@ -6,7 +6,9 @@ import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.ArrayAdapter;
@@ -27,6 +29,7 @@ import com.familyfinance.app.model.BudgetCategory;
 import com.familyfinance.app.model.BudgetSummary;
 import com.familyfinance.app.model.CashAccount;
 import com.familyfinance.app.model.ExpectedBill;
+import com.familyfinance.app.model.MerchantRule;
 import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.Payday;
 import com.familyfinance.app.model.PlannedIncome;
@@ -75,6 +78,7 @@ public final class MainActivity extends Activity {
     private List<TransactionDetail> transactions = new ArrayList<>();
     private List<TransactionDetail> reviewQueue = new ArrayList<>();
     private List<CashAccount> accounts = new ArrayList<>();
+    private List<MerchantRule> merchantRules = new ArrayList<>();
     private List<NotificationEvent> notifications = new ArrayList<>();
     private int unreadNotificationCount;
     private PlaidHandler plaidHandler;
@@ -174,6 +178,7 @@ public final class MainActivity extends Activity {
         transactions = new ArrayList<>();
         reviewQueue = new ArrayList<>();
         accounts = new ArrayList<>();
+        merchantRules = new ArrayList<>();
         notifications = new ArrayList<>();
         unreadNotificationCount = 0;
         showLogin("Logged out.");
@@ -187,6 +192,7 @@ public final class MainActivity extends Activity {
                 List<TransactionDetail> loadedTransactions = api.getTransactions(budgetMonthId);
                 List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(budgetMonthId);
                 List<CashAccount> loadedAccounts = api.getAccounts(budgetMonthId);
+                List<MerchantRule> loadedMerchantRules = api.getMerchantRules();
                 List<NotificationEvent> loadedNotifications = api.getNotifications(budgetMonthId);
                 int loadedUnreadNotificationCount = api.getUnreadNotificationCount(budgetMonthId);
                 mainHandler.post(() -> {
@@ -196,6 +202,7 @@ public final class MainActivity extends Activity {
                     transactions = loadedTransactions;
                     reviewQueue = loadedReviewQueue;
                     accounts = loadedAccounts;
+                    merchantRules = loadedMerchantRules;
                     notifications = loadedNotifications;
                     unreadNotificationCount = loadedUnreadNotificationCount;
                     afterLoad.run();
@@ -731,19 +738,29 @@ public final class MainActivity extends Activity {
         beginScreen("Transaction Detail");
         addMetric("Name", detail.transaction.name);
         addMetric("Merchant", blankAsDash(detail.transaction.merchantName));
+        addMetric("Account", blankAsDash(detail.transaction.accountName));
         addMetric("Amount", MoneyFormatter.dollars(detail.transaction.amountCents));
         addMetric("Date", detail.transaction.occurredOn);
         addMetric("Plaid hint", blankAsDash(detail.transaction.categoryHint));
+        addMetric("Suggestion", describeSuggestion(detail));
         addMetric("Current assignment", describeCategory(detail.finalCategoryId));
         addMetric("Categorization status", detail.categorizationStatus);
         addMetric("Reviewed", detail.transaction.reviewed ? "Yes" : "No");
         addMetric("Ignored/excluded", detail.transaction.ignored ? "Yes" : "No");
+        addBudgetImpact(detail);
         if (detail.isSplit()) {
             addSection("Split state");
             for (TransactionAssignment assignment : detail.assignments) {
                 addBody(describeCategory(assignment.categoryId) + " | " + MoneyFormatter.dollars(assignment.amountCents));
             }
-            addBody("Split editing is read-only in Milestone 4.");
+            addButton("Edit split", () -> showSplitEditor(detail));
+            addButton("Remove split", () -> runMutation(
+                    "Removing split...",
+                    () -> api.removeSplit(detail.transaction.id),
+                    () -> afterTransactionSaved(detail.transaction.id)
+            ));
+        } else {
+            addButton("Split transaction", () -> showSplitEditor(detail));
         }
 
         addSection("Categorize");
@@ -762,9 +779,16 @@ public final class MainActivity extends Activity {
             runMutation(
                     "Assigning category...",
                     () -> api.assignCategory(detail.transaction.id, category.id, reviewed.isChecked()),
-                    () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
+                    () -> afterTransactionSaved(detail.transaction.id)
             );
         });
+        if (detail.finalCategoryId != null || detail.isSplit()) {
+            addButton("Remove category assignment", () -> runMutation(
+                    "Removing category...",
+                    () -> api.removeCategory(detail.transaction.id),
+                    () -> afterTransactionSaved(detail.transaction.id)
+            ));
+        }
         addButton(detail.transaction.reviewed ? "Mark unreviewed" : "Mark reviewed", () -> runMutation(
                 "Updating review state...",
                 () -> api.markReviewed(detail.transaction.id, !detail.transaction.reviewed),
@@ -773,9 +797,235 @@ public final class MainActivity extends Activity {
         addButton(detail.transaction.ignored ? "Unignore transaction" : "Ignore/exclude transaction", () -> runMutation(
                 "Updating ignored state...",
                 () -> api.setIgnored(detail.transaction.id, !detail.transaction.ignored, "Marked in Android MVP"),
-                () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
+                () -> afterTransactionSaved(detail.transaction.id)
         ));
+        addMerchantRuleControls(detail);
         addNav();
+    }
+
+    private void showSplitEditor(TransactionDetail detail) {
+        beginScreen("Split Transaction");
+        int totalCents = Math.abs(detail.transaction.amountCents);
+        addMetric("Transaction", detail.transaction.displayName());
+        addMetric("Amount to allocate", MoneyFormatter.dollars(totalCents));
+
+        ArrayList<Spinner> categorySpinners = new ArrayList<>();
+        ArrayList<EditText> amountInputs = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            addSection("Split line " + (i + 1));
+            Spinner spinner = categorySpinner();
+            categorySpinners.add(spinner);
+            root.addView(spinner);
+            int existingAmount = 0;
+            if (i < detail.assignments.size()) {
+                TransactionAssignment assignment = detail.assignments.get(i);
+                setSpinnerToCategory(spinner, assignment.categoryId);
+                existingAmount = assignment.amountCents;
+            } else if (i == 0 && detail.assignments.isEmpty()) {
+                existingAmount = totalCents;
+            }
+            amountInputs.add(moneyInput("Amount", existingAmount));
+        }
+
+        TextView remaining = new TextView(this);
+        remaining.setTextSize(16);
+        remaining.setPadding(0, 10, 0, 10);
+        root.addView(remaining);
+        Runnable updateRemaining = () -> updateSplitRemaining(amountInputs, remaining, totalCents);
+        for (EditText input : amountInputs) {
+            input.addTextChangedListener(new SimpleTextWatcher(updateRemaining));
+        }
+        updateRemaining.run();
+
+        addButton("Save split", () -> {
+            ArrayList<int[]> splits = new ArrayList<>();
+            int total = 0;
+            for (int i = 0; i < amountInputs.size(); i++) {
+                String raw = amountInputs.get(i).getText().toString().trim();
+                if (raw.isEmpty()) {
+                    continue;
+                }
+                int cents;
+                try {
+                    cents = MoneyFormatter.parseDollarAmountToCents(raw);
+                } catch (NumberFormatException exception) {
+                    toast("Split amounts must be valid dollars.");
+                    return;
+                }
+                if (cents <= 0) {
+                    toast("Split amounts must be positive.");
+                    return;
+                }
+                BudgetCategory category = selectedCategory(categorySpinners.get(i));
+                if (category == null) {
+                    toast("Choose a category for each split line.");
+                    return;
+                }
+                splits.add(new int[]{category.id, cents});
+                total += cents;
+            }
+            if (splits.size() < 2) {
+                toast("Use at least two split lines.");
+                return;
+            }
+            if (total != totalCents) {
+                toast("Split total must equal the transaction amount.");
+                return;
+            }
+            runMutation(
+                    "Saving split...",
+                    () -> api.splitTransaction(detail.transaction.id, splits, true),
+                    () -> afterTransactionSaved(detail.transaction.id)
+            );
+        });
+        addButton("Back to transaction", () -> showTransactionDetail(detail.transaction.id));
+        addNav();
+    }
+
+    private void updateSplitRemaining(List<EditText> amountInputs, TextView remaining, int totalCents) {
+        int allocated = 0;
+        for (EditText input : amountInputs) {
+            String raw = input.getText().toString().trim();
+            if (raw.isEmpty()) {
+                continue;
+            }
+            try {
+                allocated += MoneyFormatter.parseDollarAmountToCents(raw);
+            } catch (NumberFormatException ignored) {
+                // Save validation gives the precise error; the preview just avoids crashing while typing.
+            }
+        }
+        int left = totalCents - allocated;
+        remaining.setText("Remaining to allocate: " + MoneyFormatter.dollars(left));
+        remaining.setTextColor(left == 0 ? 0xFF155724 : 0xFF856404);
+    }
+
+    private void afterTransactionSaved(int transactionId) {
+        refreshData(() -> {
+            for (TransactionDetail next : reviewQueue) {
+                if (next.transaction.id != transactionId) {
+                    showTransactionDetail(next.transaction.id);
+                    return;
+                }
+            }
+            showTransactions(true);
+        });
+    }
+
+    private void addBudgetImpact(TransactionDetail detail) {
+        if (detail.transaction.ignored) {
+            addMetric("Budget impact", "Ignored; not counted in spending");
+            return;
+        }
+        if (detail.isSplit()) {
+            addSection("Budget impact");
+            for (TransactionAssignment assignment : detail.assignments) {
+                BudgetCategory category = BudgetScreenState.findCategory(
+                        assignment.categoryId,
+                        summary == null ? null : summary.categories
+                );
+                if (category != null) {
+                    addBody(category.name + " remaining now: " + MoneyFormatter.dollars(category.remainingCents));
+                    if (category.isOverspent()) {
+                        addWarning(category.name + " is overspent.");
+                    }
+                }
+            }
+            return;
+        }
+        Integer impactCategoryId = detail.finalCategoryId != null ? detail.finalCategoryId : detail.suggestedCategoryId;
+        BudgetCategory category = impactCategoryId == null
+                ? null
+                : BudgetScreenState.findCategory(impactCategoryId, summary == null ? null : summary.categories);
+        if (category == null) {
+            addMetric("Budget impact", "No category impact yet");
+            return;
+        }
+        if (detail.finalCategoryId != null) {
+            addMetric("Budget impact", category.name + " remaining now: " + MoneyFormatter.dollars(category.remainingCents));
+            if (category.isOverspent()) {
+                addWarning(category.name + " is overspent.");
+            }
+        } else {
+            int projected = category.remainingCents - Math.abs(detail.transaction.amountCents);
+            addMetric("Projected impact", category.name + " would have " + MoneyFormatter.dollars(projected) + " left");
+            if (projected < 0) {
+                addWarning(category.name + " would be overspent.");
+            }
+        }
+    }
+
+    private void addMerchantRuleControls(TransactionDetail detail) {
+        addSection("Merchant rule");
+        MerchantRule matchingRule = findMatchingRule(detail);
+        if (matchingRule != null) {
+            addBody("Existing rule: " + matchingRule.merchantMatchText + " -> " + matchingRule.categoryName);
+            addButton("Archive matching rule", () -> runMutation(
+                    "Archiving merchant rule...",
+                    () -> api.archiveMerchantRule(matchingRule.id),
+                    () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
+            ));
+            addButton("Delete matching rule", () -> runMutation(
+                    "Deleting merchant rule...",
+                    () -> api.deleteMerchantRule(matchingRule.id),
+                    () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
+            ));
+            return;
+        }
+        addBody("A new rule affects future matching transactions. Current unreviewed matches are optional.");
+        Spinner ruleCategory = categorySpinner();
+        if (detail.finalCategoryId != null) {
+            setSpinnerToCategory(ruleCategory, detail.finalCategoryId);
+        } else if (detail.suggestedCategoryId != null) {
+            setSpinnerToCategory(ruleCategory, detail.suggestedCategoryId);
+        }
+        root.addView(ruleCategory);
+        CheckBox applyExisting = new CheckBox(this);
+        applyExisting.setText("Also apply to current unreviewed matches");
+        applyExisting.setChecked(false);
+        root.addView(applyExisting);
+        addButton("Create merchant rule", () -> {
+            BudgetCategory category = selectedCategory(ruleCategory);
+            if (category == null) {
+                toast("No category selected.");
+                return;
+            }
+            runMutation(
+                    "Creating merchant rule...",
+                    () -> api.createMerchantRuleFromTransaction(detail.transaction.id, category.id, applyExisting.isChecked()),
+                    () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
+            );
+        });
+    }
+
+    private String describeSuggestion(TransactionDetail detail) {
+        if (detail.suggestionSource == null || detail.suggestionSource.isEmpty()) {
+            return "None";
+        }
+        String category = detail.suggestedCategoryId == null ? "" : " -> " + describeCategory(detail.suggestedCategoryId);
+        String reason = detail.suggestionReason == null || detail.suggestionReason.isEmpty()
+                ? ""
+                : " (" + detail.suggestionReason + ")";
+        return detail.suggestionSource + category + reason;
+    }
+
+    private MerchantRule findMatchingRule(TransactionDetail detail) {
+        if (detail.matchingRuleId != null) {
+            for (MerchantRule rule : merchantRules) {
+                if (rule.id == detail.matchingRuleId) {
+                    return rule;
+                }
+            }
+        }
+        String haystack = ((detail.transaction.merchantName == null ? "" : detail.transaction.merchantName)
+                + " "
+                + (detail.transaction.name == null ? "" : detail.transaction.name)).toLowerCase();
+        for (MerchantRule rule : merchantRules) {
+            if (rule.active && !rule.merchantMatchText.isEmpty() && haystack.contains(rule.merchantMatchText)) {
+                return rule;
+            }
+        }
+        return null;
     }
 
     private void showSafeToSpend() {
@@ -1132,6 +1382,18 @@ public final class MainActivity extends Activity {
         return summary.categories.get(spinner.getSelectedItemPosition());
     }
 
+    private void setSpinnerToCategory(Spinner spinner, int categoryId) {
+        if (summary == null) {
+            return;
+        }
+        for (int i = 0; i < summary.categories.size(); i++) {
+            if (summary.categories.get(i).id == categoryId) {
+                spinner.setSelection(i);
+                return;
+            }
+        }
+    }
+
     private String describeCategory(Integer categoryId) {
         if (categoryId == null) {
             return "Uncategorized";
@@ -1150,5 +1412,26 @@ public final class MainActivity extends Activity {
 
     private interface ThrowingRunnable {
         void run() throws Exception;
+    }
+
+    private static final class SimpleTextWatcher implements TextWatcher {
+        private final Runnable afterChanged;
+
+        private SimpleTextWatcher(Runnable afterChanged) {
+            this.afterChanged = afterChanged;
+        }
+
+        @Override
+        public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+        }
+
+        @Override
+        public void onTextChanged(CharSequence s, int start, int before, int count) {
+        }
+
+        @Override
+        public void afterTextChanged(Editable s) {
+            afterChanged.run();
+        }
     }
 }

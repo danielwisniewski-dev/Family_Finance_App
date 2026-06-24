@@ -13,19 +13,31 @@ public final class TransactionDetail {
     public final Integer finalCategoryId;
     public final String categorizationStatus;
     public final boolean needsReview;
+    public final Integer suggestedCategoryId;
+    public final String suggestionSource;
+    public final String suggestionReason;
+    public final Integer matchingRuleId;
 
     public TransactionDetail(
             TransactionLine transaction,
             List<TransactionAssignment> assignments,
             Integer finalCategoryId,
             String categorizationStatus,
-            boolean needsReview
+            boolean needsReview,
+            Integer suggestedCategoryId,
+            String suggestionSource,
+            String suggestionReason,
+            Integer matchingRuleId
     ) {
         this.transaction = transaction;
         this.assignments = Collections.unmodifiableList(new ArrayList<>(assignments));
         this.finalCategoryId = finalCategoryId;
         this.categorizationStatus = categorizationStatus;
         this.needsReview = needsReview;
+        this.suggestedCategoryId = suggestedCategoryId;
+        this.suggestionSource = suggestionSource;
+        this.suggestionReason = suggestionReason;
+        this.matchingRuleId = matchingRuleId;
     }
 
     public static TransactionDetail fromJson(JSONObject json) {
@@ -37,12 +49,18 @@ public final class TransactionDetail {
             }
         }
         Integer categoryId = json.isNull("final_category_id") ? null : json.optInt("final_category_id");
+        Integer suggestedCategoryId = json.isNull("suggested_category_id") ? null : json.optInt("suggested_category_id");
+        Integer matchingRuleId = json.isNull("matching_rule_id") ? null : json.optInt("matching_rule_id");
         return new TransactionDetail(
                 TransactionLine.fromJson(json.optJSONObject("transaction")),
                 assignments,
                 categoryId,
                 json.optString("categorization_status", "uncategorized"),
-                json.optBoolean("needs_review")
+                json.optBoolean("needs_review"),
+                suggestedCategoryId,
+                json.optString("suggestion_source", ""),
+                json.optString("suggestion_reason", ""),
+                matchingRuleId
         );
     }
 

@@ -19,6 +19,7 @@ from .coach import (
 from .db import (
     BudgetRepository,
     account_to_dict,
+    merchant_rule_to_dict,
     notification_event_to_dict,
     safe_to_spend_to_dict,
     summary_to_dict,
@@ -87,8 +88,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
-                transactions = self.repository.list_transaction_review_queue(budget_month_id)
+                query = parse_qs(parsed.query)
+                account_id = optional_query_int(query, "account_id")
+                if account_id is not None:
+                    self.repository.require_account_access(account_id, auth["household_id"])
+                transactions = self.repository.list_review_transactions(
+                    budget_month_id,
+                    status=optional_query_value(query, "status") or "needs_review",
+                    start_date=parse_date(optional_query_value(query, "start_date")) if optional_query_value(query, "start_date") else None,
+                    end_date=parse_date(optional_query_value(query, "end_date")) if optional_query_value(query, "end_date") else None,
+                    account_id=account_id,
+                )
                 self.send_json({"transactions": [transaction_detail_to_dict(item) for item in transactions]})
+                return
+            if parsed.path == "/merchant-category-rules":
+                auth = self.require_auth()
+                query = parse_qs(parsed.query)
+                include_inactive = (optional_query_value(query, "include_inactive") or "false").casefold() == "true"
+                rules = self.repository.list_merchant_rules(
+                    auth["household_id"],
+                    include_inactive=include_inactive,
+                )
+                self.send_json({"rules": [merchant_rule_to_dict(rule) for rule in rules]})
                 return
             if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications"):
                 auth = self.require_auth()
@@ -378,11 +399,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 auth = self.require_auth()
                 category_id = int(payload["category_id"])
                 self.repository.require_category_access(category_id, auth["household_id"])
+                merchant_match_text = payload.get("merchant_match_text")
+                transaction_id = optional_int(payload, "transaction_id")
+                if transaction_id is not None:
+                    self.repository.require_transaction_access(transaction_id, auth["household_id"])
+                    detail = self.repository.get_transaction_detail(transaction_id)
+                    if merchant_match_text is None:
+                        merchant_match_text = detail.transaction.merchant_name or detail.transaction.name
                 rule_id = self.repository.create_merchant_rule(
                     household_id=auth["household_id"],
-                    merchant_match_text=payload["merchant_match_text"],
+                    merchant_match_text=str(merchant_match_text or ""),
                     category_id=category_id,
                     priority=int(payload.get("priority", 100)),
+                    actor_user_id=auth["user_id"],
+                    apply_to_existing_unreviewed=bool(payload.get("apply_to_existing_unreviewed", False)),
                 )
                 self.send_json({"id": rule_id}, status=HTTPStatus.CREATED)
                 return
@@ -551,6 +581,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     transaction_id=transaction_id,
                     splits=payload["splits"],
                     reviewed=bool(payload.get("reviewed", True)),
+                    actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
@@ -563,6 +594,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ignored=bool(payload.get("ignored", True)),
                     reason=payload.get("reason"),
                     actor_user_id=auth["user_id"],
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/merchant-category-rules/"):
+                auth = self.require_auth()
+                rule_id = int(parsed.path.split("/")[2])
+                self.repository.require_merchant_rule_access(rule_id, auth["household_id"])
+                category_id = optional_int(payload, "category_id")
+                if category_id is not None:
+                    self.repository.require_category_access(category_id, auth["household_id"])
+                self.repository.update_merchant_rule(
+                    rule_id=rule_id,
+                    merchant_match_text=payload.get("merchant_match_text"),
+                    category_id=category_id,
+                    priority=optional_int(payload, "priority"),
+                    active=payload.get("active"),
+                    actor_user_id=auth["user_id"],
+                    apply_to_existing_unreviewed=bool(payload.get("apply_to_existing_unreviewed", False)),
                 )
                 self.send_json({"ok": True})
                 return
@@ -627,6 +676,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 payday_id = int(parsed.path.split("/")[2])
                 self.repository.require_payday_access(payday_id, auth["household_id"])
                 self.repository.remove_payday(payday_id=payday_id, actor_user_id=auth["user_id"])
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/split"):
+                auth = self.require_auth()
+                transaction_id = int(parsed.path.split("/")[2])
+                self.repository.require_transaction_access(transaction_id, auth["household_id"])
+                self.repository.remove_transaction_split(
+                    transaction_id,
+                    actor_user_id=auth["user_id"],
+                )
+                self.send_json({"ok": True})
+                return
+            if parsed.path.startswith("/merchant-category-rules/"):
+                auth = self.require_auth()
+                rule_id = int(parsed.path.split("/")[2])
+                self.repository.require_merchant_rule_access(rule_id, auth["household_id"])
+                self.repository.delete_merchant_rule(rule_id=rule_id, actor_user_id=auth["user_id"])
                 self.send_json({"ok": True})
                 return
             self.send_error_json(HTTPStatus.NOT_FOUND, "Route not found")

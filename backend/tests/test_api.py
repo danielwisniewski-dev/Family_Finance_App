@@ -154,6 +154,9 @@ class ApiTests(unittest.TestCase):
         ).transaction_id
 
         queue = self.get(f"/budget-months/{budget_month['id']}/transaction-review-queue")
+        filtered_queue = self.get(
+            f"/budget-months/{budget_month['id']}/transaction-review-queue?status=uncategorized&account_id={account_id}"
+        )
         self.patch(
             f"/transactions/{transaction_id}/category",
             {
@@ -162,12 +165,16 @@ class ApiTests(unittest.TestCase):
             },
         )
         detail = self.get(f"/transactions/{transaction_id}")
+        reviewed_queue = self.get(f"/budget-months/{budget_month['id']}/transaction-review-queue?status=reviewed")
 
         serialized_queue = json.dumps(queue)
         serialized_detail = json.dumps(detail)
         self.assertEqual(queue["transactions"][0]["transaction"]["id"], transaction_id)
+        self.assertEqual(filtered_queue["transactions"][0]["transaction"]["account_name"], "Main Checking")
+        self.assertEqual(reviewed_queue["transactions"][0]["transaction"]["id"], transaction_id)
         self.assertEqual(detail["categorization_status"], "manual")
         self.assertEqual(detail["final_category_id"], category["id"])
+        self.assertEqual(detail["suggestion_source"], "manual")
         self.assertNotIn("access_token", serialized_queue)
         self.assertNotIn("access_token_ref", serialized_queue)
         self.assertNotIn("access_token", serialized_detail)

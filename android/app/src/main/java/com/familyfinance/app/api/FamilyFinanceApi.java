@@ -4,6 +4,7 @@ import com.familyfinance.app.model.BudgetSummary;
 import com.familyfinance.app.model.BudgetDetail;
 import com.familyfinance.app.model.BudgetMonth;
 import com.familyfinance.app.model.CashAccount;
+import com.familyfinance.app.model.MerchantRule;
 import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.TransactionDetail;
@@ -313,6 +314,17 @@ public final class FamilyFinanceApi {
         return parseTransactions(client.get("/budget-months/" + budgetMonthId + "/transaction-review-queue"));
     }
 
+    public List<MerchantRule> getMerchantRules() throws ApiException {
+        JSONArray json = client.get("/merchant-category-rules?include_inactive=true").optJSONArray("rules");
+        ArrayList<MerchantRule> rules = new ArrayList<>();
+        if (json != null) {
+            for (int i = 0; i < json.length(); i++) {
+                rules.add(MerchantRule.fromJson(json.optJSONObject(i)));
+            }
+        }
+        return rules;
+    }
+
     public List<NotificationEvent> getNotifications(int budgetMonthId) throws ApiException {
         JSONArray json = client.get(
                 "/budget-months/" + budgetMonthId + "/notifications"
@@ -350,6 +362,43 @@ public final class FamilyFinanceApi {
         }
     }
 
+    public void removeCategory(int transactionId) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("category_id", JSONObject.NULL);
+            payload.put("reviewed", false);
+            client.patch("/transactions/" + transactionId + "/category", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build category removal request", exception);
+        }
+    }
+
+    public void splitTransaction(int transactionId, List<int[]> splits, boolean reviewed) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            JSONArray splitArray = new JSONArray();
+            for (int[] split : splits) {
+                JSONObject row = new JSONObject();
+                row.put("category_id", split[0]);
+                row.put("amount_cents", split[1]);
+                splitArray.put(row);
+            }
+            payload.put("splits", splitArray);
+            payload.put("reviewed", reviewed);
+            client.patch("/transactions/" + transactionId + "/split", payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build split request", exception);
+        }
+    }
+
+    public void removeSplit(int transactionId) throws ApiException {
+        client.delete("/transactions/" + transactionId + "/split");
+    }
+
     public void markReviewed(int transactionId, boolean reviewed) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
@@ -375,6 +424,40 @@ public final class FamilyFinanceApi {
         } catch (Exception exception) {
             throw new ApiException("Could not build ignore request", exception);
         }
+    }
+
+    public int createMerchantRuleFromTransaction(
+            int transactionId,
+            int categoryId,
+            boolean applyToExistingUnreviewed
+    ) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("transaction_id", transactionId);
+            payload.put("category_id", categoryId);
+            payload.put("apply_to_existing_unreviewed", applyToExistingUnreviewed);
+            return client.post("/merchant-category-rules", payload).optInt("id");
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build merchant rule request", exception);
+        }
+    }
+
+    public void archiveMerchantRule(int ruleId) throws ApiException {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("active", false);
+            client.patch("/merchant-category-rules/" + ruleId, payload);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not build merchant rule archive request", exception);
+        }
+    }
+
+    public void deleteMerchantRule(int ruleId) throws ApiException {
+        client.delete("/merchant-category-rules/" + ruleId);
     }
 
     public void markNotificationRead(int notificationId) throws ApiException {
