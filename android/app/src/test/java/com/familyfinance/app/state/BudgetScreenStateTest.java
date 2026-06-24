@@ -46,6 +46,26 @@ public final class BudgetScreenStateTest {
         assertSame(gas, BudgetScreenState.findCategory(11, Arrays.asList(groceries, gas)));
     }
 
+    @Test
+    public void validatesSplitTotalsForUserMessage() {
+        assertEquals(
+                "",
+                BudgetScreenState.splitValidationMessage(2000, Arrays.asList(1200, 800))
+        );
+        assertEquals(
+                "Split total must equal the transaction amount.",
+                BudgetScreenState.splitValidationMessage(2000, Arrays.asList(1200, 700))
+        );
+        assertEquals(
+                "Use at least two split lines.",
+                BudgetScreenState.splitValidationMessage(2000, Collections.singletonList(2000))
+        );
+        assertEquals(
+                "Split amounts must be positive.",
+                BudgetScreenState.splitValidationMessage(2000, Arrays.asList(2000, 0))
+        );
+    }
+
     private static TransactionDetail detail(
             int id,
             Integer finalCategoryId,

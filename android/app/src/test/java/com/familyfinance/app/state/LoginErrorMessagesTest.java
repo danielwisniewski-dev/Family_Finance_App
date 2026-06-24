@@ -26,4 +26,14 @@ public final class LoginErrorMessagesTest {
 
         assertEquals("Wrong username/email or password for this local household setup.", message);
     }
+
+    @Test
+    public void explainsExpiredSession() {
+        String message = LoginErrorMessages.fromException(
+                new Exception("Login required or session expired. Please log in again."),
+                "http://10.0.2.2:8080"
+        );
+
+        assertEquals("Session expired. Please log in again.", message);
+    }
 }

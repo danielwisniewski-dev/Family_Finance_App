@@ -14,6 +14,9 @@ public final class LoginErrorMessages {
         if (message.contains("Invalid credentials")) {
             return "Wrong username/email or password for this local household setup.";
         }
+        if (message.contains("Login required") || message.contains("Authentication required")) {
+            return "Session expired. Please log in again.";
+        }
         return message;
     }
 }
