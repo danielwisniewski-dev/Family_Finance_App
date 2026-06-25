@@ -1,8 +1,11 @@
 package com.familyfinance.app;
 
 import android.app.Activity;
+import android.content.res.ColorStateList;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -11,11 +14,13 @@ import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -64,6 +69,25 @@ public final class MainActivity extends Activity {
     private static final String PREFS = "family_finance";
     private static final String DEFAULT_BASE_URL = "http://10.0.2.2:8080";
     private static final int DEFAULT_BUDGET_MONTH_ID = 1;
+    private static final String PREF_LAST_BUDGET_CHECK_DATE = "last_budget_check_date";
+    private static final String PREF_BUDGET_CHECK_STREAK = "budget_check_streak";
+    private static final String PREF_LAST_REVIEW_CLEAR_DATE = "last_review_clear_date";
+    private static final String PREF_REVIEW_CLEAR_STREAK = "review_clear_streak";
+
+    private static final int COLOR_BACKGROUND = 0xFFF8FAF7;
+    private static final int COLOR_SURFACE = 0xFFFFFFFF;
+    private static final int COLOR_SURFACE_ALT = 0xFFEAF4EF;
+    private static final int COLOR_TEXT = 0xFF17201A;
+    private static final int COLOR_MUTED = 0xFF637267;
+    private static final int COLOR_BORDER = 0xFFD7E2DA;
+    private static final int COLOR_PRIMARY = 0xFF236B4E;
+    private static final int COLOR_PRIMARY_DARK = 0xFF144734;
+    private static final int COLOR_WARNING_BG = 0xFFFFF4D7;
+    private static final int COLOR_WARNING_TEXT = 0xFF76510A;
+    private static final int COLOR_DANGER_BG = 0xFFFFECE8;
+    private static final int COLOR_DANGER_TEXT = 0xFF9A3427;
+    private static final int COLOR_SUCCESS_BG = 0xFFE7F7EC;
+    private static final int COLOR_SUCCESS_TEXT = 0xFF155C35;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -274,7 +298,7 @@ public final class MainActivity extends Activity {
     private void showFirstRunSetup(String message) {
         beginScreen("First-Run Setup");
         if (message != null && !message.trim().isEmpty()) {
-            addBody(message.trim());
+            addStatusCard("Setup note", message.trim(), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
         }
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
@@ -392,7 +416,7 @@ public final class MainActivity extends Activity {
     private void showLogin(String message) {
         beginScreen("Login");
         if (message != null && !message.trim().isEmpty()) {
-            addBody(message.trim());
+            addStatusCard("Connection note", message.trim(), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
         }
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
@@ -462,38 +486,82 @@ public final class MainActivity extends Activity {
 
     private void showDashboard() {
         beginScreen("Dashboard");
-        addFact("Backend", baseUrl + "  |  Budget month ID " + budgetMonthId);
-        addFact("Signed in", blankAsDash(currentUserName) + "  |  " + blankAsDash(householdName));
         if (summary == null) {
             if (budgetMonths.isEmpty()) {
-                addBody("No budget month exists yet for this household.");
+                addStatusCard(
+                        "Ready for a starter plan",
+                        "No budget month exists yet for this household. Create one, then the dashboard will fill in from backend data.",
+                        COLOR_SURFACE_ALT,
+                        COLOR_PRIMARY_DARK
+                );
                 addButton("Create starter budget month", this::showStarterBudget);
             } else {
-                addBody("No summary loaded.");
+                addWarning("No summary loaded.");
             }
             addNav();
             return;
         }
+        int budgetCheckStreak = recordBudgetCheckInStreak();
+        int reviewClearStreak = recordReviewClearStreakIfCleared();
+        addFact("Signed in", blankAsDash(currentUserName) + " for " + blankAsDash(householdName));
+        addHeroCard(
+                "Cash after upcoming bills",
+                MoneyFormatter.dollars(summary.cashAfterBillsCents),
+                "About " + summary.daysUntilPayday + " day"
+                        + (summary.daysUntilPayday == 1 ? "" : "s")
+                        + " until payday. Included balance is "
+                        + MoneyFormatter.dollars(summary.includedAccountBalanceCents)
+                        + "."
+        );
+        if (summary.hasLowCushion()) {
+            addWarning("Cash remaining after bills is tight for the days until payday. Keep new spending calm and intentional.");
+        } else {
+            addStatusCard(
+                    "Cushion looks steady",
+                    "The current cash cushion is not flagged as low by the backend.",
+                    COLOR_SUCCESS_BG,
+                    COLOR_SUCCESS_TEXT
+            );
+        }
+        addProgressCard(
+                "Transaction review",
+                reviewProgressValue(),
+                reviewProgressPercent(),
+                reviewProgressDetail()
+        );
+        if (reviewQueue.isEmpty()) {
+            addStatusCard(
+                    "Review queue cleared",
+                    "That is a small but real win. Today's local clear streak: "
+                            + reviewClearStreak + " day" + (reviewClearStreak == 1 ? "" : "s") + ".",
+                    COLOR_SUCCESS_BG,
+                    COLOR_SUCCESS_TEXT
+            );
+        }
+        addMetricCard(
+                "Budget check-in streak",
+                budgetCheckStreak + " day" + (budgetCheckStreak == 1 ? "" : "s"),
+                "Local-only encouragement. It does not change financial records."
+        );
+
+        addSection("Month at a glance");
         addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
         addMetric("Assigned total", MoneyFormatter.dollars(summary.assignedTotalCents));
         addMetric("Remaining to assign", MoneyFormatter.dollars(summary.remainingToAssignCents));
         addMetric("Total spent", MoneyFormatter.dollars(summary.totalSpentCents));
-        addMetric("Included account balance", MoneyFormatter.dollars(summary.includedAccountBalanceCents));
         addMetric("Bills before next payday", MoneyFormatter.dollars(summary.billsBeforePaydayCents));
-        addMetric("Cash remaining after upcoming bills", MoneyFormatter.dollars(summary.cashAfterBillsCents));
-        addMetric("Days until next payday", Integer.toString(summary.daysUntilPayday));
-        if (summary.hasLowCushion()) {
-            addWarning("Low cushion warning: cash remaining after bills is tight for the days until payday.");
-        }
-        addMetric("Uncategorized transactions", Integer.toString(reviewQueue.size()));
         addMetric("Unread notifications", Integer.toString(unreadNotificationCount));
-        addFact("Notification viewer", "Unread state is scoped to the signed-in user.");
-        addButton("Notifications / accountability", this::showNotifications);
+        addSecondaryButton("Notifications / accountability", this::showNotifications);
 
         addSection("Categories needing attention");
         List<BudgetCategory> attention = summary.categoriesNeedingAttention();
         if (attention.isEmpty()) {
-            addBody("No overspent or zero-remaining categories.");
+            addStatusCard(
+                    "No red flags right now",
+                    "No overspent or zero-remaining categories are showing for this month.",
+                    COLOR_SUCCESS_BG,
+                    COLOR_SUCCESS_TEXT
+            );
         } else {
             for (BudgetCategory category : attention) {
                 addButton(
@@ -502,6 +570,8 @@ public final class MainActivity extends Activity {
                 );
             }
         }
+        addFact("Backend", baseUrl + " | Budget month ID " + budgetMonthId);
+        addFact("Notification viewer", "Unread state is scoped to the signed-in user.");
         addNav();
     }
 
@@ -558,47 +628,55 @@ public final class MainActivity extends Activity {
     private void showBudget() {
         beginScreen("Monthly Budget");
         if (summary == null || budgetDetail == null) {
-            addBody("No budget month is loaded. Create a starter budget or reload after the backend is reachable.");
+            addStatusCard(
+                    "No budget month loaded",
+                    "Create a starter budget or reload after the backend is reachable.",
+                    COLOR_WARNING_BG,
+                    COLOR_WARNING_TEXT
+            );
             if (budgetMonths.isEmpty()) {
                 addButton("Create starter budget month", this::showStarterBudget);
             }
             addNav();
             return;
         }
-        addMetric("Budget month", summary.month);
+        int streak = recordBudgetCheckInStreak();
+        addHeroCard(
+                summary.month,
+                MoneyFormatter.dollars(summary.remainingToAssignCents),
+                "Remaining to assign. Check-in streak: " + streak + " day"
+                        + (streak == 1 ? "" : "s") + "."
+        );
         addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
         addMetric("Assigned", MoneyFormatter.dollars(summary.assignedTotalCents));
-        addMetric("Remaining to assign", MoneyFormatter.dollars(summary.remainingToAssignCents));
         addMetric("Total spent", MoneyFormatter.dollars(summary.totalSpentCents));
-        addButton("Switch / create budget month", this::showBudgetMonths);
-        addButton("Income planning", this::showIncomePlanning);
-        addButton("Bills and paydays", this::showBillsAndPaydays);
+        addSecondaryButton("Switch / create budget month", this::showBudgetMonths);
+        addSecondaryButton("Income planning", this::showIncomePlanning);
+        addSecondaryButton("Bills and paydays", this::showBillsAndPaydays);
 
         addSection("Budget groups");
         if (budgetDetail.groups.isEmpty()) {
-            addBody("No budget groups yet.");
+            addStatusCard(
+                    "No groups yet",
+                    "Add a budget group to start organizing household spending.",
+                    COLOR_SURFACE_ALT,
+                    COLOR_PRIMARY_DARK
+            );
         } else {
             for (BudgetGroup group : budgetDetail.groups) {
                 addSection(group.name);
-                addButton("Rename group", () -> showGroupEditor(group));
-                addButton("Add category to " + group.name, () -> showCategoryEditor(null, group.id));
                 if (group.categories.isEmpty()) {
-                    addBody("No categories in this group.");
+                    addBody("No categories in this group yet.");
                 } else {
                     for (BudgetCategory category : group.categories) {
-                        String marker = category.isOverspent() ? "OVERSPENT  " : "";
-                        addButton(
-                                marker + category.name
-                                        + " | planned " + MoneyFormatter.dollars(category.plannedCents)
-                                        + " | spent " + MoneyFormatter.dollars(category.spentCents)
-                                        + " | remaining " + MoneyFormatter.dollars(category.remainingCents),
-                                () -> showCategoryDetail(category.id)
-                        );
+                        addCategoryCard(category);
                     }
                 }
+                addSecondaryButton("Rename " + group.name, () -> showGroupEditor(group));
+                addSecondaryButton("Add category to " + group.name, () -> showCategoryEditor(null, group.id));
             }
         }
-        addButton("Add budget group", () -> showGroupEditor(null));
+        addSecondaryButton("Add budget group", () -> showGroupEditor(null));
         addNav();
     }
 
@@ -615,7 +693,7 @@ public final class MainActivity extends Activity {
         addMetric("Spent", MoneyFormatter.dollars(category.spentCents));
         addMetric("Remaining", MoneyFormatter.dollars(category.remainingCents));
         addButton("Rename / fund category", () -> showCategoryEditor(category, category.budgetGroupId));
-        addButton("Archive category", () -> runMutation(
+        addDangerButton("Archive category", () -> runMutation(
                 "Archiving category...",
                 () -> api.updateCategory(category.id, category.name, category.plannedCents, true),
                 () -> refreshData(this::showBudget)
@@ -758,7 +836,7 @@ public final class MainActivity extends Activity {
                         + " | planned " + MoneyFormatter.dollars(income.plannedCents)
                         + " | received " + MoneyFormatter.dollars(income.receivedCents));
                 addButton("Edit " + income.name, () -> showIncomeEditor(income));
-                addButton("Remove " + income.name, () -> runMutation(
+                addDangerButton("Remove " + income.name, () -> runMutation(
                         "Removing income...",
                         () -> api.deleteIncome(income.id),
                         () -> refreshData(this::showIncomePlanning)
@@ -832,7 +910,7 @@ public final class MainActivity extends Activity {
             for (ExpectedBill bill : budgetDetail.expectedBills) {
                 addBody(bill.name + " | " + MoneyFormatter.dollars(bill.amountCents) + " | due " + bill.dueOn + (bill.paid ? " | paid" : ""));
                 addButton("Edit " + bill.name, () -> showBillEditor(bill));
-                addButton("Remove " + bill.name, () -> runMutation(
+                addDangerButton("Remove " + bill.name, () -> runMutation(
                         "Removing bill...",
                         () -> api.deleteExpectedBill(bill.id),
                         () -> refreshData(this::showBillsAndPaydays)
@@ -847,7 +925,7 @@ public final class MainActivity extends Activity {
             for (Payday payday : budgetDetail.paydays) {
                 addBody(payday.paydayDate);
                 addButton("Edit " + payday.paydayDate, () -> showPaydayEditor(payday));
-                addButton("Remove " + payday.paydayDate, () -> runMutation(
+                addDangerButton("Remove " + payday.paydayDate, () -> runMutation(
                         "Removing payday...",
                         () -> api.deletePayday(payday.id),
                         () -> refreshData(this::showBillsAndPaydays)
@@ -935,10 +1013,33 @@ public final class MainActivity extends Activity {
     private void showTransactions(boolean reviewOnly) {
         beginScreen(reviewOnly ? "Uncategorized Review" : "Transactions");
         List<TransactionDetail> source = reviewOnly ? reviewQueue : transactions;
+        if (reviewOnly) {
+            int clearStreak = recordReviewClearStreakIfCleared();
+            addProgressCard(
+                    "Review queue",
+                    reviewProgressValue(),
+                    reviewProgressPercent(),
+                    reviewProgressDetail()
+            );
+            if (reviewQueue.isEmpty()) {
+                addStatusCard(
+                        "Queue cleared",
+                        "Everything waiting for a category is handled. Local clear streak: "
+                                + clearStreak + " day" + (clearStreak == 1 ? "" : "s") + ".",
+                        COLOR_SUCCESS_BG,
+                        COLOR_SUCCESS_TEXT
+                );
+            }
+        }
         if (source.isEmpty()) {
-            addBody(reviewOnly
-                    ? "No transactions need categorization right now."
-                    : "No transactions returned by the backend for this budget month.");
+            addStatusCard(
+                    reviewOnly ? "Nothing waiting" : "No transactions yet",
+                    reviewOnly
+                            ? "No transactions need categorization right now."
+                            : "No transactions returned by the backend for this budget month.",
+                    COLOR_SUCCESS_BG,
+                    COLOR_SUCCESS_TEXT
+            );
         } else {
             for (TransactionDetail detail : source) {
                 addTransactionButton(detail);
@@ -979,7 +1080,7 @@ public final class MainActivity extends Activity {
                 addBody(describeCategory(assignment.categoryId) + " | " + MoneyFormatter.dollars(assignment.amountCents));
             }
             addButton("Edit split", () -> showSplitEditor(detail));
-            addButton("Remove split", () -> runMutation(
+            addDangerButton("Remove split", () -> runMutation(
                     "Removing split...",
                     () -> api.removeSplit(detail.transaction.id),
                     () -> afterTransactionSaved(detail.transaction.id)
@@ -1008,7 +1109,7 @@ public final class MainActivity extends Activity {
             );
         });
         if (detail.finalCategoryId != null || detail.isSplit()) {
-            addButton("Remove category assignment", () -> runMutation(
+            addDangerButton("Remove category assignment", () -> runMutation(
                     "Removing category...",
                     () -> api.removeCategory(detail.transaction.id),
                     () -> afterTransactionSaved(detail.transaction.id)
@@ -1019,7 +1120,7 @@ public final class MainActivity extends Activity {
                 () -> api.markReviewed(detail.transaction.id, !detail.transaction.reviewed),
                 () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
         ));
-        addButton(detail.transaction.ignored ? "Unignore transaction" : "Ignore/exclude transaction", () -> runMutation(
+        addDangerButton(detail.transaction.ignored ? "Unignore transaction" : "Ignore/exclude transaction", () -> runMutation(
                 "Updating ignored state...",
                 () -> api.setIgnored(detail.transaction.id, !detail.transaction.ignored, "Marked in Android MVP"),
                 () -> afterTransactionSaved(detail.transaction.id)
@@ -1186,7 +1287,7 @@ public final class MainActivity extends Activity {
         MerchantRule matchingRule = findMatchingRule(detail);
         if (matchingRule != null) {
             addBody("Existing rule: " + matchingRule.merchantMatchText + " -> " + matchingRule.categoryName);
-            addButton("Archive matching rule", () -> runMutation(
+            addDangerButton("Archive matching rule", () -> runMutation(
                     "Archiving merchant rule...",
                     () -> api.archiveMerchantRule(matchingRule.id),
                     () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
@@ -1249,18 +1350,70 @@ public final class MainActivity extends Activity {
         return null;
     }
 
+    private String safeToSpendTitle(String warningLevel) {
+        if ("safe".equals(warningLevel)) {
+            return "Looks safe";
+        }
+        if ("caution".equals(warningLevel)) {
+            return "Use caution";
+        }
+        if ("no".equals(warningLevel)) {
+            return "Not a good idea";
+        }
+        if ("discuss".equals(warningLevel)) {
+            return "Talk it over first";
+        }
+        return "Backend result";
+    }
+
+    private int safeToSpendBackground(String warningLevel) {
+        if ("safe".equals(warningLevel)) {
+            return COLOR_SUCCESS_BG;
+        }
+        if ("no".equals(warningLevel) || "discuss".equals(warningLevel)) {
+            return COLOR_DANGER_BG;
+        }
+        return COLOR_WARNING_BG;
+    }
+
+    private int safeToSpendTextColor(String warningLevel) {
+        if ("safe".equals(warningLevel)) {
+            return COLOR_SUCCESS_TEXT;
+        }
+        if ("no".equals(warningLevel) || "discuss".equals(warningLevel)) {
+            return COLOR_DANGER_TEXT;
+        }
+        return COLOR_WARNING_TEXT;
+    }
+
     private void showSafeToSpend() {
         beginScreen("Safe To Spend");
         if (summary == null) {
-            addBody("No budget month is loaded. Safe-to-spend needs backend budget and payday data.");
+            addStatusCard(
+                    "Budget data needed",
+                    "Safe-to-spend needs backend budget and payday data before it can answer.",
+                    COLOR_WARNING_BG,
+                    COLOR_WARNING_TEXT
+            );
             addNav();
             return;
         }
         if (summary.categories.isEmpty()) {
-            addBody("No active categories are available for safe-to-spend.");
+            addStatusCard(
+                    "No active categories",
+                    "Safe-to-spend needs an active category for this month.",
+                    COLOR_WARNING_BG,
+                    COLOR_WARNING_TEXT
+            );
             addNav();
             return;
         }
+        addStatusCard(
+                "Ask before spending",
+                "Choose the category and amount. The answer comes from backend budget and cash-reality rules.",
+                COLOR_SURFACE_ALT,
+                COLOR_PRIMARY_DARK
+        );
         EditText amount = new EditText(this);
         amount.setHint("Amount, e.g. 42.50");
         amount.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
@@ -1305,13 +1458,19 @@ public final class MainActivity extends Activity {
 
     private void renderSafeToSpendResult(SafeToSpendResult result, String note) {
         beginScreen("Safe To Spend Result");
-        addMetric("Result", result.warningLevel);
+        int background = safeToSpendBackground(result.warningLevel);
+        int textColor = safeToSpendTextColor(result.warningLevel);
+        addStatusCard(
+                safeToSpendTitle(result.warningLevel),
+                result.requiredPhrase,
+                background,
+                textColor
+        );
         addMetric("Budget line fits", result.budgetLineFits ? "Yes" : "No");
         addMetric("Category remaining after purchase", MoneyFormatter.dollars(result.categoryRemainingAfterCents));
         addMetric("Cash after purchase and upcoming bills", MoneyFormatter.dollars(result.cashAfterPurchaseAndBillsCents));
         addMetric("Days until payday", Integer.toString(result.daysUntilPayday));
         addMetric("Low cushion warning", result.lowCushion ? "Yes" : "No");
-        addWarning(result.requiredPhrase);
         if (note != null && !note.trim().isEmpty()) {
             addBody("Purpose: " + note.trim());
         }
@@ -1430,7 +1589,7 @@ public final class MainActivity extends Activity {
         newPasswordInput.setSingleLine(true);
         newPasswordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         root.addView(newPasswordInput);
-        addButton("Change password", () -> {
+        addDangerButton("Change password", () -> {
             String currentPassword = currentPasswordInput.getText().toString();
             String newPassword = newPasswordInput.getText().toString();
             if (currentPassword.isEmpty() || newPassword.isEmpty()) {
@@ -1450,7 +1609,7 @@ public final class MainActivity extends Activity {
                     }
             );
         });
-        addButton("Log out", this::logout);
+        addDangerButton("Log out", this::logout);
 
         addSection("Plaid Sandbox");
         addButton("Link bank with Plaid Sandbox", this::preparePlaidLink);
@@ -1545,17 +1704,78 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void addTransactionButton(TransactionDetail detail) {
-        String status = detail.categorizationStatus
-                + (detail.transaction.reviewed ? " | reviewed" : " | unreviewed")
-                + (detail.transaction.ignored ? " | ignored" : "");
-        addButton(
-                detail.transaction.occurredOn
-                        + "  " + detail.transaction.displayName()
-                        + "  " + MoneyFormatter.dollars(detail.transaction.amountCents)
-                        + "\n" + status,
-                () -> showTransactionDetail(detail.transaction.id)
+    private void addCategoryCard(BudgetCategory category) {
+        String status;
+        int background = COLOR_SURFACE;
+        int textColor = COLOR_TEXT;
+        if (category.isOverspent()) {
+            status = "Overspent by " + MoneyFormatter.dollars(Math.abs(category.remainingCents));
+            background = COLOR_DANGER_BG;
+            textColor = COLOR_DANGER_TEXT;
+        } else if (category.remainingCents == 0) {
+            status = "Fully used";
+            background = COLOR_WARNING_BG;
+            textColor = COLOR_WARNING_TEXT;
+        } else {
+            status = MoneyFormatter.dollars(category.remainingCents) + " left";
+        }
+        Button button = new Button(this);
+        button.setAllCaps(false);
+        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        button.setText(category.name
+                + "\n" + status
+                + " | spent " + MoneyFormatter.dollars(category.spentCents)
+                + " of " + MoneyFormatter.dollars(category.plannedCents));
+        button.setTextColor(textColor);
+        button.setTextSize(15);
+        button.setPadding(dp(16), dp(12), dp(16), dp(12));
+        button.setMinHeight(dp(72));
+        button.setBackground(rounded(background, COLOR_BORDER, 14));
+        button.setOnClickListener(view -> showCategoryDetail(category.id));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
         );
+        params.setMargins(0, dp(4), 0, dp(10));
+        button.setLayoutParams(params);
+        root.addView(button);
+    }
+
+    private void addTransactionButton(TransactionDetail detail) {
+        String status = transactionStatusLabel(detail);
+        Button button = new Button(this);
+        button.setAllCaps(false);
+        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        button.setText(detail.transaction.displayName()
+                + "\n" + MoneyFormatter.dollars(detail.transaction.amountCents)
+                + " | " + detail.transaction.occurredOn
+                + " | " + status);
+        button.setTextColor(detail.transaction.ignored ? COLOR_MUTED : COLOR_TEXT);
+        button.setTextSize(15);
+        button.setPadding(dp(16), dp(12), dp(16), dp(12));
+        button.setMinHeight(dp(72));
+        button.setBackground(rounded(detail.needsReview ? COLOR_WARNING_BG : COLOR_SURFACE, COLOR_BORDER, 14));
+        button.setOnClickListener(view -> showTransactionDetail(detail.transaction.id));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.setMargins(0, dp(4), 0, dp(10));
+        button.setLayoutParams(params);
+        root.addView(button);
+    }
+
+    private String transactionStatusLabel(TransactionDetail detail) {
+        if (detail.transaction.ignored) {
+            return "ignored";
+        }
+        if (detail.transaction.reviewed) {
+            return "reviewed";
+        }
+        if (detail.finalCategoryId != null || detail.isSplit()) {
+            return "needs final review";
+        }
+        return "needs category";
     }
 
     private void addNotificationRow(NotificationEvent notification) {
@@ -1589,35 +1809,37 @@ public final class MainActivity extends Activity {
 
     private void beginScreen(String title) {
         ScrollView scrollView = new ScrollView(this);
-        root = new LinearLayout(this);
+        scrollView.setBackgroundColor(COLOR_BACKGROUND);
+        root = new StyledLinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(28, 28, 28, 28);
+        root.setPadding(dp(18), dp(22), dp(18), dp(24));
         scrollView.addView(root);
         setContentView(scrollView);
         TextView heading = new TextView(this);
         heading.setText(title);
-        heading.setTextSize(26);
+        heading.setTextColor(COLOR_TEXT);
+        heading.setTextSize(29);
+        heading.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         heading.setGravity(Gravity.START);
-        heading.setPadding(0, 0, 0, 20);
+        heading.setPadding(0, 0, 0, dp(4));
         root.addView(heading);
     }
 
     private void showLoading(String message) {
         beginScreen("Family Finance");
-        addBody(message);
+        addStatusCard("One moment", message, COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK);
     }
 
     private void showError(String context, Exception exception) {
-        beginScreen("Error");
-        addWarning(context);
-        addBody(userFacingError(exception));
+        beginScreen("Something needs attention");
+        addStatusCard(context, userFacingError(exception), COLOR_DANGER_BG, COLOR_DANGER_TEXT);
         addButton("Log in", () -> showLogin(null));
         addButton("Retry dashboard", () -> refreshData(this::showDashboard));
         addButton("Settings", this::showSettings);
     }
 
     private void addNav() {
-        addSection("Navigation");
+        addSection("Quick actions");
         addButton("Dashboard", this::showDashboard);
         addButton("Monthly budget", this::showBudget);
         addButton("Income planning", this::showIncomePlanning);
@@ -1627,56 +1849,193 @@ public final class MainActivity extends Activity {
         addButton("Safe to spend", this::showSafeToSpend);
         addButton("Notifications", this::showNotifications);
         addButton("Accounts / settings", this::showSettings);
-        addButton("Log out", this::logout);
+        addDangerButton("Log out", this::logout);
     }
 
     private void addMetric(String label, String value) {
-        TextView textView = new TextView(this);
-        textView.setText(label + ": " + value);
-        textView.setTextSize(17);
-        textView.setPadding(0, 6, 0, 6);
-        root.addView(textView);
+        addMetricCard(label, value, null);
     }
 
     private void addFact(String label, String value) {
         TextView textView = new TextView(this);
         textView.setText(label + ": " + value);
+        textView.setTextColor(COLOR_MUTED);
         textView.setTextSize(13);
-        textView.setPadding(0, 0, 0, 12);
+        textView.setPadding(0, dp(2), 0, dp(8));
         root.addView(textView);
     }
 
     private void addSection(String label) {
         TextView textView = new TextView(this);
         textView.setText(label);
-        textView.setTextSize(20);
-        textView.setPadding(0, 24, 0, 8);
+        textView.setTextColor(COLOR_TEXT);
+        textView.setTextSize(19);
+        textView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        textView.setPadding(0, dp(22), 0, dp(8));
         root.addView(textView);
     }
 
     private void addBody(String body) {
         TextView textView = new TextView(this);
         textView.setText(body);
+        textView.setTextColor(COLOR_TEXT);
         textView.setTextSize(15);
-        textView.setPadding(0, 6, 0, 6);
+        textView.setLineSpacing(dp(2), 1.0f);
+        textView.setPadding(0, dp(4), 0, dp(8));
         root.addView(textView);
     }
 
     private void addWarning(String body) {
-        TextView textView = new TextView(this);
-        textView.setText(body);
-        textView.setTextSize(16);
-        textView.setPadding(12, 12, 12, 12);
-        textView.setBackgroundColor(0xFFFFF3CD);
-        root.addView(textView);
+        addStatusCard("Heads up", body, COLOR_WARNING_BG, COLOR_WARNING_TEXT);
     }
 
     private void addButton(String label, Runnable action) {
+        addStyledButton(label, COLOR_PRIMARY, 0xFFFFFFFF, action);
+    }
+
+    private void addSecondaryButton(String label, Runnable action) {
+        addStyledButton(label, COLOR_SURFACE, COLOR_PRIMARY_DARK, action);
+    }
+
+    private void addDangerButton(String label, Runnable action) {
+        addStyledButton(label, COLOR_DANGER_BG, COLOR_DANGER_TEXT, action);
+    }
+
+    private void addStyledButton(String label, int backgroundColor, int textColor, Runnable action) {
         Button button = new Button(this);
         button.setAllCaps(false);
         button.setText(label);
+        button.setTextColor(textColor);
+        button.setTextSize(15);
+        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        button.setGravity(Gravity.CENTER);
+        button.setPadding(dp(14), dp(10), dp(14), dp(10));
+        button.setMinHeight(dp(52));
+        button.setBackgroundTintList(ColorStateList.valueOf(backgroundColor));
         button.setOnClickListener(view -> action.run());
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.setMargins(0, dp(4), 0, dp(8));
+        button.setLayoutParams(params);
         root.addView(button);
+    }
+
+    private void addMetricCard(String label, String value, String detail) {
+        LinearLayout card = cardLayout(COLOR_SURFACE, COLOR_BORDER);
+        TextView labelView = smallLabel(label);
+        card.addView(labelView);
+        TextView valueView = new TextView(this);
+        valueView.setText(value);
+        valueView.setTextColor(COLOR_TEXT);
+        valueView.setTextSize(22);
+        valueView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        valueView.setPadding(0, dp(2), 0, detail == null ? 0 : dp(4));
+        card.addView(valueView);
+        if (detail != null && !detail.trim().isEmpty()) {
+            TextView detailView = mutedText(detail);
+            card.addView(detailView);
+        }
+        root.addView(card);
+    }
+
+    private void addHeroCard(String label, String value, String detail) {
+        LinearLayout card = cardLayout(COLOR_SURFACE_ALT, 0xFFBFD5C8);
+        TextView labelView = smallLabel(label);
+        card.addView(labelView);
+        TextView valueView = new TextView(this);
+        valueView.setText(value);
+        valueView.setTextColor(COLOR_PRIMARY_DARK);
+        valueView.setTextSize(34);
+        valueView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        valueView.setPadding(0, dp(2), 0, dp(8));
+        card.addView(valueView);
+        if (detail != null && !detail.trim().isEmpty()) {
+            TextView detailView = mutedText(detail);
+            card.addView(detailView);
+        }
+        root.addView(card);
+    }
+
+    private void addStatusCard(String title, String body, int backgroundColor, int textColor) {
+        LinearLayout card = cardLayout(backgroundColor, backgroundColor);
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextColor(textColor);
+        titleView.setTextSize(16);
+        titleView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        card.addView(titleView);
+        TextView bodyView = new TextView(this);
+        bodyView.setText(body);
+        bodyView.setTextColor(textColor);
+        bodyView.setTextSize(15);
+        bodyView.setLineSpacing(dp(2), 1.0f);
+        bodyView.setPadding(0, dp(4), 0, 0);
+        card.addView(bodyView);
+        root.addView(card);
+    }
+
+    private void addProgressCard(String title, String value, int progressPercent, String detail) {
+        LinearLayout card = cardLayout(COLOR_SURFACE, COLOR_BORDER);
+        TextView titleView = smallLabel(title);
+        card.addView(titleView);
+        TextView valueView = new TextView(this);
+        valueView.setText(value);
+        valueView.setTextColor(COLOR_TEXT);
+        valueView.setTextSize(20);
+        valueView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        valueView.setPadding(0, dp(2), 0, dp(8));
+        card.addView(valueView);
+        ProgressBar progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setMax(100);
+        progressBar.setProgress(Math.max(0, Math.min(100, progressPercent)));
+        progressBar.setProgressTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+        progressBar.setProgressBackgroundTintList(ColorStateList.valueOf(0xFFE1E8E3));
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(10)
+        );
+        progressParams.setMargins(0, 0, 0, dp(8));
+        progressBar.setLayoutParams(progressParams);
+        card.addView(progressBar);
+        if (detail != null && !detail.trim().isEmpty()) {
+            card.addView(mutedText(detail));
+        }
+        root.addView(card);
+    }
+
+    private LinearLayout cardLayout(int backgroundColor, int strokeColor) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        card.setBackground(rounded(backgroundColor, strokeColor, 14));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.setMargins(0, dp(6), 0, dp(10));
+        card.setLayoutParams(params);
+        return card;
+    }
+
+    private TextView smallLabel(String label) {
+        TextView textView = new TextView(this);
+        textView.setText(label);
+        textView.setTextColor(COLOR_MUTED);
+        textView.setTextSize(12);
+        textView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        textView.setAllCaps(true);
+        return textView;
+    }
+
+    private TextView mutedText(String body) {
+        TextView textView = new TextView(this);
+        textView.setText(body);
+        textView.setTextColor(COLOR_MUTED);
+        textView.setTextSize(14);
+        textView.setLineSpacing(dp(2), 1.0f);
+        return textView;
     }
 
     private EditText moneyInput(String hint, int cents) {
@@ -1779,8 +2138,144 @@ public final class MainActivity extends Activity {
         return value == null || value.isEmpty() ? "-" : value;
     }
 
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private GradientDrawable rounded(int backgroundColor, int strokeColor, int radiusDp) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(backgroundColor);
+        drawable.setCornerRadius(dp(radiusDp));
+        drawable.setStroke(dp(1), strokeColor);
+        return drawable;
+    }
+
+    private int recordDailyStreak(String lastDateKey, String streakKey) {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String today = LocalDate.now().toString();
+        String lastDate = prefs.getString(lastDateKey, "");
+        int currentStreak = prefs.getInt(streakKey, 0);
+        if (today.equals(lastDate)) {
+            return currentStreak;
+        }
+        int nextStreak;
+        try {
+            LocalDate last = LocalDate.parse(lastDate);
+            nextStreak = last.plusDays(1).equals(LocalDate.parse(today)) ? currentStreak + 1 : 1;
+        } catch (Exception exception) {
+            nextStreak = 1;
+        }
+        prefs.edit()
+                .putString(lastDateKey, today)
+                .putInt(streakKey, nextStreak)
+                .apply();
+        return nextStreak;
+    }
+
+    private int recordBudgetCheckInStreak() {
+        return recordDailyStreak(PREF_LAST_BUDGET_CHECK_DATE, PREF_BUDGET_CHECK_STREAK);
+    }
+
+    private int recordReviewClearStreakIfCleared() {
+        if (!reviewQueue.isEmpty()) {
+            return getSharedPreferences(PREFS, MODE_PRIVATE).getInt(PREF_REVIEW_CLEAR_STREAK, 0);
+        }
+        return recordDailyStreak(PREF_LAST_REVIEW_CLEAR_DATE, PREF_REVIEW_CLEAR_STREAK);
+    }
+
+    private int reviewProgressPercent() {
+        if (transactions.isEmpty()) {
+            return reviewQueue.isEmpty() ? 100 : 0;
+        }
+        int reviewedOrCategorized = Math.max(0, transactions.size() - reviewQueue.size());
+        return Math.round((reviewedOrCategorized * 100f) / Math.max(1, transactions.size()));
+    }
+
+    private String reviewProgressValue() {
+        if (transactions.isEmpty()) {
+            return reviewQueue.isEmpty() ? "Nothing waiting" : reviewQueue.size() + " to review";
+        }
+        int reviewedOrCategorized = Math.max(0, transactions.size() - reviewQueue.size());
+        return reviewedOrCategorized + " of " + transactions.size() + " handled";
+    }
+
+    private String reviewProgressDetail() {
+        if (reviewQueue.isEmpty()) {
+            return "Review queue cleared. Nice and tidy for the household demo.";
+        }
+        return reviewQueue.size() + " quick decision" + (reviewQueue.size() == 1 ? "" : "s")
+                + " left before the queue is clear.";
+    }
+
     private void toast(String message) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+    }
+
+    private final class StyledLinearLayout extends LinearLayout {
+        private StyledLinearLayout(Activity context) {
+            super(context);
+        }
+
+        @Override
+        public void addView(View child) {
+            styleLooseChild(child);
+            super.addView(child);
+        }
+
+        @Override
+        public void addView(View child, int index) {
+            styleLooseChild(child);
+            super.addView(child, index);
+        }
+
+        @Override
+        public void addView(View child, ViewGroup.LayoutParams params) {
+            styleLooseChild(child);
+            super.addView(child, params);
+        }
+    }
+
+    private void styleLooseChild(View child) {
+        if (child instanceof EditText) {
+            EditText editText = (EditText) child;
+            editText.setTextColor(COLOR_TEXT);
+            editText.setHintTextColor(COLOR_MUTED);
+            editText.setTextSize(15);
+            editText.setPadding(dp(14), 0, dp(14), 0);
+            editText.setMinHeight(dp(54));
+            editText.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, 12));
+            ensureBlockMargins(editText, dp(4), dp(8));
+            return;
+        }
+        if (child instanceof Spinner) {
+            child.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, 12));
+            child.setPadding(dp(10), 0, dp(10), 0);
+            child.setMinimumHeight(dp(54));
+            ensureBlockMargins(child, dp(4), dp(8));
+            return;
+        }
+        if (child instanceof CheckBox) {
+            CheckBox checkBox = (CheckBox) child;
+            checkBox.setTextColor(COLOR_TEXT);
+            checkBox.setTextSize(15);
+            checkBox.setButtonTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+            ensureBlockMargins(checkBox, dp(4), dp(8));
+        }
+    }
+
+    private void ensureBlockMargins(View view, int top, int bottom) {
+        ViewGroup.LayoutParams rawParams = view.getLayoutParams();
+        LinearLayout.LayoutParams params;
+        if (rawParams instanceof LinearLayout.LayoutParams) {
+            params = (LinearLayout.LayoutParams) rawParams;
+        } else {
+            params = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+        }
+        params.setMargins(params.leftMargin, top, params.rightMargin, bottom);
+        view.setLayoutParams(params);
     }
 
     private interface ThrowingRunnable {
