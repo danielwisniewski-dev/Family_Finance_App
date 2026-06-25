@@ -2,7 +2,7 @@
 
 This workspace starts the staged MVP from the attached build plan.
 
-The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, Milestone 12 MVP usability hardening/data integrity, and Milestone 13 MVP release-candidate stabilization.
+The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, Milestone 12 MVP usability hardening/data integrity, Milestone 13 MVP release-candidate stabilization, and Milestone 14 Android visual polish/local gamification.
 
 Milestone 1 built deterministic household budget logic that can answer safe-to-spend questions without Plaid or AI. It includes:
 
@@ -131,6 +131,17 @@ Milestone 13 stabilizes the local MVP release candidate:
 - Preserves merchant-rule history through archive/reactivation instead of destructive removal
 - Confirms local demo seed, backend startup, Android navigation, diagnostics, transaction review, and safe-to-spend smoke paths
 - Documents fresh setup, demo seed, emulator URL, Sandbox setup, smoke checks, and MVP limitations
+
+Milestone 14 improves the Android demo experience without changing backend financial logic:
+
+- Warmer Android visual system with styled cards, buttons, inputs, loading states, warnings, and success states
+- Dashboard hierarchy focused first on cash after upcoming bills, review progress, and clear next actions
+- Monthly budget category cards with simpler remaining/spent/planned summaries
+- Transaction review rows with clearer status wording and progress toward clearing the queue
+- Safe-to-spend request/result screens with calmer wording while preserving backend-calculated results and the required phrase
+- Local-only motivational cues for budget check-in streaks, review queue progress, and queue-cleared celebration
+
+Milestone 14 gamification is read-only/local Android UI state. It does not mutate backend budget, account, transaction, category, notification, Plaid, or safe-to-spend data.
 
 Environment variables:
 
@@ -401,9 +412,10 @@ With the demo API running and the Pixel 8 emulator open, verify:
 
 - Login succeeds with local-only Daniel or Kara demo credentials.
 - Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
-- Monthly budget shows backend groups/categories and supports budget month switching/copy-forward, category add/edit/archive, and funding edits.
+- Dashboard also shows local-only budget check-in/review progress cues without changing backend financial state.
+- Monthly budget shows polished backend groups/categories and supports budget month switching/copy-forward, category add/edit/archive, and funding edits.
 - Safe to spend returns a backend-calculated result and required phrase.
-- Uncategorized review shows empty or non-empty state from backend data.
+- Uncategorized review shows empty or non-empty state from backend data, plus local-only queue progress/cleared messaging.
 - Tapping a transaction opens transaction detail when demo transactions exist.
 - Transaction detail can assign a category, split a transaction, toggle reviewed/unreviewed, create a merchant rule, and ignore/unignore a transaction.
 - Accounts / settings shows account inclusion, Plaid Sandbox actions, account settings, and diagnostics/integrity checks.
@@ -415,11 +427,13 @@ Real in current MVP:
 - Backend summary, account, transaction, review queue, transaction detail, safe-to-spend, category assignment, review, and ignore data
 - Deterministic backend financial calculations
 - Local mock/demo account and transaction data
+- Local-only Android motivational progress/streak display state
 
 Known MVP limitations:
 
 - Login/household access is a private local access layer, not production auth
 - Local token storage is suitable for this local/Sandbox MVP only, not production-grade credential storage
+- Android motivational streak/progress cues are local to the device/app data and are not a backend accountability record
 - Local/private MVP only; there is no hosted deployment
 - Plaid is Sandbox-only and requires local Plaid env vars for live linking
 - Production Plaid is not supported
