@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import calendar
-from contextlib import contextmanager
+import re
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -68,8 +69,10 @@ class BudgetRepository:
     def initialize(self) -> None:
         schema_path = Path(__file__).with_name("schema.sql")
         with self.connect() as connection:
+            # Legacy users tables predate the username index in schema.sql.
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").fetchone():
+                ensure_column(connection, "users", "username", "TEXT")
             connection.executescript(schema_path.read_text(encoding="utf-8"))
-            ensure_column(connection, "users", "username", "TEXT")
             ensure_column(connection, "users", "password_hash", "TEXT")
             ensure_column(connection, "households", "active_budget_month_id", "INTEGER")
             ensure_column(connection, "budget_groups", "archived", "INTEGER NOT NULL DEFAULT 0")
@@ -132,7 +135,8 @@ class BudgetRepository:
     def authenticate_local_user(self, login: str, password: str) -> dict[str, Any] | None:
         cleaned = require_login_value(login, "login")
         with self.connect() as connection:
-            row = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
                 """
                 SELECT
                     u.*,
@@ -142,8 +146,11 @@ class BudgetRepository:
                 WHERE lower(u.username) = ? OR lower(u.email) = ?
                 """,
                 (cleaned, cleaned),
-            ).fetchone()
-            if row is None or not verify_password(password, row["password_hash"]):
+            ).fetchall()
+            if len(rows) != 1:
+                return None
+            row = rows[0]
+            if not verify_password(password, row["password_hash"]):
                 return None
             token = new_session_token()
             connection.execute(
@@ -268,21 +275,15 @@ class BudgetRepository:
                     (household_id,),
                 ).fetchone()["count"]
             )
-            archived_assignment_count = int(
-                connection.execute(
-                    """
-                    SELECT COUNT(*) AS count
-                    FROM transaction_category_assignments assn
-                    JOIN budget_categories c ON c.id = assn.budget_category_id
-                    JOIN budget_groups g ON g.id = c.budget_group_id
-                    JOIN budget_months b ON b.id = g.budget_month_id
-                    WHERE b.household_id = ?
-                        AND assn.active = 1
-                        AND (c.archived = 1 OR g.archived = 1)
-                    """,
-                    (household_id,),
-                ).fetchone()["count"]
-            )
+            non_outflow_assignment_count = int(connection.execute(
+                """SELECT COUNT(DISTINCT t.id) AS count
+                   FROM account_transactions t
+                   JOIN cash_accounts a ON a.id = t.cash_account_id
+                   JOIN budget_months b ON b.id = a.budget_month_id
+                   JOIN transaction_category_assignments assn ON assn.transaction_id = t.id
+                   WHERE b.household_id = ? AND t.amount_cents >= 0 AND t.ignored = 0 AND assn.active = 1""",
+                (household_id,),
+            ).fetchone()["count"])
             archived_rule_count = int(
                 connection.execute(
                     """
@@ -307,8 +308,8 @@ class BudgetRepository:
         ))
         checks.append(diagnostic_check("split_totals_match", split_mismatch_count == 0, "Transaction splits total correctly.", "One or more transaction splits do not total the transaction amount.", split_mismatch_count))
         checks.append(diagnostic_check("ignored_transactions_not_counted", ignored_assignment_count == 0, "Ignored transactions have no active budget assignments.", "Ignored transactions still have active budget assignments.", ignored_assignment_count))
-        archived_misuse_count = archived_assignment_count + archived_rule_count
-        checks.append(diagnostic_check("archived_categories_unused", archived_misuse_count == 0, "Archived categories are not used by active assignments or rules.", "Archived categories are still used by active assignments or rules.", archived_misuse_count))
+        checks.append(diagnostic_check("only_outflows_assigned", non_outflow_assignment_count == 0, "Spending categories contain only outgoing transactions.", "Review incoming or zero-value transactions with legacy spending assignments; budget totals may be overstated.", non_outflow_assignment_count))
+        checks.append(diagnostic_check("archived_categories_unused", archived_rule_count == 0, "No active merchant rules target archived categories; historical assignments are preserved.", "Active merchant rules still target archived categories.", archived_rule_count))
         checks.append(self._safe_to_spend_diagnostic(active_budget_month_id))
         return {
             "backend_reachable": True,
@@ -351,7 +352,14 @@ class BudgetRepository:
         cleaned_users = [clean_setup_user(user) for user in users]
         if not cleaned_users:
             raise ValueError("At least one local user is required")
+        login_identifiers: set[str] = set()
+        for user in cleaned_users:
+            identifiers = {value for value in (user["username"], user["email"]) if value}
+            if login_identifiers.intersection(identifiers):
+                raise ValueError("Each username and email must identify only one user")
+            login_identifiers.update(identifiers)
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             household_count = int(connection.execute("SELECT COUNT(*) AS count FROM households").fetchone()["count"])
             user_count = int(connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"])
             if household_count > 0 or user_count > 0:
@@ -468,6 +476,7 @@ class BudgetRepository:
             raise PermissionError("Current password is required")
         validate_local_password(new_password, "new_password")
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             if row is None:
                 raise LookupError("User not found")
@@ -477,6 +486,7 @@ class BudgetRepository:
                 "UPDATE users SET password_hash = ? WHERE id = ?",
                 (hash_password(new_password), user_id),
             )
+            connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
             self._insert_notification_event(
                 connection,
                 household_id=int(row["household_id"]),
@@ -583,7 +593,7 @@ class BudgetRepository:
         copy_from_budget_month_id: int | None = None,
     ) -> int:
         month = validate_budget_month_value(month)
-        validate_nonnegative_cents(included_account_balance_cents, "included_account_balance_cents")
+        validate_integer_cents(included_account_balance_cents, "included_account_balance_cents")
         validate_nonnegative_cents(low_cushion_daily_cents, "low_cushion_daily_cents")
         with self.connect() as connection:
             if copy_from_budget_month_id is not None:
@@ -673,7 +683,7 @@ class BudgetRepository:
             assignments.append("month = ?")
             values.append(month)
         if included_account_balance_cents is not None:
-            validate_nonnegative_cents(included_account_balance_cents, "included_account_balance_cents")
+            validate_integer_cents(included_account_balance_cents, "included_account_balance_cents")
             assignments.append("included_account_balance_cents = ?")
             values.append(included_account_balance_cents)
         if low_cushion_daily_cents is not None:
@@ -822,6 +832,7 @@ class BudgetRepository:
         return detail
 
     def update_account_balance(self, budget_month_id: int, included_account_balance_cents: int) -> None:
+        validate_integer_cents(included_account_balance_cents, "included_account_balance_cents")
         with self.connect() as connection:
             connection.execute(
                 "UPDATE budget_months SET included_account_balance_cents = ? WHERE id = ?",
@@ -839,7 +850,7 @@ class BudgetRepository:
     ) -> int:
         name = clean_required_text(name, "name")
         validate_account_type(account_type)
-        validate_nonnegative_cents(balance_cents, "balance_cents")
+        validate_integer_cents(balance_cents, "balance_cents")
         with self.connect() as connection:
             return insert_and_return_id(
                 connection,
@@ -872,6 +883,7 @@ class BudgetRepository:
         assignments: list[str] = []
         values: list[Any] = []
         if balance_cents is not None:
+            validate_integer_cents(balance_cents, "balance_cents")
             assignments.append("balance_cents = ?")
             values.append(balance_cents)
         if included_in_cash_reality is not None:
@@ -1159,6 +1171,11 @@ class BudgetRepository:
         current_balance_cents: int | None = None,
     ) -> int:
         validate_account_type(account_type)
+        validate_integer_cents(balance_cents, "balance_cents")
+        if available_balance_cents is not None:
+            validate_integer_cents(available_balance_cents, "available_balance_cents")
+        if current_balance_cents is not None:
+            validate_integer_cents(current_balance_cents, "current_balance_cents")
         with self.connect() as connection:
             budget_month = connection.execute(
                 "SELECT household_id FROM budget_months WHERE id = ?",
@@ -1177,13 +1194,15 @@ class BudgetRepository:
 
             existing = connection.execute(
                 """
-                SELECT id
+                SELECT id, budget_month_id
                 FROM cash_accounts
                 WHERE plaid_item_id = ? AND plaid_account_id = ?
                 """,
                 (plaid_item_id, plaid_account_id),
             ).fetchone()
             if existing is not None:
+                if int(existing["budget_month_id"]) != budget_month_id:
+                    raise ValueError("Connected account belongs to another budget month; account history cannot be moved")
                 connection.execute(
                     """
                     UPDATE cash_accounts
@@ -1196,8 +1215,7 @@ class BudgetRepository:
                         official_name = ?,
                         balance_cents = ?,
                         available_balance_cents = ?,
-                        current_balance_cents = ?,
-                        included_in_cash_reality = ?
+                        current_balance_cents = ?
                     WHERE id = ?
                     """,
                     (
@@ -1210,7 +1228,6 @@ class BudgetRepository:
                         balance_cents,
                         available_balance_cents,
                         current_balance_cents,
-                        1 if included_in_cash_reality else 0,
                         existing["id"],
                     ),
                 )
@@ -1259,6 +1276,11 @@ class BudgetRepository:
         available_balance_cents: int | None = None,
         current_balance_cents: int | None = None,
     ) -> int:
+        validate_integer_cents(balance_cents, "balance_cents")
+        if available_balance_cents is not None:
+            validate_integer_cents(available_balance_cents, "available_balance_cents")
+        if current_balance_cents is not None:
+            validate_integer_cents(current_balance_cents, "current_balance_cents")
         with self.connect() as connection:
             row = connection.execute(
                 """
@@ -1312,18 +1334,31 @@ class BudgetRepository:
         merchant_name: str | None = None,
         pending: bool = False,
         category_hint: str | None = None,
+        pending_transaction_id: str | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> TransactionUpsertResult:
-        with self.connect() as connection:
+        validate_integer_cents(amount_cents, "amount_cents")
+        with (nullcontext(_connection) if _connection is not None else self.connect()) as connection:
             existing = connection.execute(
-                "SELECT id FROM account_transactions WHERE plaid_transaction_id = ?",
+                "SELECT * FROM account_transactions WHERE plaid_transaction_id = ?",
                 (plaid_transaction_id,),
             ).fetchone()
+            if existing is None and pending_transaction_id and not pending:
+                existing = connection.execute(
+                    "SELECT * FROM account_transactions WHERE plaid_transaction_id = ? AND pending = 1",
+                    (pending_transaction_id,),
+                ).fetchone()
             if existing is not None:
+                if existing["cash_account_id"] != cash_account_id:
+                    raise ValueError("Imported transaction cannot move to another account")
+                transaction_id = int(existing["id"])
+                assignments = self._active_assignments(connection, transaction_id)
                 connection.execute(
                     """
                     UPDATE account_transactions
                     SET
                         cash_account_id = ?,
+                        plaid_transaction_id = ?,
                         amount_cents = ?,
                         occurred_on = ?,
                         name = ?,
@@ -1335,6 +1370,7 @@ class BudgetRepository:
                     """,
                     (
                         cash_account_id,
+                        plaid_transaction_id,
                         amount_cents,
                         occurred_on.isoformat(),
                         name,
@@ -1344,8 +1380,31 @@ class BudgetRepository:
                         existing["id"],
                     ),
                 )
-                self._apply_best_rule_if_allowed(connection, int(existing["id"]))
-                return TransactionUpsertResult(transaction_id=int(existing["id"]), created=False)
+                if existing["plaid_transaction_id"] != plaid_transaction_id:
+                    self._record_transaction_event(
+                        connection, transaction_id=transaction_id, event_type="pending_posted",
+                        metadata={"pending_transaction_id": existing["plaid_transaction_id"],
+                                  "plaid_transaction_id": plaid_transaction_id},
+                    )
+                if existing["amount_cents"] != amount_cents:
+                    self._supersede_active_assignments(connection, transaction_id)
+                    # A full single-category assignment follows the bank amount. Split
+                    # allocation needs a person's decision; retain its rows as history.
+                    if len(assignments) == 1 and assignments[0]["source"] != "split" and amount_cents < 0:
+                        assignment = assignments[0]
+                        self._insert_assignment(
+                            connection, transaction_id=transaction_id,
+                            category_id=int(assignment["budget_category_id"]),
+                            amount_cents=-amount_cents, source=assignment["source"],
+                        )
+                    connection.execute("UPDATE account_transactions SET reviewed = 0 WHERE id = ?", (transaction_id,))
+                    self._record_transaction_event(
+                        connection, transaction_id=transaction_id, event_type="imported_amount_changed",
+                        amount_cents=amount_cents,
+                        metadata={"previous_amount_cents": existing["amount_cents"],
+                                  "split_needs_review": any(row["source"] == "split" for row in assignments)},
+                    )
+                return TransactionUpsertResult(transaction_id=transaction_id, created=False)
             transaction_id = insert_and_return_id(
                 connection,
                 """
@@ -1382,15 +1441,21 @@ class BudgetRepository:
             self._apply_best_rule_if_allowed(connection, transaction_id)
             return TransactionUpsertResult(transaction_id=transaction_id, created=True)
 
-    def mark_plaid_transaction_removed(self, plaid_transaction_id: str) -> bool:
-        with self.connect() as connection:
+    def mark_plaid_transaction_removed(
+        self, plaid_transaction_id: str, *, plaid_item_id: int | None = None,
+        _connection: sqlite3.Connection | None = None,
+    ) -> bool:
+        with (nullcontext(_connection) if _connection is not None else self.connect()) as connection:
             row = connection.execute(
-                "SELECT * FROM account_transactions WHERE plaid_transaction_id = ?",
-                (plaid_transaction_id,),
+                """SELECT t.* FROM account_transactions t
+                   JOIN cash_accounts a ON a.id = t.cash_account_id
+                   WHERE t.plaid_transaction_id = ? AND (? IS NULL OR a.plaid_item_id = ?)""",
+                (plaid_transaction_id, plaid_item_id, plaid_item_id),
             ).fetchone()
             if row is None:
                 return False
             already_removed = bool(row["ignored"]) and row["ignored_reason"] == "Removed by Plaid sync"
+            self._supersede_active_assignments(connection, int(row["id"]))
             connection.execute(
                 """
                 UPDATE account_transactions
@@ -1410,6 +1475,44 @@ class BudgetRepository:
                     metadata={"plaid_transaction_id": plaid_transaction_id},
                 )
             return True
+
+    def apply_plaid_transaction_sync(
+        self, *, plaid_item_id: int, expected_cursor: str | None, next_cursor: str | None,
+        transactions: Iterable[dict[str, Any]], removed_transaction_ids: Iterable[str],
+    ) -> dict[str, int]:
+        counts = {"inserted_transactions": 0, "updated_transactions": 0,
+                  "removed_transactions": 0, "skipped_transactions": 0}
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            item = connection.execute("SELECT sync_cursor FROM plaid_items WHERE id = ?", (plaid_item_id,)).fetchone()
+            if item is None:
+                raise LookupError("Plaid item not found")
+            if item["sync_cursor"] != expected_cursor:
+                raise ValueError("Another transaction sync finished first; retry the sync")
+            for transaction in transactions:
+                values = dict(transaction)
+                account = connection.execute(
+                    "SELECT id FROM cash_accounts WHERE plaid_item_id = ? AND plaid_account_id = ?",
+                    (plaid_item_id, values.pop("plaid_account_id")),
+                ).fetchone()
+                if account is None:
+                    counts["skipped_transactions"] += 1
+                    continue
+                result = self.upsert_plaid_transaction(
+                    cash_account_id=int(account["id"]), _connection=connection, **values,
+                )
+                counts["inserted_transactions" if result.created else "updated_transactions"] += 1
+            for transaction_id in removed_transaction_ids:
+                removed = self.mark_plaid_transaction_removed(
+                    transaction_id, plaid_item_id=plaid_item_id, _connection=connection,
+                )
+                counts["removed_transactions" if removed else "skipped_transactions"] += 1
+            connection.execute(
+                """UPDATE plaid_items SET sync_cursor = ?, status = 'connected',
+                   last_error_code = NULL, last_error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""", (next_cursor, plaid_item_id),
+            )
+        return counts
 
     def list_transactions(self, cash_account_id: int) -> list[TransactionLine]:
         with self.connect() as connection:
@@ -1687,7 +1790,9 @@ class BudgetRepository:
         with self.connect() as connection:
             transaction = self._require_transaction(connection, transaction_id)
             expected_total = budget_amount_cents(transaction["amount_cents"])
-            actual_total = sum(int(row["amount_cents"]) for row in split_rows)
+            for row in split_rows:
+                validate_positive_cents(row["amount_cents"], "amount_cents")
+            actual_total = sum(row["amount_cents"] for row in split_rows)
             if actual_total != expected_total:
                 raise ValueError("Split amounts must equal the transaction amount")
             self._supersede_active_assignments(connection, transaction_id)
@@ -2523,6 +2628,8 @@ class BudgetRepository:
         validate_nonnegative_cents(planned_cents, "planned_cents")
         with self.connect() as connection:
             context = self._notification_context_for_budget_group(connection, budget_group_id)
+            if context["group_archived"]:
+                raise ValueError("Cannot add a category to an archived budget group")
             category_id = insert_and_return_id(
                 connection,
                 """
@@ -2585,6 +2692,10 @@ class BudgetRepository:
                 target = self._notification_context_for_budget_group(connection, budget_group_id)
                 if target["budget_month_id"] != before["budget_month_id"]:
                     raise ValueError("Category can only move within the same budget month")
+                if target["group_archived"]:
+                    raise ValueError("Cannot move a category to an archived budget group")
+            elif archived is False and before["group_archived"]:
+                raise ValueError("Restore the budget group before restoring its categories")
             connection.execute(
                 f"UPDATE budget_categories SET {', '.join(assignments)} WHERE id = ?",
                 values,
@@ -2634,7 +2745,7 @@ class BudgetRepository:
         validate_positive_cents(amount_cents, "amount_cents")
         with self.connect() as connection:
             context = self._notification_context_for_category(connection, category_id)
-            if bool(context["archived"]):
+            if bool(context["archived"]) or bool(context["group_archived"]):
                 raise ValueError("Cannot record spending against an archived category")
             return insert_and_return_id(
                 connection,
@@ -2842,6 +2953,7 @@ class BudgetRepository:
             expected_bills=snapshot["expected_bills"],
             paydays=snapshot["paydays"],
             today=today,
+            low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
         )
 
     def safe_to_spend(
@@ -2920,7 +3032,7 @@ class BudgetRepository:
     ) -> dict[str, Any]:
         row = connection.execute(
             """
-            SELECT b.household_id, b.id AS budget_month_id, g.name AS group_name
+            SELECT b.household_id, b.id AS budget_month_id, g.name AS group_name, g.archived AS group_archived
             FROM budget_groups g
             JOIN budget_months b ON b.id = g.budget_month_id
             WHERE g.id = ?
@@ -3017,7 +3129,8 @@ class BudgetRepository:
                 b.id AS budget_month_id,
                 c.name AS category_name,
                 c.planned_cents,
-                c.archived
+                c.archived,
+                g.archived AS group_archived
             FROM budget_categories c
             JOIN budget_groups g ON g.id = c.budget_group_id
             JOIN budget_months b ON b.id = g.budget_month_id
@@ -3148,7 +3261,7 @@ class BudgetRepository:
                 INSERT INTO income_plan(budget_month_id, name, kind, planned_cents, received_cents)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (target_budget_month_id, row["name"], row["kind"], row["planned_cents"], row["received_cents"]),
+                (target_budget_month_id, row["name"], row["kind"], row["planned_cents"], 0),
             )
 
         group_id_map: dict[int, int] = {}
@@ -3301,7 +3414,7 @@ class BudgetRepository:
             JOIN budget_groups g ON g.id = c.budget_group_id
             JOIN cash_accounts a ON a.budget_month_id = g.budget_month_id
             JOIN account_transactions t ON t.cash_account_id = a.id
-            WHERE t.id = ? AND c.id = ? AND c.archived = 0
+            WHERE t.id = ? AND c.id = ? AND c.archived = 0 AND g.archived = 0
             """,
             (transaction_id, category_id),
         ).fetchone()
@@ -3320,7 +3433,7 @@ class BudgetRepository:
             FROM budget_categories c
             JOIN budget_groups g ON g.id = c.budget_group_id
             JOIN budget_months b ON b.id = g.budget_month_id
-            WHERE b.household_id = ? AND c.id = ? AND c.archived = 0
+            WHERE b.household_id = ? AND c.id = ? AND c.archived = 0 AND g.archived = 0
             """,
             (household_id, category_id),
         ).fetchone()
@@ -3410,6 +3523,8 @@ class BudgetRepository:
         connection: sqlite3.Connection,
         transaction: sqlite3.Row,
     ) -> sqlite3.Row | None:
+        if transaction["amount_cents"] >= 0:
+            return None
         haystack = self._transaction_match_text(transaction)
         if not haystack:
             return None
@@ -3425,6 +3540,7 @@ class BudgetRepository:
                 AND r.household_id = b.household_id
                 AND r.active = 1
                 AND c.archived = 0
+                AND g.archived = 0
             ORDER BY r.priority, r.id
             """,
             (transaction["cash_account_id"],),
@@ -3463,7 +3579,7 @@ class BudgetRepository:
 
     def _apply_best_rule_if_allowed(self, connection: sqlite3.Connection, transaction_id: int) -> None:
         transaction = self._require_transaction(connection, transaction_id)
-        if transaction["ignored"]:
+        if transaction["ignored"] or transaction["reviewed"] or transaction["amount_cents"] >= 0:
             return
         active_assignments = connection.execute(
             """
@@ -3724,7 +3840,10 @@ def safe_household_from_household_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def budget_amount_cents(transaction_amount_cents: int) -> int:
-    return abs(transaction_amount_cents)
+    validate_integer_cents(transaction_amount_cents, "amount_cents")
+    if transaction_amount_cents >= 0:
+        raise ValueError("Only outgoing transactions can be assigned to spending categories")
+    return -transaction_amount_cents
 
 
 def json_dumps(value: dict[str, object]) -> str:
@@ -3740,6 +3859,8 @@ def same_day_in_month(source_iso_date: str, target_month: str) -> str:
 
 def validate_budget_month_value(month: str) -> str:
     cleaned = clean_required_text(month, "month")
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}", cleaned) is None:
+        raise ValueError("month must use YYYY-MM")
     try:
         year, month_number = (int(part) for part in cleaned.split("-", maxsplit=1))
         date(year, month_number, 1)
@@ -3749,13 +3870,20 @@ def validate_budget_month_value(month: str) -> str:
 
 
 def validate_nonnegative_cents(value: int, field_name: str) -> None:
-    if int(value) < 0:
+    validate_integer_cents(value, field_name)
+    if value < 0:
         raise ValueError(f"{field_name} must be zero or more")
 
 
 def validate_positive_cents(value: int, field_name: str) -> None:
-    if int(value) <= 0:
+    validate_integer_cents(value, field_name)
+    if value <= 0:
         raise ValueError(f"{field_name} must be positive")
+
+
+def validate_integer_cents(value: int, field_name: str) -> None:
+    if type(value) is not int or not -(2**63) < value < 2**63:
+        raise ValueError(f"{field_name} must be whole cents within the supported range")
 
 
 def validate_income_kind(kind: str) -> None:
@@ -3866,7 +3994,9 @@ def merchant_rule_from_row(row: sqlite3.Row) -> MerchantRule:
 
 def summary_to_dict(summary: BudgetSummary) -> dict[str, Any]:
     payload = asdict(summary)
-    payload["next_payday"] = summary.next_payday.isoformat()
+    payload["next_payday"] = summary.next_payday.isoformat() if summary.next_payday is not None else None
+    payload["as_of"] = summary.as_of.isoformat() if summary.as_of is not None else None
+    payload["forecast_available"] = summary.forecast_available
     payload["categories"] = [asdict(category) | {"remaining_cents": category.remaining_cents} for category in summary.categories]
     total_spent_cents = sum(category.spent_cents for category in summary.categories)
     overspent_categories = [
@@ -3898,8 +4028,10 @@ def plaid_item_to_public_dict(item: PlaidItemLine) -> dict[str, Any]:
         "institution_id": item.institution_id,
         "institution_name": item.institution_name,
         "status": item.status,
-        "last_error_code": item.last_error_code,
-        "last_error_message": item.last_error_message,
+        # Older databases may contain unredacted provider error text.
+        "last_error_code": "PLAID_SYNC_FAILED" if item.last_error_code or item.last_error_message else None,
+        "last_error_message": "Plaid sync failed. Retry or reconnect this Sandbox bank connection."
+        if item.last_error_code or item.last_error_message else None,
     }
 
 

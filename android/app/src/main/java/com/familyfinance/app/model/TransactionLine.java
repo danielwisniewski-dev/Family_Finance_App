@@ -44,7 +44,7 @@ public final class TransactionLine {
     public static TransactionLine fromJson(JSONObject json) {
         return new TransactionLine(
                 json.optInt("id"),
-                json.optInt("amount_cents"),
+                JsonMoney.cents(json, "amount_cents"),
                 json.optString("occurred_on", ""),
                 json.optString("name", "Transaction"),
                 json.optString("merchant_name", ""),

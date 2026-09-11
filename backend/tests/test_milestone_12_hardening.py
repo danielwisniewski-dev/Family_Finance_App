@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from backend.app.api import ApiHandler, build_server
+from backend.app.api import build_server
 from backend.app.plaid import (
     InMemoryPlaidTokenStore,
     PlaidConnectionService,
@@ -112,13 +112,13 @@ class Milestone12HardeningApiTests(unittest.TestCase):
 
     def test_diagnostics_catch_split_total_mismatch(self) -> None:
         category_id = self.create_budget_with_category()
-        account_id = ApiHandler.repository.add_cash_account(
+        account_id = self.server.RequestHandlerClass.repository.add_cash_account(
             budget_month_id=1,
             name="Main Checking",
             account_type="checking",
             balance_cents=100_000,
         )
-        transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+        transaction_id = self.server.RequestHandlerClass.repository.upsert_plaid_transaction(
             cash_account_id=account_id,
             plaid_transaction_id="bad-split",
             amount_cents=-10_00,
@@ -126,7 +126,7 @@ class Milestone12HardeningApiTests(unittest.TestCase):
             name="Bad Split",
             merchant_name="Bad Split",
         ).transaction_id
-        with ApiHandler.repository.connect() as connection:
+        with self.server.RequestHandlerClass.repository.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO transaction_category_assignments(
@@ -149,13 +149,13 @@ class Milestone12HardeningApiTests(unittest.TestCase):
 
     def test_diagnostics_catch_archived_category_rule_misuse(self) -> None:
         category_id = self.create_budget_with_category()
-        ApiHandler.repository.create_merchant_rule(
+        self.server.RequestHandlerClass.repository.create_merchant_rule(
             household_id=1,
             merchant_match_text="corner store",
             category_id=category_id,
             actor_user_id=1,
         )
-        ApiHandler.repository.update_category(category_id=category_id, archived=True, actor_user_id=1)
+        self.server.RequestHandlerClass.repository.update_category(category_id=category_id, archived=True, actor_user_id=1)
 
         diagnostics = self.get("/app/diagnostics")
         archived_check = self.find_check(diagnostics, "archived_categories_unused")
@@ -166,8 +166,8 @@ class Milestone12HardeningApiTests(unittest.TestCase):
     def test_plaid_sandbox_errors_are_sanitized(self) -> None:
         self.initialize_household()
         self.login()
-        ApiHandler.plaid_service = PlaidConnectionService(
-            repository=ApiHandler.repository,
+        self.server.RequestHandlerClass.plaid_service = PlaidConnectionService(
+            repository=self.server.RequestHandlerClass.repository,
             client=FailingPlaidClient(),
             token_store=InMemoryPlaidTokenStore(),
         )

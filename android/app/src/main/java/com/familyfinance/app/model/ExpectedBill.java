@@ -21,7 +21,7 @@ public final class ExpectedBill {
         return new ExpectedBill(
                 json.optInt("id"),
                 json.optString("name"),
-                json.optInt("amount_cents"),
+                JsonMoney.cents(json, "amount_cents"),
                 json.optString("due_on"),
                 json.optBoolean("paid")
         );

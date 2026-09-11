@@ -121,6 +121,8 @@ class SetupSettingsApiTests(unittest.TestCase):
             {"current_password": "daniel-secret", "new_password": "new-daniel-secret"},
             token=token,
         )
+        self.get("/households/1/notifications", token=token, expect_status=401)
+        token = str(self.login(password="new-daniel-secret")["token"])
         events = self.get("/households/1/notifications", token=token)["notifications"]
         serialized = json.dumps(events)
 
@@ -217,9 +219,7 @@ class SetupSettingsApiTests(unittest.TestCase):
         return self.post("/auth/login", {"username": "daniel", "password": password})
 
     def repository(self):
-        from backend.app.api import ApiHandler
-
-        return ApiHandler.repository
+        return self.server.RequestHandlerClass.repository
 
     def get(self, path: str, *, token: str | None = None, expect_status: int = 200) -> dict[str, object]:
         request = Request(f"{self.base_url}{path}", headers=self.auth_headers(token), method="GET")

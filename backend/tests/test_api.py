@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from backend.app.api import ApiHandler, build_server
+from backend.app.api import build_server
 
 
 class ApiTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class ApiTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_safe_to_spend_endpoint_returns_required_fields(self) -> None:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             "API Household",
             spouses=[
                 {"name": "A", "username": "api-a", "email": "api-a@example.test", "password": "api-a-password"},
@@ -102,7 +102,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["days_until_payday"], 7)
 
     def test_transaction_review_endpoints_return_sanitized_payloads(self) -> None:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             "API Transaction Household",
             spouses=[
                 {
@@ -137,13 +137,13 @@ class ApiTests(unittest.TestCase):
                 "planned_cents": 50_000,
             },
         )
-        account_id = ApiHandler.repository.add_cash_account(
+        account_id = self.server.RequestHandlerClass.repository.add_cash_account(
             budget_month_id=budget_month["id"],
             name="Main Checking",
             account_type="checking",
             balance_cents=100_000,
         )
-        transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+        transaction_id = self.server.RequestHandlerClass.repository.upsert_plaid_transaction(
             cash_account_id=account_id,
             plaid_transaction_id="api-txn-1",
             amount_cents=-2_500,
@@ -181,7 +181,7 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("access_token_ref", serialized_detail)
 
     def test_notification_routes_list_count_and_mark_read(self) -> None:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             "API Notification Household",
             spouses=[
                 {"name": "A", "username": "api-note-a", "email": "api-note-a@example.test", "password": "api-note-a-password"},
@@ -189,7 +189,7 @@ class ApiTests(unittest.TestCase):
             ],
         )
         self.login("api-note-a", "api-note-a-password")
-        with ApiHandler.repository.connect() as connection:
+        with self.server.RequestHandlerClass.repository.connect() as connection:
             user_id = int(
                 connection.execute(
                     "SELECT id FROM users WHERE household_id = ? ORDER BY id LIMIT 1",
@@ -219,13 +219,13 @@ class ApiTests(unittest.TestCase):
                 "planned_cents": 50_000,
             },
         )
-        account_id = ApiHandler.repository.add_cash_account(
+        account_id = self.server.RequestHandlerClass.repository.add_cash_account(
             budget_month_id=budget_month["id"],
             name="Main Checking",
             account_type="checking",
             balance_cents=100_000,
         )
-        transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+        transaction_id = self.server.RequestHandlerClass.repository.upsert_plaid_transaction(
             cash_account_id=account_id,
             plaid_transaction_id="api-notification-txn",
             amount_cents=-2_500,

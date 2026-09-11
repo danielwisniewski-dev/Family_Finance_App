@@ -2,6 +2,8 @@ package com.familyfinance.app.api;
 
 import org.json.JSONObject;
 
+import com.familyfinance.app.state.ConnectionSettings;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -20,7 +22,7 @@ public final class JsonHttpClient {
     }
 
     public JsonHttpClient(String baseUrl, String bearerToken) {
-        this.baseUrl = trimTrailingSlash(baseUrl);
+        this.baseUrl = ConnectionSettings.normalizeBaseUrl(baseUrl);
         this.bearerToken = bearerToken == null ? "" : bearerToken.trim();
     }
 
@@ -45,6 +47,7 @@ public final class JsonHttpClient {
         try {
             URL url = new URL(baseUrl + path);
             connection = (HttpURLConnection) url.openConnection();
+            connection.setInstanceFollowRedirects(false);
             connection.setRequestMethod(method);
             connection.setConnectTimeout(5_000);
             connection.setReadTimeout(5_000);
@@ -63,8 +66,27 @@ public final class JsonHttpClient {
             }
 
             int status = connection.getResponseCode();
-            String body = readBody(status >= 400 ? connection.getErrorStream() : connection.getInputStream());
-            JSONObject json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+            if (status >= 300 && status < 400) {
+                throw new ApiException("Backend redirected the request. Update the backend URL in settings.", "redirect_not_followed", status);
+            }
+            String body;
+            try {
+                body = readBody(status >= 400 ? connection.getErrorStream() : connection.getInputStream());
+            } catch (IOException exception) {
+                if (status >= 400) {
+                    throw ApiException.fromApiError(status, null, path);
+                }
+                throw new ApiException("Backend response could not be read or exceeds the supported size.", "invalid_response", status);
+            }
+            JSONObject json;
+            try {
+                json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+            } catch (Exception exception) {
+                if (status >= 400) {
+                    throw ApiException.fromApiError(status, null, path);
+                }
+                throw new ApiException("Backend returned an invalid response. Check the backend URL.", "invalid_response", status);
+            }
             if (status >= 400) {
                 throw ApiException.fromApiError(status, json, path);
             }
@@ -86,21 +108,16 @@ public final class JsonHttpClient {
         }
         StringBuilder builder = new StringBuilder();
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                builder.append(line);
+            char[] buffer = new char[4096];
+            int count;
+            while ((count = reader.read(buffer)) != -1) {
+                if (builder.length() + count > 2 * 1024 * 1024) {
+                    throw new IOException("Backend response exceeds the supported size.");
+                }
+                builder.append(buffer, 0, count);
             }
         }
         return builder.toString();
     }
 
-    private static String trimTrailingSlash(String value) {
-        if (value == null || value.isEmpty()) {
-            return "http://10.0.2.2:8080";
-        }
-        while (value.endsWith("/")) {
-            value = value.substring(0, value.length() - 1);
-        }
-        return value;
-    }
 }

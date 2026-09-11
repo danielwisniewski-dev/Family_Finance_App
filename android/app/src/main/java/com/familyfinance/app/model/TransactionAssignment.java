@@ -31,7 +31,7 @@ public final class TransactionAssignment {
                 json.optInt("id"),
                 json.optInt("transaction_id"),
                 json.optInt("category_id"),
-                json.optInt("amount_cents"),
+                JsonMoney.cents(json, "amount_cents"),
                 json.optString("source", ""),
                 json.optBoolean("active")
         );

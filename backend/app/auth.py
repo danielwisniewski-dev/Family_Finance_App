@@ -26,7 +26,7 @@ def hash_password(password: str, *, salt: bytes | None = None, iterations: int =
 
 
 def verify_password(password: str, encoded_hash: str | None) -> bool:
-    if not password or not encoded_hash:
+    if not isinstance(password, str) or not password or not isinstance(encoded_hash, str) or not encoded_hash:
         return False
     try:
         algorithm, iterations_text, salt_text, expected_text = encoded_hash.split("$", 3)
@@ -35,9 +35,11 @@ def verify_password(password: str, encoded_hash: str | None) -> bool:
         iterations = int(iterations_text)
         salt = base64.urlsafe_b64decode(salt_text.encode("ascii"))
         expected = base64.urlsafe_b64decode(expected_text.encode("ascii"))
-    except (ValueError, TypeError):
+        if not 0 < iterations <= 10_000_000 or not salt or len(expected) != hashlib.sha256().digest_size:
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    except (ValueError, TypeError, OverflowError):
         return False
-    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return hmac.compare_digest(actual, expected)
 
 

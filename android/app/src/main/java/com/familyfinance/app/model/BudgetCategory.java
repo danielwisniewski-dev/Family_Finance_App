@@ -48,9 +48,9 @@ public final class BudgetCategory {
                 json.optInt("id"),
                 json.optInt("budget_group_id"),
                 json.optString("name", "Unnamed category"),
-                json.optInt("planned_cents"),
-                json.optInt("spent_cents"),
-                json.optInt("remaining_cents"),
+                JsonMoney.cents(json, "planned_cents"),
+                JsonMoney.cents(json, "spent_cents"),
+                JsonMoney.cents(json, "remaining_cents"),
                 json.optBoolean("archived"),
                 json.optInt("display_order")
         );

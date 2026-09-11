@@ -64,6 +64,15 @@ public final class BudgetScreenStateTest {
                 "Split amounts must be positive.",
                 BudgetScreenState.splitValidationMessage(2000, Arrays.asList(2000, 0))
         );
+        assertEquals("Split total must equal the transaction amount.",
+                BudgetScreenState.splitValidationMessage(100, Arrays.asList(Integer.MAX_VALUE, Integer.MAX_VALUE, 102)));
+    }
+
+    @Test
+    public void excludesArchivedCategoriesFromNewActions() {
+        BudgetCategory archived = new BudgetCategory(10, "Old groceries", 500, 200, 300, true);
+        BudgetCategory active = new BudgetCategory(11, "Groceries", 500, 200, 300, false);
+        assertEquals(Collections.singletonList(active), BudgetScreenState.activeCategories(Arrays.asList(archived, active)));
     }
 
     private static TransactionDetail detail(

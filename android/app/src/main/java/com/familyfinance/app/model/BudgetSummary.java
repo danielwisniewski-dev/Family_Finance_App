@@ -15,10 +15,13 @@ public final class BudgetSummary {
     public final int assignedTotalCents;
     public final int remainingToAssignCents;
     public final int totalSpentCents;
-    public final int billsBeforePaydayCents;
-    public final int cashAfterBillsCents;
-    public final int daysUntilPayday;
+    public final Integer billsBeforePaydayCents;
+    public final Integer cashAfterBillsCents;
+    public final Integer daysUntilPayday;
     public final String nextPayday;
+    public final boolean forecastAvailable;
+    public final Boolean lowCushion;
+    public final String asOf;
     public final List<BudgetCategory> categories;
 
     public BudgetSummary(
@@ -35,6 +38,16 @@ public final class BudgetSummary {
             String nextPayday,
             List<BudgetCategory> categories
     ) {
+        this(budgetMonthId, month, includedAccountBalanceCents, plannedIncomeTotalCents,
+                assignedTotalCents, remainingToAssignCents, totalSpentCents, billsBeforePaydayCents,
+                cashAfterBillsCents, daysUntilPayday, nextPayday, categories, true, null, "");
+    }
+
+    private BudgetSummary(int budgetMonthId, String month, int includedAccountBalanceCents,
+            int plannedIncomeTotalCents, int assignedTotalCents, int remainingToAssignCents,
+            int totalSpentCents, Integer billsBeforePaydayCents, Integer cashAfterBillsCents,
+            Integer daysUntilPayday, String nextPayday, List<BudgetCategory> categories,
+            boolean forecastAvailable, Boolean lowCushion, String asOf) {
         this.budgetMonthId = budgetMonthId;
         this.month = month;
         this.includedAccountBalanceCents = includedAccountBalanceCents;
@@ -46,6 +59,9 @@ public final class BudgetSummary {
         this.cashAfterBillsCents = cashAfterBillsCents;
         this.daysUntilPayday = daysUntilPayday;
         this.nextPayday = nextPayday;
+        this.forecastAvailable = forecastAvailable;
+        this.lowCushion = lowCushion;
+        this.asOf = asOf;
         this.categories = Collections.unmodifiableList(new ArrayList<>(categories));
     }
 
@@ -83,19 +99,23 @@ public final class BudgetSummary {
                 categories.add(BudgetCategory.fromJson(categoryArray.optJSONObject(i)));
             }
         }
+        boolean forecastAvailable = json.optBoolean("forecast_available", !json.isNull("next_payday"));
         return new BudgetSummary(
                 json.optInt("budget_month_id"),
                 json.optString("month", "Unknown month"),
-                json.optInt("included_account_balance_cents"),
-                json.optInt("planned_income_total_cents", json.optInt("income_available_cents")),
-                json.optInt("assigned_total_cents", json.optInt("planned_cents")),
-                json.optInt("remaining_to_assign_cents", json.optInt("unassigned_cents")),
-                json.optInt("total_spent_cents"),
-                json.optInt("bills_before_payday_cents"),
-                json.optInt("cash_after_bills_cents"),
-                json.optInt("days_until_payday"),
-                json.optString("next_payday", ""),
-                categories
+                JsonMoney.cents(json, "included_account_balance_cents"),
+                JsonMoney.cents(json, json.has("planned_income_total_cents") ? "planned_income_total_cents" : "income_available_cents"),
+                JsonMoney.cents(json, json.has("assigned_total_cents") ? "assigned_total_cents" : "planned_cents"),
+                JsonMoney.cents(json, json.has("remaining_to_assign_cents") ? "remaining_to_assign_cents" : "unassigned_cents"),
+                JsonMoney.cents(json, "total_spent_cents"),
+                forecastAvailable ? JsonMoney.cents(json, "bills_before_payday_cents") : null,
+                forecastAvailable ? JsonMoney.cents(json, "cash_after_bills_cents") : null,
+                forecastAvailable ? json.optInt("days_until_payday") : null,
+                forecastAvailable ? json.optString("next_payday", "") : "",
+                categories,
+                forecastAvailable,
+                json.opt("low_cushion") instanceof Boolean ? json.optBoolean("low_cushion") : null,
+                json.optString("as_of", "")
         );
     }
 
@@ -106,7 +126,7 @@ public final class BudgetSummary {
     public List<BudgetCategory> categoriesNeedingAttention() {
         ArrayList<BudgetCategory> result = new ArrayList<>();
         for (BudgetCategory category : categories) {
-            if (category.isOverspent() || category.remainingCents <= 0) {
+            if (!category.archived && category.remainingCents <= 0) {
                 result.add(category);
             }
         }
@@ -114,9 +134,6 @@ public final class BudgetSummary {
     }
 
     public boolean hasLowCushion() {
-        if (daysUntilPayday <= 0) {
-            return cashAfterBillsCents < 0;
-        }
-        return cashAfterBillsCents / Math.max(daysUntilPayday, 1) < 5_000;
+        return Boolean.TRUE.equals(lowCushion);
     }
 }

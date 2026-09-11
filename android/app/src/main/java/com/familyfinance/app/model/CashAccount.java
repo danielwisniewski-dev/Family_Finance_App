@@ -46,17 +46,17 @@ public final class CashAccount {
                 json.optInt("id"),
                 json.optString("name", "Account"),
                 json.optString("account_type", ""),
-                json.optInt("balance_cents"),
+                JsonMoney.cents(json, "balance_cents"),
                 json.optInt("plaid_item_id", 0),
                 json.optBoolean("included_in_cash_reality"),
                 json.optString("mask", ""),
                 json.optString("official_name", ""),
                 json.optString("subtype", ""),
                 json.has("available_balance_cents") && !json.isNull("available_balance_cents")
-                        ? json.optInt("available_balance_cents")
+                        ? JsonMoney.cents(json, "available_balance_cents")
                         : null,
                 json.has("current_balance_cents") && !json.isNull("current_balance_cents")
-                        ? json.optInt("current_balance_cents")
+                        ? JsonMoney.cents(json, "current_balance_cents")
                         : null
         );
     }
