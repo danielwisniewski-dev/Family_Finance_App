@@ -9,6 +9,14 @@ __pycache__/
 .pytest_cache/
 *.log
 work/
+*.ffbackup
+*.jks
+*.keystore
+*.p12
+*.pem
+*.sqlite-journal
+*.db
+*.db-*
 .idea/
 android/.idea/
 android/.gradle/

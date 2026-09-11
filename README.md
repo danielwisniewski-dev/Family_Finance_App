@@ -1,5 +1,7 @@
 # Family Finance Accountability App
 
+Stage 1 private-beta security, Render configuration, backups, migration, and signed Android build instructions are in [docs/stage-1-private-beta.md](docs/stage-1-private-beta.md). Live USAA linking remains stage 2; the hosted stage 1 entry point explicitly disables bank connections.
+
 The September recovery review and verification record is in [docs/overnight-review.md](docs/overnight-review.md). The app remains a private, local Android/SQLite MVP with Plaid Sandbox only.
 
 This workspace starts the staged MVP from the attached build plan.
@@ -164,9 +166,9 @@ Do not commit real passwords. The demo credentials below are local-only values f
 
 ## Database Schema Assumption
 
-This staged MVP does not have a production migration system yet. `backend/app/schema.sql` is applied with `CREATE TABLE IF NOT EXISTS`, which is enough for fresh local SQLite databases but does not safely migrate existing databases when columns, indexes, or constraints change.
+Stage 1 adds ordered, transactional SQLite migrations with a version ledger. The known local MVP schema is the baseline; upgrades reject future versions and inconsistent history. Hosted startup creates an encrypted recovery archive before upgrading an existing database.
 
-Current assumption: this is still a dev-only SQLite schema workflow. For a fresh development run, choose a new database path and keep existing data. Stop the backend before backing up an existing SQLite file; preserve any accompanying journal/WAL files. Initialization contains limited additive compatibility updates (including legacy user login columns), not a general production migration framework. The recovery review makes no destructive data migration.
+The hosted beta starts with a fresh database. Preserve existing local data. For a later import, use the offline copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
 
 Deferred by design:
 
@@ -185,7 +187,7 @@ Still intentionally excluded:
 - Credit cards
 - MCP/tool layer
 - Push notifications
-- Production-grade migration tooling
+- Support for arbitrary historical schemas beyond the versioned stage 1 migration baseline
 
 ## Transaction Review API Notes
 
@@ -299,7 +301,7 @@ $env:PLAID_COUNTRY_CODES = "US"
 
 `PLAID_REDIRECT_URI` is optional and should only be set if your Plaid Dashboard/app configuration requires it.
 
-The backend creates Link tokens and exchanges public tokens. Android never receives Plaid access tokens or token refs. For this local MVP, raw Plaid access tokens are stored in SQLite behind token refs so sync can work across backend calls. Production requires encrypted persistent secret storage or a secrets manager before using real financial credentials.
+The local Sandbox backend creates Link tokens and exchanges public tokens. Android never receives Plaid access tokens or token refs. Local Sandbox mode without an encryption key retains the legacy token store. With `FF_ENCRYPTION_KEY`, token values are encrypted; plaintext legacy values require the explicit offline upgrade. Stage 1 hosted mode disables all bank linking. Live Plaid remains a separate stage 2 requirement.
 
 Sandbox manual flow:
 

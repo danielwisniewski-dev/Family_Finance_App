@@ -1,0 +1,5 @@
+waitress==3.0.2
+cryptography==50.0.1
+tzdata==2026.2
+cffi==2.1.1
+pycparser==3.0

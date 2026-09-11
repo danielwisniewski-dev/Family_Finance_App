@@ -43,12 +43,14 @@ public final class FamilyFinanceApi {
 
     public JSONObject initializeHousehold(
             String householdName,
-            JSONArray users
+            JSONArray users,
+            String setupCode
     ) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
             payload.put("household_name", householdName);
             payload.put("users", users);
+            payload.put("setup_code", setupCode);
             return client.post("/setup/initialize", payload);
         } catch (ApiException exception) {
             throw exception;
@@ -68,6 +70,10 @@ public final class FamilyFinanceApi {
         } catch (Exception exception) {
             throw new ApiException("Could not build login request", exception);
         }
+    }
+
+    public void logout() throws ApiException {
+        client.post("/auth/logout", new JSONObject());
     }
 
     public JSONObject getAccountSettings() throws ApiException {

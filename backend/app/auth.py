@@ -7,7 +7,7 @@ import secrets
 
 
 PASSWORD_ALGORITHM = "pbkdf2_sha256"
-PASSWORD_ITERATIONS = 210_000
+PASSWORD_ITERATIONS = 600_000
 
 
 def hash_password(password: str, *, salt: bytes | None = None, iterations: int = PASSWORD_ITERATIONS) -> str:
