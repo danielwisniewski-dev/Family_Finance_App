@@ -31,6 +31,14 @@ public final class ConnectionSettings {
         }
     }
 
+    public static String normalizeBaseUrl(String value, boolean allowHttp) {
+        String normalized = normalizeBaseUrl(value);
+        if (!allowHttp && !normalized.startsWith("https://")) {
+            throw new IllegalArgumentException("The private beta requires an HTTPS backend URL.");
+        }
+        return normalized;
+    }
+
     public static boolean requiresNewSession(String previousUrl, String nextUrl) {
         return !normalizeBaseUrl(previousUrl).equals(normalizeBaseUrl(nextUrl));
     }

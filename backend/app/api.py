@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from .security import RateLimitError, RuntimeSettings
+from .dates import household_today
 
 from .coach import (
     BudgetChangeSuggestionRequest,
@@ -60,6 +62,7 @@ ERROR_CODES = {
     HTTPStatus.REQUEST_ENTITY_TOO_LARGE: "request_too_large",
     HTTPStatus.SERVICE_UNAVAILABLE: "service_unavailable",
     HTTPStatus.INTERNAL_SERVER_ERROR: "backend_error",
+    HTTPStatus.TOO_MANY_REQUESTS: "rate_limited",
 }
 
 
@@ -79,7 +82,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if parsed.path == "/setup/status":
-                self.send_json(self.repository.setup_status(self.optional_auth()))
+                status = self.repository.setup_status(self.optional_auth())
+                status["setup_code_required"] = self.repository.settings.hosted
+                status["bank_linking_enabled"] = not self.repository.settings.hosted
+                self.send_json(status)
                 return
             if parsed.path == "/settings/account":
                 auth = self.require_auth()
@@ -98,7 +104,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
                 query = parse_qs(parsed.query)
-                today = parse_date(query.get("today", [date.today().isoformat()])[0])
+                today = parse_date(query.get("today", [household_today().isoformat()])[0])
                 summary = self.repository.get_summary(budget_month_id, today)
                 self.send_json(summary_to_dict(summary))
                 return
@@ -107,7 +113,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
                 query = parse_qs(parsed.query)
-                today = parse_date(query.get("today", [date.today().isoformat()])[0])
+                today = parse_date(query.get("today", [household_today().isoformat()])[0])
                 self.send_json(self.repository.get_budget_detail(budget_month_id, today))
                 return
             if resource_path(parsed.path, "budget-months", "accounts"):
@@ -222,11 +228,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(auth_payload)
                 return
             if parsed.path == "/setup/initialize":
+                self.repository.consume_auth_attempt("setup-global", limit=10, window=300)
+                self.repository.settings.require_setup_code(payload.get("setup_code"))
                 result = self.repository.initialize_private_household(
                     household_name=str(payload.get("household_name") or payload.get("name") or ""),
                     users=payload.get("users") or [],
                 )
                 self.send_json(result, status=HTTPStatus.CREATED)
+                return
+            if parsed.path == "/auth/logout":
+                self.require_auth()
+                self.repository.revoke_session(self.headers.get("Authorization", "").partition(" ")[2].strip())
+                self.send_json({"ok": True})
                 return
             if parsed.path == "/households":
                 self.require_auth()
@@ -237,7 +250,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.repository.create_starter_budget_for_current_month(
                     household_id=auth["household_id"],
                     actor_user_id=auth["user_id"],
-                    today=parse_date(payload.get("today", date.today().isoformat())),
+                    today=parse_date(payload.get("today", household_today().isoformat())),
                     next_payday=parse_date(payload["next_payday"]) if payload.get("next_payday") else None,
                 )
                 self.send_json(result, status=HTTPStatus.CREATED)
@@ -333,7 +346,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     budget_month_id=budget_month_id,
                     category_id=require_int(payload, "category_id"),
                     purchase_amount_cents=require_int(payload, "purchase_amount_cents"),
-                    today=parse_date(payload.get("today", date.today().isoformat())),
+                    today=parse_date(payload.get("today", household_today().isoformat())),
                     urgency=payload.get("urgency", "planned_want"),
                     actor_user_id=auth["user_id"],
                 )
@@ -350,7 +363,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     budget_month_id=budget_month_id,
                     category_id=category_id,
                     purchase_amount_cents=amount_cents,
-                    today=parse_date(payload.get("today", date.today().isoformat())),
+                    today=parse_date(payload.get("today", household_today().isoformat())),
                     urgency=payload.get("urgency", "planned_want"),
                     actor_user_id=auth["user_id"],
                 )
@@ -383,7 +396,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.repository.require_category_access(to_category_id, auth["household_id"])
                 summary = self.repository.get_summary(
                     budget_month_id,
-                    parse_date(payload.get("today", date.today().isoformat())),
+                    parse_date(payload.get("today", household_today().isoformat())),
                 )
                 coach_response = self.coach_service.suggest_budget_change(
                     summary=summary,
@@ -774,6 +787,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         context = self.repository.auth_context_for_token(token.strip())
         if context is None:
             raise UnauthorizedError("Authentication required")
+        if self.repository.settings.hosted and urlparse(self.path).path.startswith("/plaid/"):
+            raise PermissionError("Bank linking is unavailable during stage 1")
         return context
 
     def optional_auth(self) -> dict[str, Any] | None:
@@ -818,6 +833,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
+            self.send_header("Retry-After", "300")
         self.end_headers()
         self.wfile.write(body)
 
@@ -841,6 +859,8 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 def error_response_for_exception(exc: Exception) -> tuple[HTTPStatus, str]:
+    if isinstance(exc, RateLimitError):
+        return HTTPStatus.TOO_MANY_REQUESTS, "Too many attempts. Please wait a few minutes and try again."
     if isinstance(exc, RequestBodyTooLargeError):
         return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large"
     if isinstance(exc, TimeoutError):
@@ -1020,7 +1040,10 @@ def optional_query_int(query: dict[str, list[str]], key: str, fallback_key: str 
 
 
 def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
-    repository = BudgetRepository(db_path)
+    settings = RuntimeSettings.from_env()
+    if settings.hosted:
+        raise RuntimeError("Use python -m backend.app.hosted for hosted deployment")
+    repository = BudgetRepository(db_path, settings)
     repository.initialize()
 
     class ConfiguredApiHandler(ApiHandler):

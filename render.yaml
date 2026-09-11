@@ -1,0 +1,35 @@
+# Stage 1: deploy only after review/commit approval. One paid service; SQLite has no separate service charge.
+services:
+  - type: web
+    name: family-finance-beta
+    runtime: python
+    plan: starter
+    region: virginia
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m backend.app.hosted
+    healthCheckPath: /ready
+    disk:
+      name: household-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: FF_MODE
+        value: hosted
+      - key: FF_DB_PATH
+        value: /var/data/family-finance.sqlite
+      - key: FF_BACKUP_DIR
+        value: /var/data/backups
+      - key: FF_TIMEZONE
+        value: America/New_York
+      - key: FF_SETUP_CODE
+        generateValue: true
+      - key: FF_ENCRYPTION_KEY
+        generateValue: true
+      - key: COACH_PROVIDER
+        value: mock
+      - key: PLAID_ENV
+        value: sandbox

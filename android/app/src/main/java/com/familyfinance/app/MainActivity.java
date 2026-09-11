@@ -16,6 +16,7 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -50,6 +51,7 @@ import com.familyfinance.app.state.BudgetScreenState;
 import com.familyfinance.app.state.ConnectionSettings;
 import com.familyfinance.app.state.LoginErrorMessages;
 import com.familyfinance.app.state.MoneyFormatter;
+import com.familyfinance.app.state.SecureSessionStore;
 import com.plaid.link.Plaid;
 import com.plaid.link.PlaidHandler;
 import com.plaid.link.configuration.LinkTokenConfiguration;
@@ -71,7 +73,7 @@ import kotlin.Unit;
 
 public final class MainActivity extends Activity {
     private static final String PREFS = "family_finance";
-    private static final String DEFAULT_BASE_URL = "http://10.0.2.2:8080";
+    private static final String DEFAULT_BASE_URL = BuildConfig.DEFAULT_BACKEND_URL;
     private static final int DEFAULT_BUDGET_MONTH_ID = 1;
     private static final String PREF_LAST_BUDGET_CHECK_DATE = "last_budget_check_date";
     private static final String PREF_BUDGET_CHECK_STREAK = "budget_check_streak";
@@ -141,6 +143,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!BuildConfig.DEBUG) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         loadPreferences();
         if (savedConnectionReset) {
             showLogin("The saved backend URL was invalid and has been reset. Check the connection and log in again.");
@@ -193,16 +196,19 @@ public final class MainActivity extends Activity {
     private void loadPreferences() {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         try {
-            baseUrl = ConnectionSettings.normalizeBaseUrl(prefs.getString("base_url", DEFAULT_BASE_URL));
+            baseUrl = ConnectionSettings.normalizeBaseUrl(prefs.getString("base_url", DEFAULT_BASE_URL), BuildConfig.DEBUG);
         } catch (IllegalArgumentException exception) {
             baseUrl = DEFAULT_BASE_URL;
             savedConnectionReset = true;
+            new SecureSessionStore(this).clear();
             prefs.edit().putString("base_url", DEFAULT_BASE_URL)
                     .remove("auth_token").remove("current_user_id").remove("current_user_name")
                     .remove("household_id").remove("household_name").apply();
         }
         budgetMonthId = prefs.getInt("budget_month_id", DEFAULT_BUDGET_MONTH_ID);
-        authToken = prefs.getString("auth_token", "");
+        // Legacy plaintext tokens are deliberately discarded; a fresh login encrypts the new session.
+        if (prefs.contains("auth_token")) prefs.edit().remove("auth_token").commit();
+        authToken = new SecureSessionStore(this).load(baseUrl);
         currentUserId = prefs.getInt("current_user_id", 0);
         householdId = prefs.getInt("household_id", 0);
         currentUserName = prefs.getString("current_user_name", "");
@@ -211,7 +217,7 @@ public final class MainActivity extends Activity {
     }
 
     private void saveConnectionPreferences(String newBaseUrl, int newBudgetMonthId) {
-        newBaseUrl = ConnectionSettings.normalizeBaseUrl(newBaseUrl);
+        newBaseUrl = ConnectionSettings.normalizeBaseUrl(newBaseUrl, BuildConfig.DEBUG);
         if (ConnectionSettings.requiresNewSession(baseUrl, newBaseUrl)) {
             clearSession();
         }
@@ -223,24 +229,40 @@ public final class MainActivity extends Activity {
         loadPreferences();
     }
 
-    private void saveAuthSession(String token, JSONObject user, JSONObject household) {
+    private boolean saveAuthSession(String token, JSONObject user, JSONObject household) {
+        if (!new SecureSessionStore(this).save(token, baseUrl)) {
+            showLogin("The phone could not securely save your session. Please try logging in again.");
+            return false;
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
-                .putString("auth_token", token)
+                .remove("auth_token")
                 .putInt("current_user_id", user.optInt("id"))
                 .putString("current_user_name", user.optString("name"))
                 .putInt("household_id", household.optInt("id"))
                 .putString("household_name", household.optString("name"))
                 .apply();
         loadPreferences();
+        return true;
     }
 
     private void logout() {
+        FamilyFinanceApi previousApi = api;
         clearSession();
-        checkSetupThenShowLogin("Logged out.");
+        showLoading("Signing out...");
+        executor.execute(() -> {
+            String message = "Logged out.";
+            try { previousApi.logout(); }
+            catch (ApiException exception) {
+                if (exception.status != 401) message = "Signed out on this phone. The server could not be reached to revoke the session; it will expire automatically.";
+            }
+            String result = message;
+            postIfActive(() -> showLogin(result));
+        });
     }
 
     private void clearSession() {
+        new SecureSessionStore(this).clear();
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .remove("auth_token")
@@ -368,6 +390,12 @@ public final class MainActivity extends Activity {
         root.addView(baseUrlInput);
 
         addSection("Private household");
+        EditText setupCodeInput = new EditText(this);
+        setupCodeInput.setHint("Private setup code (provided with server setup)");
+        setupCodeInput.setSingleLine(true);
+        setupCodeInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        setupCodeInput.setSaveEnabled(false);
+        root.addView(setupCodeInput);
         EditText householdInput = new EditText(this);
         householdInput.setHint("Household name");
         householdInput.setSingleLine(true);
@@ -394,7 +422,7 @@ public final class MainActivity extends Activity {
         danielPassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         root.addView(danielPassword);
 
-        addSection("Kara local user optional");
+        addSection(BuildConfig.DEBUG ? "Kara local user optional" : "Kara");
         EditText karaName = new EditText(this);
         karaName.setHint("Display name");
         karaName.setSingleLine(true);
@@ -417,7 +445,7 @@ public final class MainActivity extends Activity {
         addButton("Create private household", () -> {
             String newBaseUrl;
             try {
-                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString());
+                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString(), BuildConfig.DEBUG);
             } catch (IllegalArgumentException exception) {
                 toast(exception.getMessage());
                 return;
@@ -431,6 +459,12 @@ public final class MainActivity extends Activity {
             String spouseUsername = karaUsername.getText().toString().trim();
             String spouseEmail = karaEmail.getText().toString();
             String spousePassword = karaPassword.getText().toString();
+            String setupCode = setupCodeInput.getText().toString().trim();
+            if (!BuildConfig.DEBUG && (setupCode.isEmpty() || spouseUsername.isEmpty()
+                    || primaryPassword.length() < 12 || spousePassword.length() < 12)) {
+                toast("Enter the private setup code and both usernames. Each password needs at least 12 characters.");
+                return;
+            }
             if (householdName.isEmpty() || primaryUsername.isEmpty() || primaryPassword.isEmpty()) {
                 toast("Household name, primary username, and primary password are required.");
                 return;
@@ -456,10 +490,10 @@ public final class MainActivity extends Activity {
                                 spousePassword
                         ));
                     }
-                    new FamilyFinanceApi(newBaseUrl).initializeHousehold(householdName, users);
+                    new FamilyFinanceApi(newBaseUrl).initializeHousehold(householdName, users, setupCode);
                     postIfActive(() -> {
                         saveConnectionPreferences(newBaseUrl, budgetMonthId);
-                        showLogin("Household created. Log in with the local credentials you just set.");
+                        showLogin("Household created. Log in with the credentials you just set.");
                     });
                 } catch (Exception exception) {
                     postIfActive(() -> showFirstRunSetup(exception.getMessage()));
@@ -516,7 +550,7 @@ public final class MainActivity extends Activity {
             String newBaseUrl;
             try {
                 parsedBudgetMonthId = ConnectionSettings.parseBudgetMonthId(budgetMonthInput.getText().toString());
-                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString());
+                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString(), BuildConfig.DEBUG);
             } catch (IllegalArgumentException exception) {
                 toast(exception.getMessage());
                 return;
@@ -535,11 +569,11 @@ public final class MainActivity extends Activity {
                     JSONObject auth = loginApi.login(username, password);
                     postIfActive(() -> {
                         saveConnectionPreferences(newBaseUrl, parsedBudgetMonthId);
-                        saveAuthSession(
+                        if (!saveAuthSession(
                                 auth.optString("token"),
                                 auth.optJSONObject("user") == null ? new JSONObject() : auth.optJSONObject("user"),
                                 auth.optJSONObject("household") == null ? new JSONObject() : auth.optJSONObject("household")
-                        );
+                        )) return;
                         showLoading("Loading dashboard...");
                         refreshData(this::showDashboard);
                     });
@@ -1738,8 +1772,8 @@ public final class MainActivity extends Activity {
                 toast("Enter current and new passwords.");
                 return;
             }
-            if (newPassword.length() < 8) {
-                toast("New password must be at least 8 characters.");
+            if (newPassword.length() < (BuildConfig.DEBUG ? 8 : 12)) {
+                toast("New password must be at least " + (BuildConfig.DEBUG ? 8 : 12) + " characters.");
                 return;
             }
             runMutation(
@@ -1753,14 +1787,19 @@ public final class MainActivity extends Activity {
         });
         addDangerButton("Log out", this::logout);
 
-        addSection("Plaid Sandbox");
-        addButton("Link bank with Plaid Sandbox", this::preparePlaidLink);
-        addButton("Sync balances", () -> syncPlaidItems("balance"));
-        addButton("Sync transactions", () -> syncPlaidItems("transaction"));
+        if (BuildConfig.BANK_LINKING_ENABLED) {
+            addSection("Plaid Sandbox");
+            addButton("Link bank with Plaid Sandbox", this::preparePlaidLink);
+            addButton("Sync balances", () -> syncPlaidItems("balance"));
+            addButton("Sync transactions", () -> syncPlaidItems("transaction"));
+        } else {
+            addBody("Stage 1: bank connections become available after live sync verification.");
+        }
 
         addSection("Account inclusion");
         if (accounts.isEmpty()) {
-            addBody("No linked checking or savings accounts returned. Link Plaid Sandbox or add demo accounts from the backend seed flow.");
+            addBody(BuildConfig.BANK_LINKING_ENABLED ? "No linked checking or savings accounts returned. Link Plaid Sandbox or add demo accounts from the backend seed flow."
+                    : "No accounts connected yet. Account balances will appear after bank setup in stage 2.");
         } else {
             for (CashAccount account : accounts) {
                 addBody(account.name

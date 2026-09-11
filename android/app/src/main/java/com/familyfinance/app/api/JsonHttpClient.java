@@ -3,6 +3,7 @@ package com.familyfinance.app.api;
 import org.json.JSONObject;
 
 import com.familyfinance.app.state.ConnectionSettings;
+import com.familyfinance.app.BuildConfig;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -22,7 +23,7 @@ public final class JsonHttpClient {
     }
 
     public JsonHttpClient(String baseUrl, String bearerToken) {
-        this.baseUrl = ConnectionSettings.normalizeBaseUrl(baseUrl);
+        this.baseUrl = ConnectionSettings.normalizeBaseUrl(baseUrl, BuildConfig.DEBUG);
         this.bearerToken = bearerToken == null ? "" : bearerToken.trim();
     }
 

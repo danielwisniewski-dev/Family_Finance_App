@@ -4,6 +4,7 @@ import json
 import sqlite3
 import calendar
 import re
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import date
@@ -11,6 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .auth import hash_password, hash_session_token, new_session_token, verify_password
+from .migrations import migrate
+from .dates import household_today
+from .security import RateLimitError, RuntimeSettings, attempt_key
 from .domain import (
     AccountLine,
     BudgetSummary,
@@ -46,15 +50,19 @@ FORBIDDEN_METADATA_TERMS = (
     "plaid_token",
 )
 
+DUMMY_PASSWORD_HASH = hash_password(new_session_token())
+
 
 class BudgetRepository:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, settings: RuntimeSettings | None = None):
         self.db_path = Path(db_path)
+        self.settings = settings or RuntimeSettings()
+        self.token_box = self.settings.token_box()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=15)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
@@ -67,19 +75,39 @@ class BudgetRepository:
             connection.close()
 
     def initialize(self) -> None:
-        schema_path = Path(__file__).with_name("schema.sql")
         with self.connect() as connection:
-            # Legacy users tables predate the username index in schema.sql.
-            if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").fetchone():
-                ensure_column(connection, "users", "username", "TEXT")
-            connection.executescript(schema_path.read_text(encoding="utf-8"))
-            ensure_column(connection, "users", "password_hash", "TEXT")
-            ensure_column(connection, "households", "active_budget_month_id", "INTEGER")
-            ensure_column(connection, "budget_groups", "archived", "INTEGER NOT NULL DEFAULT 0")
-            ensure_column(connection, "account_transactions", "reviewed", "INTEGER NOT NULL DEFAULT 0")
-            ensure_column(connection, "account_transactions", "ignored", "INTEGER NOT NULL DEFAULT 0")
-            ensure_column(connection, "account_transactions", "ignored_reason", "TEXT")
-            ensure_column(connection, "merchant_category_rules", "updated_at", "TEXT")
+            migrate(connection)
+            check = connection.execute("SELECT sealed_value FROM app_secret_checks WHERE name='encryption-key-v1'").fetchone()
+            if check is not None:
+                from .security import SecretError
+                if not self.token_box or self.token_box.open(check[0]) != "family-finance-key-check-v1":
+                    raise SecretError("The database requires its original encryption key")
+            if self.token_box:
+                for row in connection.execute("SELECT access_token FROM plaid_access_tokens"):
+                    self.token_box.open(row[0])
+                if check is None:
+                    connection.execute("INSERT INTO app_secret_checks(name,sealed_value) VALUES (?,?)",
+                                       ("encryption-key-v1", self.token_box.seal("family-finance-key-check-v1")))
+
+    def consume_auth_attempt(self, identity: str, *, limit: int = 10, window: int = 300) -> None:
+        now = int(time.time())
+        key = attempt_key(identity)
+        limited = False
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM auth_attempts WHERE resets_at <= ?", (now,))
+            row = connection.execute("SELECT attempts FROM auth_attempts WHERE bucket = ?", (key,)).fetchone()
+            if row is not None and row[0] >= limit:
+                limited = True
+            else:
+                connection.execute("""INSERT INTO auth_attempts(bucket,attempts,resets_at) VALUES (?,1,?)
+                    ON CONFLICT(bucket) DO UPDATE SET attempts=attempts+1""", (key, now + window))
+        if limited:
+            raise RateLimitError("Too many attempts. Please wait a few minutes and try again.")
+
+    def revoke_session(self, token: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (hash_session_token(token),))
 
     def create_household(self, name: str, spouses: Iterable[dict[str, str]] = ()) -> int:
         with self.connect() as connection:
@@ -134,6 +162,10 @@ class BudgetRepository:
 
     def authenticate_local_user(self, login: str, password: str) -> dict[str, Any] | None:
         cleaned = require_login_value(login, "login")
+        if len(cleaned) > 254 or not isinstance(password, str) or len(password) > 1024:
+            return None
+        self.consume_auth_attempt("login-global", limit=60, window=60)
+        self.consume_auth_attempt("login:" + cleaned)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
@@ -148,24 +180,28 @@ class BudgetRepository:
                 (cleaned, cleaned),
             ).fetchall()
             if len(rows) != 1:
+                verify_password(password, DUMMY_PASSWORD_HASH)
                 return None
             row = rows[0]
             if not verify_password(password, row["password_hash"]):
                 return None
             token = new_session_token()
+            expires_at = int(time.time()) + self.settings.session_seconds
+            connection.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (int(time.time()),))
             connection.execute(
-                "INSERT INTO auth_sessions(user_id, token_hash) VALUES (?, ?)",
-                (row["id"], hash_session_token(token)),
+                "INSERT INTO auth_sessions(user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+                (row["id"], hash_session_token(token), expires_at),
             )
             return {
                 "token": token,
+                "expires_at": expires_at,
                 "user": safe_user_from_row(row),
                 "household": safe_household_from_user_row(row),
             }
 
     def auth_context_for_token(self, token: str) -> dict[str, Any] | None:
         token = (token or "").strip()
-        if not token:
+        if not token or len(token) > 256:
             return None
         with self.connect() as connection:
             row = connection.execute(
@@ -176,9 +212,9 @@ class BudgetRepository:
                 FROM auth_sessions s
                 JOIN users u ON u.id = s.user_id
                 JOIN households h ON h.id = u.household_id
-                WHERE s.token_hash = ?
+                WHERE s.token_hash = ? AND s.expires_at > ?
                 """,
-                (hash_session_token(token),),
+                (hash_session_token(token), int(time.time())),
             ).fetchone()
             if row is None:
                 return None
@@ -314,7 +350,7 @@ class BudgetRepository:
         return {
             "backend_reachable": True,
             "database_initialized": setup["initialized"],
-            "plaid_mode": "sandbox",
+            "plaid_mode": "disabled" if self.settings.hosted else "sandbox",
             "plaid_sandbox_only": True,
             "current_user": auth_context["user"],
             "current_household": auth_context["household"],
@@ -339,7 +375,7 @@ class BudgetRepository:
                 included_account_balance_cents=snapshot["included_account_balance_cents"],
                 expected_bills=snapshot["expected_bills"],
                 paydays=snapshot["paydays"],
-                today=date.today(),
+                today=household_today(),
                 urgency="planned_want",
                 low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
             )
@@ -350,6 +386,11 @@ class BudgetRepository:
     def initialize_private_household(self, *, household_name: str, users: Iterable[dict[str, str]]) -> dict[str, Any]:
         household_name = clean_required_text(household_name, "household_name")
         cleaned_users = [clean_setup_user(user) for user in users]
+        if self.settings.hosted:
+            if len(cleaned_users) != 2:
+                raise ValueError("Private beta setup requires exactly two household users")
+            if any(len(user["password"]) < 12 for user in cleaned_users):
+                raise ValueError("Use passwords with at least 12 characters")
         if not cleaned_users:
             raise ValueError("At least one local user is required")
         login_identifiers: set[str] = set()
@@ -475,6 +516,9 @@ class BudgetRepository:
         if not current_password:
             raise PermissionError("Current password is required")
         validate_local_password(new_password, "new_password")
+        if self.settings.hosted and len(new_password) < 12:
+            raise ValueError("Use a password with at least 12 characters")
+        self.consume_auth_attempt("password:" + str(user_id))
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -1118,6 +1162,8 @@ class BudgetRepository:
             )
 
     def store_plaid_access_token(self, token_ref: str, access_token: str) -> None:
+        if self.token_box:
+            access_token = self.token_box.seal(access_token)
         with self.connect() as connection:
             connection.execute(
                 """
@@ -1134,7 +1180,15 @@ class BudgetRepository:
                 "SELECT access_token FROM plaid_access_tokens WHERE token_ref = ?",
                 (token_ref,),
             ).fetchone()
-        return str(row["access_token"]) if row is not None else None
+        if row is None:
+            return None
+        value = str(row["access_token"])
+        if self.token_box:
+            return self.token_box.open(value)
+        if value.startswith("sealed:v1:"):
+            from .security import SecretError
+            raise SecretError("Encrypted tokens require the configured encryption key")
+        return value
 
     def get_plaid_item(self, plaid_item_row_id: int) -> PlaidItemLine:
         with self.connect() as connection:
@@ -3812,6 +3866,8 @@ def validate_local_password(password: str, field_name: str) -> None:
         raise ValueError(f"{field_name} is required")
     if len(password) < 8:
         raise ValueError(f"{field_name} must be at least 8 characters")
+    if len(password) > 1024:
+        raise ValueError(f"{field_name} must be at most 1024 characters")
 
 
 def safe_user_from_row(row: sqlite3.Row) -> dict[str, Any]:
