@@ -31,8 +31,8 @@ public final class BudgetMonth {
                 json.optInt("id"),
                 json.optInt("household_id"),
                 json.optString("month"),
-                json.optInt("included_account_balance_cents"),
-                json.optInt("low_cushion_daily_cents"),
+                JsonMoney.cents(json, "included_account_balance_cents"),
+                JsonMoney.cents(json, "low_cushion_daily_cents"),
                 json.optBoolean("is_active")
         );
     }

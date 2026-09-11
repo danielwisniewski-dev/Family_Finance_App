@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from backend.app.api import ApiHandler, build_server
+from backend.app.api import build_server
 from backend.app.coach import (
     CoachConfigurationError,
     CoachService,
@@ -103,13 +103,13 @@ class CoachApiTests(unittest.TestCase):
 
     def test_coach_endpoints_do_not_mutate_budget_category_or_transaction_data(self) -> None:
         fixture = self.seed_budget(balance_cents=100_000, grocery_planned_cents=50_000)
-        account_id = ApiHandler.repository.add_cash_account(
+        account_id = self.server.RequestHandlerClass.repository.add_cash_account(
             budget_month_id=fixture["budget_month_id"],
             name="Main Checking",
             account_type="checking",
             balance_cents=100_000,
         )
-        transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+        transaction_id = self.server.RequestHandlerClass.repository.upsert_plaid_transaction(
             cash_account_id=account_id,
             plaid_transaction_id="coach-mutation-check",
             amount_cents=-2_500,
@@ -118,7 +118,7 @@ class CoachApiTests(unittest.TestCase):
             merchant_name="Corner Store",
             category_hint="Shops",
         ).transaction_id
-        ApiHandler.repository.assign_transaction_category(
+        self.server.RequestHandlerClass.repository.assign_transaction_category(
             transaction_id=transaction_id,
             category_id=fixture["groceries_id"],
             reviewed=True,
@@ -191,12 +191,12 @@ class CoachApiTests(unittest.TestCase):
 
     def test_coach_responses_do_not_expose_plaid_token_references(self) -> None:
         fixture = self.seed_budget(balance_cents=100_000, grocery_planned_cents=50_000)
-        plaid_item_id = ApiHandler.repository.create_plaid_item(
+        plaid_item_id = self.server.RequestHandlerClass.repository.create_plaid_item(
             household_id=fixture["household_id"],
             plaid_item_id="plaid-item-visible-id",
             access_token_ref="dummy-token-reference-for-redaction",
         )
-        ApiHandler.repository.upsert_connected_account(
+        self.server.RequestHandlerClass.repository.upsert_connected_account(
             plaid_item_id=plaid_item_id,
             budget_month_id=fixture["budget_month_id"],
             plaid_account_id="plaid-account-id",
@@ -259,7 +259,7 @@ class CoachApiTests(unittest.TestCase):
         self.assertEqual(invalid_amount["error"], "amount_cents must be an integer")
 
     def seed_budget(self, *, balance_cents: int, grocery_planned_cents: int) -> dict[str, int]:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             "Coach Household",
             spouses=[
                 {
@@ -465,21 +465,21 @@ class OpenAICoachProviderTests(unittest.TestCase):
             return {"output_text": json.dumps(valid_openai_coach_payload())}
 
         server = build_server(Path(temp_dir.name) / "openai-coach.sqlite", "127.0.0.1", 0)
-        ApiHandler.coach_service = CoachService(
+        server.RequestHandlerClass.coach_service = CoachService(
             OpenAICoachProvider(api_key="test-key", model="test-model", transport=fake_transport)
         )
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         base_url = f"http://127.0.0.1:{server.server_port}"
         try:
-            fixture = seed_budget_for_base_url(base_url)
-            account_id = ApiHandler.repository.add_cash_account(
+            fixture = seed_budget_for_base_url(base_url, server.RequestHandlerClass.repository)
+            account_id = server.RequestHandlerClass.repository.add_cash_account(
                 budget_month_id=fixture["budget_month_id"],
                 name="Main Checking",
                 account_type="checking",
                 balance_cents=100_000,
             )
-            transaction_id = ApiHandler.repository.upsert_plaid_transaction(
+            transaction_id = server.RequestHandlerClass.repository.upsert_plaid_transaction(
                 cash_account_id=account_id,
                 plaid_transaction_id="openai-mutation-check",
                 amount_cents=-2_500,
@@ -488,17 +488,17 @@ class OpenAICoachProviderTests(unittest.TestCase):
                 merchant_name="Corner Store",
                 category_hint="Shops",
             ).transaction_id
-            ApiHandler.repository.assign_transaction_category(
+            server.RequestHandlerClass.repository.assign_transaction_category(
                 transaction_id=transaction_id,
                 category_id=fixture["groceries_id"],
                 reviewed=True,
             )
-            plaid_item_id = ApiHandler.repository.create_plaid_item(
+            plaid_item_id = server.RequestHandlerClass.repository.create_plaid_item(
                 household_id=fixture["household_id"],
                 plaid_item_id="plaid-item-visible-id",
                 access_token_ref="dummy-token-reference-for-redaction",
             )
-            ApiHandler.repository.upsert_connected_account(
+            server.RequestHandlerClass.repository.upsert_connected_account(
                 plaid_item_id=plaid_item_id,
                 budget_month_id=fixture["budget_month_id"],
                 plaid_account_id="plaid-account-id",
@@ -619,8 +619,8 @@ def auth_headers(auth_token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {auth_token}"}
 
 
-def seed_budget_for_base_url(base_url: str) -> dict[str, object]:
-    household_id = ApiHandler.repository.create_household(
+def seed_budget_for_base_url(base_url: str, repository) -> dict[str, object]:
+    household_id = repository.create_household(
         "OpenAI Coach Household",
         spouses=[
             {

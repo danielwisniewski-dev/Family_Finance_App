@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -94,6 +95,7 @@ class PlaidTransactionSnapshot:
     merchant_name: str | None = None
     pending: bool = False
     category_hint: str | None = None
+    pending_transaction_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -430,48 +432,21 @@ class PlaidConnectionService:
             item = self.repository.get_plaid_item(plaid_item_id)
             access_token = self.token_store.retrieve(item.access_token_ref)
             result = self.client.sync_transactions(access_token, item.sync_cursor)
-            inserted = 0
-            updated = 0
-            removed = 0
-            skipped = 0
-            for transaction in result.transactions + result.modified_transactions:
-                account_id = self.repository.find_account_id_by_plaid_account(
-                    plaid_item_id,
-                    transaction.plaid_account_id,
-                )
-                if account_id is None:
-                    skipped += 1
-                    continue
-                upsert = self.repository.upsert_plaid_transaction(
-                    cash_account_id=account_id,
-                    plaid_transaction_id=transaction.plaid_transaction_id,
-                    amount_cents=transaction.amount_cents,
-                    occurred_on=transaction.occurred_on,
-                    name=transaction.name,
-                    merchant_name=transaction.merchant_name,
-                    pending=transaction.pending,
-                    category_hint=transaction.category_hint,
-                )
-                if upsert.created:
-                    inserted += 1
-                else:
-                    updated += 1
-            for plaid_transaction_id in result.removed_transaction_ids:
-                if self.repository.mark_plaid_transaction_removed(plaid_transaction_id):
-                    removed += 1
-                else:
-                    skipped += 1
-            self.repository.update_plaid_item_cursor(plaid_item_id, result.next_cursor)
+            counts = self.repository.apply_plaid_transaction_sync(
+                plaid_item_id=plaid_item_id, expected_cursor=item.sync_cursor, next_cursor=result.next_cursor,
+                transactions=(asdict(transaction) for transaction in result.transactions + result.modified_transactions),
+                removed_transaction_ids=result.removed_transaction_ids,
+            )
             return PlaidSyncOutcome(
-                success=True,
-                sync_type="transaction",
-                inserted_transactions=inserted,
-                updated_transactions=updated,
-                removed_transactions=removed,
-                skipped_transactions=skipped,
+                success=True, sync_type="transaction", **counts,
             )
         except PlaidIntegrationError as exc:
             return self._record_sync_error(plaid_item_id, "transaction", exc)
+        except (ValueError, TypeError, KeyError, sqlite3.Error):
+            return self._record_sync_error(
+                plaid_item_id, "transaction",
+                PlaidIntegrationError("Transaction sync could not be applied. Please retry.", "PLAID_SYNC_INVALID"),
+            )
 
     def _record_sync_error(
         self,
@@ -479,17 +454,19 @@ class PlaidConnectionService:
         sync_type: str,
         exc: PlaidIntegrationError,
     ) -> PlaidSyncOutcome:
+        public_code = sanitize_plaid_error_code(exc.code)
+        public_message = sanitize_plaid_error(str(exc))
         self.repository.record_plaid_sync_error(
             plaid_item_id=plaid_item_id,
             sync_type=sync_type,
-            error_code=exc.code,
-            error_message=sanitize_plaid_error(str(exc)),
+            error_code=public_code,
+            error_message=public_message,
         )
         return PlaidSyncOutcome(
             success=False,
             sync_type=sync_type,
-            error_code=exc.code,
-            error_message=sanitize_plaid_error(str(exc)),
+            error_code=public_code,
+            error_message=public_message,
         )
 
 
@@ -541,6 +518,7 @@ def transaction_from_plaid_json(transaction: dict[str, Any]) -> PlaidTransaction
         merchant_name=optional_str(transaction.get("merchant_name")),
         pending=bool(transaction.get("pending", False)),
         category_hint=plaid_category_hint(transaction),
+        pending_transaction_id=optional_str(transaction.get("pending_transaction_id")),
     )
 
 
@@ -581,10 +559,21 @@ def sanitize_plaid_error(message: str) -> str:
         return "Only Plaid Sandbox is supported in this app."
     if "public_token is required" in lowered:
         return "Plaid public token is required."
-    forbidden_terms = ("access_token", "access token", "token_ref", "token-ref", "api_key", "secret")
-    if any(term in lowered for term in forbidden_terms):
-        return "Plaid request failed; details were redacted."
-    return redact_sensitive_text(message, PlaidSettings.from_env())
+    public_messages = {
+        "could not reach plaid sandbox": "Could not reach Plaid Sandbox. Please retry.",
+        "plaid item needs user repair": "Reconnect this Sandbox bank connection and retry.",
+        "transaction sync could not be applied. please retry.": "Transaction sync could not be applied. Please retry.",
+    }
+    return public_messages.get(lowered, "Plaid request failed; details were redacted.")
+
+
+def sanitize_plaid_error_code(code: str | None) -> str:
+    public_codes = {
+        "ITEM_LOGIN_REQUIRED", "PLAID_NETWORK_ERROR", "PLAID_SYNC_INVALID", "PLAID_CONFIG_MISSING",
+        "PLAID_ENV_NOT_SANDBOX", "PLAID_PRODUCTS_INVALID", "PLAID_COUNTRY_CODES_INVALID",
+        "PLAID_RESPONSE_ERROR", "PUBLIC_TOKEN_REQUIRED", "PLAID_CLIENT_PLACEHOLDER",
+    }
+    return code if code in public_codes else "PLAID_REQUEST_FAILED"
 
 
 def redact_sensitive_text(message: str, settings: PlaidSettings) -> str:

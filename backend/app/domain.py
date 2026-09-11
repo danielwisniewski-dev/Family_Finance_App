@@ -184,11 +184,17 @@ class BudgetSummary:
     planned_cents: int
     unassigned_cents: int
     included_account_balance_cents: int
-    next_payday: date
-    days_until_payday: int
-    bills_before_payday_cents: int
-    cash_after_bills_cents: int
+    next_payday: date | None
+    days_until_payday: int | None
+    bills_before_payday_cents: int | None
+    cash_after_bills_cents: int | None
     categories: tuple[CategoryLine, ...]
+    as_of: date | None = None
+    low_cushion: bool | None = None
+
+    @property
+    def forecast_available(self) -> bool:
+        return self.next_payday is not None
 
 
 @dataclass(frozen=True)
@@ -234,14 +240,19 @@ def summarize_budget(
     expected_bills: Iterable[ExpectedBill],
     paydays: Iterable[date],
     today: date,
+    low_cushion_daily_cents: int = 5_000,
 ) -> BudgetSummary:
     category_tuple = tuple(category for category in categories if not category.archived)
     planned_cents = sum(category.planned_cents for category in category_tuple)
     income_available = available_income_cents(income_lines)
-    next_payday = find_next_payday(paydays, today)
-    days_until_payday = max((next_payday - today).days, 0)
-    bills_before_payday = sum_bills_before_payday(expected_bills, today, next_payday)
-    cash_after_bills = included_account_balance_cents - bills_before_payday
+    next_payday = min((payday for payday in paydays if payday >= today), default=None)
+    days_until_payday = (next_payday - today).days if next_payday is not None else None
+    bills_before_payday = (
+        sum_bills_before_payday(expected_bills, today, next_payday) if next_payday is not None else None
+    )
+    cash_after_bills = (
+        included_account_balance_cents - bills_before_payday if bills_before_payday is not None else None
+    )
     return BudgetSummary(
         budget_month_id=budget_month_id,
         month=month,
@@ -254,6 +265,11 @@ def summarize_budget(
         bills_before_payday_cents=bills_before_payday,
         cash_after_bills_cents=cash_after_bills,
         categories=category_tuple,
+        as_of=today,
+        low_cushion=(
+            cash_after_bills // max(days_until_payday, 1) < low_cushion_daily_cents
+            if cash_after_bills is not None and days_until_payday is not None else None
+        ),
     )
 
 

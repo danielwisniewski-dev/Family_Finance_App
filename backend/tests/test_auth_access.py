@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from backend.app.auth import hash_session_token
-from backend.app.api import ApiHandler, build_server
+from backend.app.api import build_server
 from backend.app.plaid import (
     InMemoryPlaidTokenStore,
     PlaidAccountSnapshot,
@@ -45,8 +45,8 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             month="2026-07",
             transaction_id="kara-txn-1",
         )
-        ApiHandler.plaid_service = PlaidConnectionService(
-            ApiHandler.repository,
+        self.server.RequestHandlerClass.plaid_service = PlaidConnectionService(
+            self.server.RequestHandlerClass.repository,
             client=ApiFakePlaidClient(),
             token_store=InMemoryPlaidTokenStore(),
         )
@@ -72,7 +72,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         result = self.login("daniel", "daniel-local-test")
         token = str(result["token"])
 
-        with ApiHandler.repository.connect() as connection:
+        with self.server.RequestHandlerClass.repository.connect() as connection:
             row = connection.execute(
                 "SELECT token_hash FROM auth_sessions ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -166,7 +166,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
 
     def test_user_cannot_access_another_households_merchant_rules(self) -> None:
         token = str(self.login("daniel", "daniel-local-test")["token"])
-        kara_rule_id = ApiHandler.repository.create_merchant_rule(
+        kara_rule_id = self.server.RequestHandlerClass.repository.create_merchant_rule(
             household_id=self.kara["household_id"],
             merchant_match_text="fresh",
             category_id=self.kara["category_id"],
@@ -217,7 +217,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
 
     def test_user_cannot_access_another_households_accounts_categories_coach_or_plaid(self) -> None:
         token = str(self.login("daniel", "daniel-local-test")["token"])
-        kara_plaid_item_id = ApiHandler.repository.create_plaid_item(
+        kara_plaid_item_id = self.server.RequestHandlerClass.repository.create_plaid_item(
             household_id=self.kara["household_id"],
             plaid_item_id="kara-plaid-item",
             access_token_ref="kara-token-ref",
@@ -304,7 +304,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             token=token,
             expect_status=201,
         )
-        plaid_item = ApiHandler.repository.get_plaid_item(int(result["plaid_item"]["id"]))
+        plaid_item = self.server.RequestHandlerClass.repository.get_plaid_item(int(result["plaid_item"]["id"]))
         serialized = json.dumps(result)
 
         self.assertEqual(plaid_item.household_id, self.daniel["household_id"])
@@ -360,7 +360,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             token=daniel_token,
         )
 
-        with ApiHandler.repository.connect() as connection:
+        with self.server.RequestHandlerClass.repository.connect() as connection:
             daniel_read = connection.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -385,12 +385,12 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
 
     def test_api_responses_do_not_expose_sensitive_provider_or_token_fields(self) -> None:
         token = str(self.login("daniel", "daniel-local-test")["token"])
-        plaid_item_id = ApiHandler.repository.create_plaid_item(
+        plaid_item_id = self.server.RequestHandlerClass.repository.create_plaid_item(
             household_id=self.daniel["household_id"],
             plaid_item_id="secret-plaid-item-id",
             access_token_ref="secret-token-ref",
         )
-        ApiHandler.repository.upsert_connected_account(
+        self.server.RequestHandlerClass.repository.upsert_connected_account(
             plaid_item_id=plaid_item_id,
             budget_month_id=self.daniel["budget_month_id"],
             plaid_account_id="account-id",
@@ -399,7 +399,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             balance_cents=90_000,
             included_in_cash_reality=True,
         )
-        ApiHandler.repository.create_notification_event(
+        self.server.RequestHandlerClass.repository.create_notification_event(
             household_id=self.daniel["household_id"],
             budget_month_id=self.daniel["budget_month_id"],
             event_type="sensitive_metadata",
@@ -446,7 +446,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         month: str,
         transaction_id: str,
     ) -> dict[str, int]:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             household_name,
             spouses=[
                 {
@@ -457,7 +457,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
                 }
             ],
         )
-        with ApiHandler.repository.connect() as connection:
+        with self.server.RequestHandlerClass.repository.connect() as connection:
             user_id = int(
                 connection.execute(
                     "SELECT id FROM users WHERE household_id = ?",
@@ -514,13 +514,13 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             token=token,
             expect_status=201,
         )
-        account_id = ApiHandler.repository.add_cash_account(
+        account_id = self.server.RequestHandlerClass.repository.add_cash_account(
             budget_month_id=budget_month["id"],
             name="Main Checking",
             account_type="checking",
             balance_cents=100_000,
         )
-        transaction_row_id = ApiHandler.repository.upsert_plaid_transaction(
+        transaction_row_id = self.server.RequestHandlerClass.repository.upsert_plaid_transaction(
             cash_account_id=account_id,
             plaid_transaction_id=transaction_id,
             amount_cents=-2_500,
@@ -528,7 +528,7 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
             name="Fresh Market",
             merchant_name="Fresh Market",
         ).transaction_id
-        notification_id = ApiHandler.repository.create_notification_event(
+        notification_id = self.server.RequestHandlerClass.repository.create_notification_event(
             household_id=household_id,
             budget_month_id=budget_month["id"],
             event_type="manual_test",

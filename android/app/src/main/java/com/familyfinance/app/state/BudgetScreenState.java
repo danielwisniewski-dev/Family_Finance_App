@@ -45,11 +45,23 @@ public final class BudgetScreenState {
         return null;
     }
 
+    public static List<BudgetCategory> activeCategories(List<BudgetCategory> categories) {
+        ArrayList<BudgetCategory> result = new ArrayList<>();
+        if (categories != null) {
+            for (BudgetCategory category : categories) {
+                if (!category.archived) {
+                    result.add(category);
+                }
+            }
+        }
+        return result;
+    }
+
     public static String splitValidationMessage(int transactionTotalCents, List<Integer> splitAmountsCents) {
         if (splitAmountsCents == null || splitAmountsCents.size() < 2) {
             return "Use at least two split lines.";
         }
-        int total = 0;
+        long total = 0;
         for (Integer amount : splitAmountsCents) {
             if (amount == null || amount <= 0) {
                 return "Split amounts must be positive.";

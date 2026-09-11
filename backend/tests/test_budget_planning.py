@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from backend.app.api import ApiHandler, build_server
+from backend.app.api import build_server
 from backend.app.db import BudgetRepository
 
 
@@ -300,7 +300,7 @@ class BudgetPlanningApiTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_authenticated_user_can_create_edit_select_and_copy_budget_month(self) -> None:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             "API Planning",
             spouses=[{"name": "Daniel", "username": "api-plan-daniel", "password": "password"}],
         )
@@ -420,7 +420,7 @@ class BudgetPlanningApiTests(unittest.TestCase):
 
     def test_api_responses_remain_sanitized(self) -> None:
         seeded = self.seed_household("Sanitized", "budget-safe", "2026-06")
-        notification_id = ApiHandler.repository.create_notification_event(
+        notification_id = self.server.RequestHandlerClass.repository.create_notification_event(
             household_id=seeded["household_id"],
             budget_month_id=seeded["budget_month_id"],
             event_type="manual_sanitized_test",
@@ -441,12 +441,12 @@ class BudgetPlanningApiTests(unittest.TestCase):
         self.assertNotIn("raw_provider", serialized)
 
     def seed_household(self, name: str, username: str, month: str) -> dict[str, object]:
-        household_id = ApiHandler.repository.create_household(
+        household_id = self.server.RequestHandlerClass.repository.create_household(
             name,
             spouses=[{"name": username, "username": username, "password": "password"}],
         )
         token = self.login(username, "password")
-        with ApiHandler.repository.connect() as connection:
+        with self.server.RequestHandlerClass.repository.connect() as connection:
             user_id = int(
                 connection.execute(
                     "SELECT id FROM users WHERE household_id = ? ORDER BY id LIMIT 1",

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -251,8 +252,8 @@ class OpenAICoachProvider:
     ):
         if not api_key:
             raise CoachConfigurationError("OPENAI_API_KEY is required when COACH_PROVIDER=openai")
-        if timeout_seconds <= 0:
-            raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be positive")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be finite and positive")
         self._api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
@@ -263,14 +264,37 @@ class OpenAICoachProvider:
             task="safe_to_spend",
             facts=safe_to_spend_facts_for_provider(facts),
         )
-        return self._call_or_fallback(payload, fallback_warning_level=facts.warning_level)
+        response = self._call_or_fallback(payload, fallback_warning_level=facts.warning_level)
+        # Structured advice cannot change the backend decision or source facts.
+        if response.warning_level != facts.warning_level or response.proposed_budget_change is not None:
+            response = unavailable_provider_response(facts.warning_level)
+        elif facts.warning_level in {"no", "discuss"} and response != unavailable_provider_response(facts.warning_level):
+            # Matching an enum is insufficient: prose could still say "buy it".
+            # Consequential stop/discuss decisions use deterministic wording.
+            response = MockCoachProvider().explain_safe_to_spend(facts)
+        return replace(
+            response,
+            facts_used=facts.backend_facts,
+            tradeoffs=(
+                f"{format_money(facts.category_remaining_after_cents)} would remain in {facts.category_name}.",
+                facts.required_phrase,
+            ),
+            requires_spouse_discussion=(
+                response.requires_spouse_discussion or facts.warning_level in {"no", "discuss"}
+            ),
+        )
 
     def suggest_budget_change(self, facts: BudgetChangeFactPacket) -> CoachResponse:
         payload = self._build_payload(
             task="budget_change_suggestion",
             facts=budget_change_facts_for_provider(facts),
         )
-        return self._call_or_fallback(payload, fallback_warning_level="discuss")
+        response = self._call_or_fallback(payload, fallback_warning_level="discuss")
+        expected = MockCoachProvider().suggest_budget_change(facts)
+        if response.proposed_budget_change != expected.proposed_budget_change or response.warning_level != expected.warning_level:
+            return expected
+        return replace(response, facts_used=expected.facts_used, tradeoffs=expected.tradeoffs,
+                       requires_spouse_discussion=True)
 
     def _build_payload(self, *, task: str, facts: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -313,7 +337,7 @@ class OpenAICoachProvider:
         try:
             raw_response = self._transport(payload, self._api_key, self.timeout_seconds)
             return coach_response_from_provider_payload(extract_response_json(raw_response))
-        except (CoachProviderError, HTTPError, TimeoutError, URLError, socket.timeout, OSError, ValueError, KeyError):
+        except (CoachProviderError, HTTPError, TimeoutError, URLError, socket.timeout, OSError, ValueError, KeyError, TypeError, AttributeError):
             return unavailable_provider_response(fallback_warning_level)
 
     def _post_response(self, payload: dict[str, Any], api_key: str, timeout_seconds: float) -> dict[str, Any]:
@@ -366,6 +390,8 @@ class CoachService:
         summary: BudgetSummary,
         request: BudgetChangeSuggestionRequest,
     ) -> CoachResponse:
+        if not summary.forecast_available:
+            raise ValueError("No upcoming payday configured")
         if request.amount_cents <= 0:
             raise ValueError("amount_cents must be positive")
         from_category = find_category(summary, request.from_category_id)
@@ -462,8 +488,8 @@ def parse_timeout(value: str) -> float:
         timeout = float(value)
     except ValueError as exc:
         raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be a number") from exc
-    if timeout <= 0:
-        raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be positive")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be finite and positive")
     return timeout
 
 
@@ -591,6 +617,8 @@ def coach_response_from_provider_payload(payload: dict[str, Any]) -> CoachRespon
 
 
 def validate_provider_payload(payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("OpenAI response must be an object")
     for key in (
         "summary",
         "recommendation",
@@ -644,11 +672,11 @@ def validate_proposed_budget_change_payload(payload: dict[str, Any] | None) -> N
             raise ValueError(f"OpenAI response proposed_budget_change missing {key}")
     if not isinstance(payload["change_type"], str):
         raise ValueError("OpenAI response proposed_budget_change.change_type must be a string")
-    if not isinstance(payload["amount_cents"], int):
+    if type(payload["amount_cents"]) is not int or payload["amount_cents"] <= 0:
         raise ValueError("OpenAI response proposed_budget_change.amount_cents must be an integer")
-    if payload["from_category_id"] is not None and not isinstance(payload["from_category_id"], int):
+    if payload["from_category_id"] is not None and type(payload["from_category_id"]) is not int:
         raise ValueError("OpenAI response proposed_budget_change.from_category_id must be integer or null")
-    if payload["to_category_id"] is not None and not isinstance(payload["to_category_id"], int):
+    if payload["to_category_id"] is not None and type(payload["to_category_id"]) is not int:
         raise ValueError("OpenAI response proposed_budget_change.to_category_id must be integer or null")
     if payload["from_category_name"] is not None and not isinstance(payload["from_category_name"], str):
         raise ValueError("OpenAI response proposed_budget_change.from_category_name must be string or null")

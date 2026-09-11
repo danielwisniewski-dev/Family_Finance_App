@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from datetime import date
 from http import HTTPStatus
@@ -41,12 +42,22 @@ class UnauthorizedError(Exception):
     pass
 
 
+class RequestBodyTooLargeError(Exception):
+    pass
+
+
+MAX_REQUEST_BODY_BYTES = 256 * 1024
+REQUEST_TIMEOUT_SECONDS = 15
+
+
 ERROR_CODES = {
     HTTPStatus.BAD_REQUEST: "validation_error",
     HTTPStatus.UNAUTHORIZED: "unauthorized",
     HTTPStatus.FORBIDDEN: "forbidden",
     HTTPStatus.NOT_FOUND: "not_found",
     HTTPStatus.CONFLICT: "conflict",
+    HTTPStatus.REQUEST_TIMEOUT: "request_timeout",
+    HTTPStatus.REQUEST_ENTITY_TOO_LARGE: "request_too_large",
     HTTPStatus.SERVICE_UNAVAILABLE: "service_unavailable",
     HTTPStatus.INTERNAL_SERVER_ERROR: "backend_error",
 }
@@ -56,6 +67,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     repository: BudgetRepository
     plaid_service: PlaidConnectionService
     coach_service: CoachService
+
+    def setup(self) -> None:
+        self.request.settimeout(REQUEST_TIMEOUT_SECONDS)
+        super().setup()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -78,7 +93,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 auth = self.require_auth()
                 self.send_json({"budget_months": self.repository.list_budget_months(auth["household_id"])})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/summary"):
+            if resource_path(parsed.path, "budget-months", "summary"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -87,7 +102,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 summary = self.repository.get_summary(budget_month_id, today)
                 self.send_json(summary_to_dict(summary))
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/budget-detail"):
+            if resource_path(parsed.path, "budget-months", "budget-detail"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -95,21 +110,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 today = parse_date(query.get("today", [date.today().isoformat()])[0])
                 self.send_json(self.repository.get_budget_detail(budget_month_id, today))
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/accounts"):
+            if resource_path(parsed.path, "budget-months", "accounts"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
                 accounts = self.repository.list_accounts(budget_month_id)
                 self.send_json({"accounts": [account_to_dict(account) for account in accounts]})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/transactions"):
+            if resource_path(parsed.path, "budget-months", "transactions"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
                 transactions = self.repository.list_budget_transactions(budget_month_id)
                 self.send_json({"transactions": [transaction_detail_to_dict(item) for item in transactions]})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/transaction-review-queue"):
+            if resource_path(parsed.path, "budget-months", "transaction-review-queue"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -136,7 +151,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"rules": [merchant_rule_to_dict(rule) for rule in rules]})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications"):
+            if resource_path(parsed.path, "budget-months", "notifications"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -149,7 +164,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"notifications": [notification_event_to_dict(event) for event in events]})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications/unread-count"):
+            if resource_path(parsed.path, "budget-months", "notifications/unread-count"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -159,7 +174,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"unread_count": count})
                 return
-            if parsed.path.startswith("/households/") and parsed.path.endswith("/notifications"):
+            if resource_path(parsed.path, "households", "notifications"):
                 auth = self.require_auth()
                 household_id = int(parsed.path.split("/")[2])
                 require_same_household(household_id, auth)
@@ -172,7 +187,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"notifications": [notification_event_to_dict(event) for event in events]})
                 return
-            if parsed.path.startswith("/households/") and parsed.path.endswith("/notifications/unread-count"):
+            if resource_path(parsed.path, "households", "notifications/unread-count"):
                 auth = self.require_auth()
                 household_id = int(parsed.path.split("/")[2])
                 require_same_household(household_id, auth)
@@ -182,7 +197,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"unread_count": count})
                 return
-            if parsed.path.startswith("/transactions/"):
+            if resource_path(parsed.path, "transactions"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
                 self.repository.require_transaction_access(transaction_id, auth["household_id"])
@@ -229,58 +244,58 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/budget-months":
                 auth = self.require_auth()
-                require_same_household(int(payload["household_id"]), auth)
+                require_same_household(require_int(payload, "household_id"), auth)
                 budget_month_id = self.repository.create_budget_month(
-                    household_id=int(payload["household_id"]),
+                    household_id=require_int(payload, "household_id"),
                     month=payload["month"],
-                    included_account_balance_cents=int(payload.get("included_account_balance_cents", 0)),
-                    low_cushion_daily_cents=int(payload.get("low_cushion_daily_cents", 5_000)),
+                    included_account_balance_cents=require_int(payload, "included_account_balance_cents", default=0),
+                    low_cushion_daily_cents=require_int(payload, "low_cushion_daily_cents", default=5_000),
                     copy_from_budget_month_id=optional_int(payload, "copy_from_budget_month_id"),
                 )
                 self.send_json({"id": budget_month_id}, status=HTTPStatus.CREATED)
                 return
             if parsed.path == "/income":
                 auth = self.require_auth()
-                self.repository.require_budget_month_access(int(payload["budget_month_id"]), auth["household_id"])
+                self.repository.require_budget_month_access(require_int(payload, "budget_month_id"), auth["household_id"])
                 income_id = self.repository.add_income(
-                    budget_month_id=int(payload["budget_month_id"]),
+                    budget_month_id=require_int(payload, "budget_month_id"),
                     name=payload["name"],
                     kind=payload["kind"],
-                    planned_cents=int(payload.get("planned_cents", 0)),
-                    received_cents=int(payload.get("received_cents", 0)),
+                    planned_cents=require_int(payload, "planned_cents", default=0),
+                    received_cents=require_int(payload, "received_cents", default=0),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"id": income_id}, status=HTTPStatus.CREATED)
                 return
             if parsed.path == "/budget-groups":
                 auth = self.require_auth()
-                self.repository.require_budget_month_access(int(payload["budget_month_id"]), auth["household_id"])
+                self.repository.require_budget_month_access(require_int(payload, "budget_month_id"), auth["household_id"])
                 group_id = self.repository.add_budget_group(
-                    budget_month_id=int(payload["budget_month_id"]),
+                    budget_month_id=require_int(payload, "budget_month_id"),
                     name=payload["name"],
-                    display_order=int(payload.get("display_order", 0)),
+                    display_order=require_int(payload, "display_order", default=0),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"id": group_id}, status=HTTPStatus.CREATED)
                 return
             if parsed.path == "/categories":
                 auth = self.require_auth()
-                self.repository.require_budget_group_access(int(payload["budget_group_id"]), auth["household_id"])
+                self.repository.require_budget_group_access(require_int(payload, "budget_group_id"), auth["household_id"])
                 category_id = self.repository.add_category(
-                    budget_group_id=int(payload["budget_group_id"]),
+                    budget_group_id=require_int(payload, "budget_group_id"),
                     name=payload["name"],
-                    planned_cents=int(payload.get("planned_cents", 0)),
-                    display_order=int(payload.get("display_order", 0)),
+                    planned_cents=require_int(payload, "planned_cents", default=0),
+                    display_order=require_int(payload, "display_order", default=0),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"id": category_id}, status=HTTPStatus.CREATED)
                 return
             if parsed.path == "/spending":
                 auth = self.require_auth()
-                self.repository.require_category_access(int(payload["category_id"]), auth["household_id"])
+                self.repository.require_category_access(require_int(payload, "category_id"), auth["household_id"])
                 spending_id = self.repository.record_spending(
-                    category_id=int(payload["category_id"]),
-                    amount_cents=int(payload["amount_cents"]),
+                    category_id=require_int(payload, "category_id"),
+                    amount_cents=require_int(payload, "amount_cents"),
                     occurred_on=parse_date(payload["occurred_on"]),
                     note=payload.get("note"),
                 )
@@ -288,22 +303,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/expected-bills":
                 auth = self.require_auth()
-                self.repository.require_budget_month_access(int(payload["budget_month_id"]), auth["household_id"])
+                self.repository.require_budget_month_access(require_int(payload, "budget_month_id"), auth["household_id"])
                 bill_id = self.repository.add_expected_bill(
-                    budget_month_id=int(payload["budget_month_id"]),
+                    budget_month_id=require_int(payload, "budget_month_id"),
                     name=payload["name"],
-                    amount_cents=int(payload["amount_cents"]),
+                    amount_cents=require_int(payload, "amount_cents"),
                     due_on=parse_date(payload["due_on"]),
-                    paid=bool(payload.get("paid", False)),
+                    paid=boolean_field(payload, "paid", False),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"id": bill_id}, status=HTTPStatus.CREATED)
                 return
             if parsed.path == "/paydays":
                 auth = self.require_auth()
-                require_same_household(int(payload["household_id"]), auth)
+                require_same_household(require_int(payload, "household_id"), auth)
                 payday_id = self.repository.add_payday(
-                    household_id=int(payload["household_id"]),
+                    household_id=require_int(payload, "household_id"),
                     payday_date=parse_date(payload["payday_date"]),
                     actor_user_id=auth["user_id"],
                 )
@@ -311,13 +326,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/safe-to-spend":
                 auth = self.require_auth()
-                budget_month_id = int(payload["budget_month_id"])
+                budget_month_id = require_int(payload, "budget_month_id")
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
-                self.repository.require_category_access(int(payload["category_id"]), auth["household_id"])
+                self.repository.require_category_access(require_int(payload, "category_id"), auth["household_id"])
                 result = self.repository.safe_to_spend(
                     budget_month_id=budget_month_id,
-                    category_id=int(payload["category_id"]),
-                    purchase_amount_cents=int(payload["purchase_amount_cents"]),
+                    category_id=require_int(payload, "category_id"),
+                    purchase_amount_cents=require_int(payload, "purchase_amount_cents"),
                     today=parse_date(payload.get("today", date.today().isoformat())),
                     urgency=payload.get("urgency", "planned_want"),
                     actor_user_id=auth["user_id"],
@@ -411,7 +426,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/plaid/exchange-public-token":
                 auth = self.require_auth()
-                budget_month_id = int(payload["budget_month_id"])
+                budget_month_id = require_int(payload, "budget_month_id")
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
                 result = self.plaid_service.exchange_public_token(
                     household_id=auth["household_id"],
@@ -423,7 +438,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/plaid/sync":
                 auth = self.require_auth()
                 sync_type = payload["sync_type"]
-                plaid_item_id = int(payload["plaid_item_id"])
+                plaid_item_id = require_int(payload, "plaid_item_id")
                 self.repository.require_plaid_item_access(plaid_item_id, auth["household_id"])
                 if sync_type == "balance":
                     outcome = self.plaid_service.sync_balances(plaid_item_id)
@@ -435,7 +450,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/merchant-category-rules":
                 auth = self.require_auth()
-                category_id = int(payload["category_id"])
+                category_id = require_int(payload, "category_id")
                 self.repository.require_category_access(category_id, auth["household_id"])
                 merchant_match_text = payload.get("merchant_match_text")
                 transaction_id = optional_int(payload, "transaction_id")
@@ -448,9 +463,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     household_id=auth["household_id"],
                     merchant_match_text=str(merchant_match_text or ""),
                     category_id=category_id,
-                    priority=int(payload.get("priority", 100)),
+                    priority=require_int(payload, "priority", default=100),
                     actor_user_id=auth["user_id"],
-                    apply_to_existing_unreviewed=bool(payload.get("apply_to_existing_unreviewed", False)),
+                    apply_to_existing_unreviewed=boolean_field(payload, "apply_to_existing_unreviewed", False),
                 )
                 self.send_json({"id": rule_id}, status=HTTPStatus.CREATED)
                 return
@@ -479,7 +494,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/activate"):
+            if resource_path(parsed.path, "budget-months", "activate"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.set_active_budget_month(
@@ -488,7 +503,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.count("/") == 2:
+            if resource_path(parsed.path, "budget-months"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -500,7 +515,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/income/"):
+            if resource_path(parsed.path, "income"):
                 auth = self.require_auth()
                 income_id = int(parsed.path.split("/")[2])
                 self.repository.require_income_access(income_id, auth["household_id"])
@@ -514,7 +529,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/budget-groups/"):
+            if resource_path(parsed.path, "budget-groups"):
                 auth = self.require_auth()
                 budget_group_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_group_access(budget_group_id, auth["household_id"])
@@ -522,29 +537,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                     budget_group_id=budget_group_id,
                     name=payload.get("name"),
                     display_order=optional_int(payload, "display_order"),
-                    archived=payload.get("archived"),
+                    archived=boolean_field(payload, "archived"),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/categories/"):
+            if resource_path(parsed.path, "categories"):
                 auth = self.require_auth()
                 category_id = int(parsed.path.split("/")[2])
                 self.repository.require_category_access(category_id, auth["household_id"])
                 if payload.get("budget_group_id") is not None:
-                    self.repository.require_budget_group_access(int(payload["budget_group_id"]), auth["household_id"])
+                    self.repository.require_budget_group_access(require_int(payload, "budget_group_id"), auth["household_id"])
                 self.repository.update_category(
                     category_id=category_id,
                     name=payload.get("name"),
                     budget_group_id=optional_int(payload, "budget_group_id"),
                     planned_cents=optional_int(payload, "planned_cents"),
                     display_order=optional_int(payload, "display_order"),
-                    archived=payload.get("archived"),
+                    archived=boolean_field(payload, "archived"),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/expected-bills/"):
+            if resource_path(parsed.path, "expected-bills"):
                 auth = self.require_auth()
                 bill_id = int(parsed.path.split("/")[2])
                 self.repository.require_bill_access(bill_id, auth["household_id"])
@@ -553,12 +568,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     name=payload.get("name"),
                     amount_cents=optional_int(payload, "amount_cents"),
                     due_on=parse_date(payload["due_on"]) if payload.get("due_on") is not None else None,
-                    paid=payload.get("paid"),
+                    paid=boolean_field(payload, "paid"),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/paydays/"):
+            if resource_path(parsed.path, "paydays"):
                 auth = self.require_auth()
                 payday_id = int(parsed.path.split("/")[2])
                 self.repository.require_payday_access(payday_id, auth["household_id"])
@@ -569,86 +584,91 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/account-balance"):
+            if resource_path(parsed.path, "budget-months", "account-balance"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
                 self.repository.update_account_balance(
                     budget_month_id,
-                    int(payload["included_account_balance_cents"]),
+                    require_int(payload, "included_account_balance_cents"),
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/accounts/"):
+            if resource_path(parsed.path, "accounts"):
                 auth = self.require_auth()
                 account_id = int(parsed.path.split("/")[2])
                 self.repository.require_account_access(account_id, auth["household_id"])
                 if "included_in_cash_reality" in payload:
                     self.repository.set_account_included(
                         account_id=account_id,
-                        included_in_cash_reality=bool(payload["included_in_cash_reality"]),
+                        included_in_cash_reality=boolean_field(payload, "included_in_cash_reality", False),
                     )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/review"):
+            if resource_path(parsed.path, "transactions", "review"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
                 self.repository.require_transaction_access(transaction_id, auth["household_id"])
                 self.repository.mark_transaction_reviewed(
                     transaction_id,
-                    reviewed=bool(payload.get("reviewed", True)),
+                    reviewed=boolean_field(payload, "reviewed", True),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/category"):
+            if resource_path(parsed.path, "transactions", "category"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
                 self.repository.require_transaction_access(transaction_id, auth["household_id"])
                 if payload.get("category_id") is None:
                     self.repository.remove_transaction_category(
                         transaction_id,
-                        reviewed=bool(payload.get("reviewed", False)),
+                        reviewed=boolean_field(payload, "reviewed", False),
                         actor_user_id=auth["user_id"],
                     )
                 else:
-                    self.repository.require_category_access(int(payload["category_id"]), auth["household_id"])
+                    self.repository.require_category_access(require_int(payload, "category_id"), auth["household_id"])
                     self.repository.assign_transaction_category(
                         transaction_id=transaction_id,
-                        category_id=int(payload["category_id"]),
+                        category_id=require_int(payload, "category_id"),
                         source=payload.get("source", "manual"),
-                        reviewed=bool(payload.get("reviewed", True)),
+                        reviewed=boolean_field(payload, "reviewed", True),
                         actor_user_id=auth["user_id"],
                     )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/split"):
+            if resource_path(parsed.path, "transactions", "split"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
                 self.repository.require_transaction_access(transaction_id, auth["household_id"])
-                for split in payload["splits"]:
-                    self.repository.require_category_access(int(split["category_id"]), auth["household_id"])
+                splits = [
+                    dict(split, category_id=require_int(split, "category_id"),
+                         amount_cents=require_int(split, "amount_cents"))
+                    for split in payload["splits"]
+                ]
+                for split in splits:
+                    self.repository.require_category_access(split["category_id"], auth["household_id"])
                 self.repository.split_transaction(
                     transaction_id=transaction_id,
-                    splits=payload["splits"],
-                    reviewed=bool(payload.get("reviewed", True)),
+                    splits=splits,
+                    reviewed=boolean_field(payload, "reviewed", True),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/ignore"):
+            if resource_path(parsed.path, "transactions", "ignore"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
                 self.repository.require_transaction_access(transaction_id, auth["household_id"])
                 self.repository.set_transaction_ignored(
                     transaction_id=transaction_id,
-                    ignored=bool(payload.get("ignored", True)),
+                    ignored=boolean_field(payload, "ignored", True),
                     reason=payload.get("reason"),
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/merchant-category-rules/"):
+            if resource_path(parsed.path, "merchant-category-rules"):
                 auth = self.require_auth()
                 rule_id = int(parsed.path.split("/")[2])
                 self.repository.require_merchant_rule_access(rule_id, auth["household_id"])
@@ -660,13 +680,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     merchant_match_text=payload.get("merchant_match_text"),
                     category_id=category_id,
                     priority=optional_int(payload, "priority"),
-                    active=payload.get("active"),
+                    active=boolean_field(payload, "active"),
                     actor_user_id=auth["user_id"],
-                    apply_to_existing_unreviewed=bool(payload.get("apply_to_existing_unreviewed", False)),
+                    apply_to_existing_unreviewed=boolean_field(payload, "apply_to_existing_unreviewed", False),
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/notifications/") and parsed.path.endswith("/read"):
+            if resource_path(parsed.path, "notifications", "read"):
                 auth = self.require_auth()
                 notification_id = int(parsed.path.split("/")[2])
                 self.repository.require_notification_access(notification_id, auth["household_id"])
@@ -676,7 +696,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/households/") and parsed.path.endswith("/notifications/read-all"):
+            if resource_path(parsed.path, "households", "notifications/read-all"):
                 auth = self.require_auth()
                 household_id = int(parsed.path.split("/")[2])
                 require_same_household(household_id, auth)
@@ -687,7 +707,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/budget-months/") and parsed.path.endswith("/notifications/read-all"):
+            if resource_path(parsed.path, "budget-months", "notifications/read-all"):
                 auth = self.require_auth()
                 budget_month_id = int(parsed.path.split("/")[2])
                 self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
@@ -704,28 +724,28 @@ class ApiHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         try:
-            if parsed.path.startswith("/income/"):
+            if resource_path(parsed.path, "income"):
                 auth = self.require_auth()
                 income_id = int(parsed.path.split("/")[2])
                 self.repository.require_income_access(income_id, auth["household_id"])
                 self.repository.remove_income(income_id=income_id, actor_user_id=auth["user_id"])
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/expected-bills/"):
+            if resource_path(parsed.path, "expected-bills"):
                 auth = self.require_auth()
                 bill_id = int(parsed.path.split("/")[2])
                 self.repository.require_bill_access(bill_id, auth["household_id"])
                 self.repository.remove_expected_bill(bill_id=bill_id, actor_user_id=auth["user_id"])
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/paydays/"):
+            if resource_path(parsed.path, "paydays"):
                 auth = self.require_auth()
                 payday_id = int(parsed.path.split("/")[2])
                 self.repository.require_payday_access(payday_id, auth["household_id"])
                 self.repository.remove_payday(payday_id=payday_id, actor_user_id=auth["user_id"])
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/transactions/") and parsed.path.endswith("/split"):
+            if resource_path(parsed.path, "transactions", "split"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
                 self.repository.require_transaction_access(transaction_id, auth["household_id"])
@@ -735,7 +755,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if parsed.path.startswith("/merchant-category-rules/"):
+            if resource_path(parsed.path, "merchant-category-rules"):
                 auth = self.require_auth()
                 rule_id = int(parsed.path.split("/")[2])
                 self.repository.require_merchant_rule_access(rule_id, auth["household_id"])
@@ -757,27 +777,47 @@ class ApiHandler(BaseHTTPRequestHandler):
         return context
 
     def optional_auth(self) -> dict[str, Any] | None:
-        header = self.headers.get("Authorization", "")
-        scheme, _, token = header.partition(" ")
-        if scheme.casefold() != "bearer" or not token.strip():
+        if "Authorization" not in self.headers:
             return None
-        context = self.repository.auth_context_for_token(token.strip())
-        if context is None:
-            raise UnauthorizedError("Authentication required")
-        return context
+        return self.require_auth()
 
     def read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", 0))
+        if self.headers.get("Transfer-Encoding") is not None:
+            raise ValueError("Transfer-Encoding is not supported")
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) > 1:
+            raise ValueError("Content-Length must appear only once")
+        length_text = lengths[0] if lengths else "0"
+        if re.fullmatch(r"[0-9]+", length_text) is None:
+            raise ValueError("Content-Length must be a nonnegative integer")
+        length = int(length_text)
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise RequestBodyTooLargeError()
         if length == 0:
             return {}
-        raw = self.rfile.read(length).decode("utf-8")
-        return json.loads(raw)
+        if self.headers.get_content_type() != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("Request body is incomplete")
+        try:
+            payload = json.loads(
+                raw.decode("utf-8"), parse_constant=reject_json_constant, object_pairs_hook=unique_json_object,
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            validate_text_fields(payload)
+        except (UnicodeDecodeError, RecursionError) as exc:
+            raise ValueError("Request body must be valid UTF-8 JSON") from exc
+        return payload
 
     def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -801,17 +841,21 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 def error_response_for_exception(exc: Exception) -> tuple[HTTPStatus, str]:
+    if isinstance(exc, RequestBodyTooLargeError):
+        return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large"
+    if isinstance(exc, TimeoutError):
+        return HTTPStatus.REQUEST_TIMEOUT, "Request timed out"
     if isinstance(exc, UnauthorizedError):
-        return HTTPStatus.UNAUTHORIZED, "Authentication required" if not str(exc) else sanitize_api_error(str(exc))
+        return HTTPStatus.UNAUTHORIZED, "Invalid credentials" if str(exc) == "Invalid credentials" else "Authentication required"
     if isinstance(exc, PermissionError):
         return HTTPStatus.FORBIDDEN, sanitize_api_error(str(exc) or "Forbidden")
-    if isinstance(exc, LookupError):
+    if isinstance(exc, LookupError) and not isinstance(exc, (KeyError, IndexError)):
         return HTTPStatus.NOT_FOUND, sanitize_api_error(str(exc) or "Not found")
     if isinstance(exc, PlaidIntegrationError):
         return HTTPStatus.SERVICE_UNAVAILABLE, sanitize_plaid_error(str(exc))
     if isinstance(exc, sqlite3.IntegrityError):
         return HTTPStatus.CONFLICT, "Request conflicts with existing data"
-    if isinstance(exc, (json.JSONDecodeError, ValueError, KeyError, TypeError)):
+    if isinstance(exc, (json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError, OverflowError)):
         return HTTPStatus.BAD_REQUEST, sanitize_api_error(validation_message(exc))
     return HTTPStatus.INTERNAL_SERVER_ERROR, "Backend error"
 
@@ -823,6 +867,8 @@ def validation_message(exc: Exception) -> str:
     if isinstance(exc, KeyError):
         key = str(exc).strip("'")
         return f"{key} is required" if key else "Required field is missing"
+    if isinstance(exc, (TypeError, IndexError, OverflowError)):
+        return "Request contains an invalid field value"
     if "invalid literal for int()" in message:
         return "Numeric fields must be valid whole numbers"
     if "Invalid isoformat string" in message:
@@ -853,30 +899,86 @@ def sanitize_api_error(message: str) -> str:
 
 def parse_date(value: str) -> date:
     try:
-        return date.fromisoformat(str(value))
+        if not isinstance(value, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is None:
+            raise ValueError("Invalid date format")
+        return date.fromisoformat(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("Date fields must use YYYY-MM-DD") from exc
 
 
-def require_int(payload: dict[str, Any], key: str, fallback_key: str | None = None) -> int:
+def require_int(payload: dict[str, Any], key: str, fallback_key: str | None = None, *, default: int | None = None) -> int:
     if key not in payload and (fallback_key is None or fallback_key not in payload):
+        if default is not None:
+            return default
         if fallback_key is None:
             raise ValueError(f"{key} is required")
         raise ValueError(f"{key} or {fallback_key} is required")
     value = payload.get(key, payload.get(fallback_key))
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be an integer") from exc
+    return parse_integer(value, key)
 
 
 def optional_int(payload: dict[str, Any], key: str) -> int | None:
     if key not in payload or payload[key] is None:
         return None
-    try:
-        return int(payload[key])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be an integer") from exc
+    return parse_integer(payload[key], key)
+
+
+def parse_integer(value: Any, key: str) -> int:
+    # Retain whole-number strings used by existing clients, without truncating
+    # JSON floats or accepting booleans as money/identifiers.
+    if type(value) is not int and not (isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value.strip())):
+        raise ValueError(f"{key} must be an integer")
+    result = int(value)
+    if not -(2**63) <= result < 2**63:
+        raise ValueError(f"{key} is outside the supported integer range")
+    return result
+
+
+def boolean_field(payload: dict[str, Any], key: str, default: bool | None = None) -> bool | None:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if value is None and default is None:
+        return None
+    if type(value) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def reject_json_constant(value: str) -> None:
+    raise ValueError("Request body must use finite JSON numbers")
+
+
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Request body contains duplicate fields")
+        result[key] = value
+    return result
+
+
+def validate_text_fields(payload: dict[str, Any]) -> None:
+    text_fields = {
+        "username", "email", "password", "household_name", "name", "display_name", "role",
+        "current_password", "new_password", "month", "kind", "note", "purpose",
+        "urgency", "public_token", "sync_type", "merchant_match_text", "source", "reason",
+    }
+    for key in text_fields & payload.keys():
+        if payload[key] is not None and not isinstance(payload[key], str):
+            raise ValueError(f"{key} must be text")
+    for key in ("users", "splits"):
+        if key in payload:
+            values = payload[key]
+            if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
+                raise ValueError(f"{key} must be an array of objects")
+            for item in values:
+                validate_text_fields(item)
+
+
+def resource_path(path: str, resource: str, action: str = "") -> bool:
+    suffix = "/" + re.escape(action) if action else ""
+    return re.fullmatch("/" + re.escape(resource) + r"/[0-9]+" + suffix, path) is not None
 
 
 def require_user_id(payload: dict[str, Any]) -> int:
@@ -914,19 +1016,20 @@ def optional_query_int(query: dict[str, list[str]], key: str, fallback_key: str 
         value = optional_query_value(query, fallback_key)
     if value is None:
         return None
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{key} must be an integer") from exc
+    return parse_integer(value, key)
 
 
 def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     repository = BudgetRepository(db_path)
     repository.initialize()
-    ApiHandler.repository = repository
-    ApiHandler.plaid_service = build_plaid_service_from_env(repository)
-    ApiHandler.coach_service = build_coach_service_from_env()
-    return ThreadingHTTPServer((host, port), ApiHandler)
+
+    class ConfiguredApiHandler(ApiHandler):
+        pass
+
+    ConfiguredApiHandler.repository = repository
+    ConfiguredApiHandler.plaid_service = build_plaid_service_from_env(repository)
+    ConfiguredApiHandler.coach_service = build_coach_service_from_env()
+    return ThreadingHTTPServer((host, port), ConfiguredApiHandler)
 
 
 def main() -> None:

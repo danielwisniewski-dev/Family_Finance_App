@@ -3,6 +3,8 @@
 
     <application
         android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="Family Finance"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"

@@ -22,8 +22,8 @@ public final class PlannedIncome {
                 json.optInt("id"),
                 json.optString("name"),
                 json.optString("kind", "main"),
-                json.optInt("planned_cents"),
-                json.optInt("received_cents")
+                JsonMoney.cents(json, "planned_cents"),
+                JsonMoney.cents(json, "received_cents")
         );
     }
 }

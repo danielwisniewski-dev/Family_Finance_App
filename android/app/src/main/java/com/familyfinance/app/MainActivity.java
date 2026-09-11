@@ -1,6 +1,7 @@
 package com.familyfinance.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.res.ColorStateList;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -15,6 +16,7 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -27,6 +29,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.familyfinance.app.api.FamilyFinanceApi;
+import com.familyfinance.app.api.ApiException;
 import com.familyfinance.app.model.AppDiagnostics;
 import com.familyfinance.app.model.BudgetDetail;
 import com.familyfinance.app.model.BudgetGroup;
@@ -44,6 +47,7 @@ import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
 import com.familyfinance.app.state.BudgetScreenState;
+import com.familyfinance.app.state.ConnectionSettings;
 import com.familyfinance.app.state.LoginErrorMessages;
 import com.familyfinance.app.state.MoneyFormatter;
 import com.plaid.link.Plaid;
@@ -111,6 +115,10 @@ public final class MainActivity extends Activity {
     private List<NotificationEvent> notifications = new ArrayList<>();
     private int unreadNotificationCount;
     private PlaidHandler plaidHandler;
+    private boolean reviewingQueue;
+    private String currentScreen = "";
+    private volatile boolean destroyed;
+    private boolean savedConnectionReset;
     private final LinkResultHandler plaidResultHandler = new LinkResultHandler(
             linkSuccess -> {
                 String publicToken = linkSuccess.getPublicToken();
@@ -122,13 +130,9 @@ public final class MainActivity extends Activity {
                 return Unit.INSTANCE;
             },
             linkExit -> {
-                String message = "Plaid Link was cancelled.";
-                if (linkExit.getError() != null) {
-                    String display = linkExit.getError().getDisplayMessage();
-                    String code = String.valueOf(linkExit.getError().getErrorCode());
-                    message = (display == null || display.isEmpty() ? "Plaid Link failed" : display)
-                            + (code == null || code.isEmpty() ? "" : " (" + code + ")");
-                }
+                String message = linkExit.getError() == null ? "Plaid Link was cancelled."
+                        : "Plaid Link could not finish. Check your Sandbox connection and try again.";
+                showSettings();
                 toast(message);
                 return Unit.INSTANCE;
             }
@@ -138,7 +142,9 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         loadPreferences();
-        if (authToken == null || authToken.isEmpty()) {
+        if (savedConnectionReset) {
+            showLogin("The saved backend URL was invalid and has been reset. Check the connection and log in again.");
+        } else if (authToken == null || authToken.isEmpty()) {
             checkSetupThenShowLogin(null);
         } else {
             showLoading("Loading dashboard...");
@@ -148,8 +154,34 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
         super.onDestroy();
+    }
+
+    private void postIfActive(Runnable action) {
+        mainHandler.post(() -> {
+            if (!destroyed && !isFinishing()) {
+                action.run();
+            }
+        });
+    }
+
+    @Override
+    public void onBackPressed() {
+        if ("Family Finance".equals(currentScreen)) {
+            return;
+        }
+        if (authToken != null && !authToken.isEmpty() && !"Dashboard".equals(currentScreen)) {
+            if ("Transaction Detail".equals(currentScreen)) {
+                showTransactions(reviewingQueue);
+            } else {
+                showDashboard();
+            }
+            return;
+        }
+        super.onBackPressed();
     }
 
     @Override
@@ -160,7 +192,15 @@ public final class MainActivity extends Activity {
 
     private void loadPreferences() {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        baseUrl = prefs.getString("base_url", DEFAULT_BASE_URL);
+        try {
+            baseUrl = ConnectionSettings.normalizeBaseUrl(prefs.getString("base_url", DEFAULT_BASE_URL));
+        } catch (IllegalArgumentException exception) {
+            baseUrl = DEFAULT_BASE_URL;
+            savedConnectionReset = true;
+            prefs.edit().putString("base_url", DEFAULT_BASE_URL)
+                    .remove("auth_token").remove("current_user_id").remove("current_user_name")
+                    .remove("household_id").remove("household_name").apply();
+        }
         budgetMonthId = prefs.getInt("budget_month_id", DEFAULT_BUDGET_MONTH_ID);
         authToken = prefs.getString("auth_token", "");
         currentUserId = prefs.getInt("current_user_id", 0);
@@ -171,6 +211,10 @@ public final class MainActivity extends Activity {
     }
 
     private void saveConnectionPreferences(String newBaseUrl, int newBudgetMonthId) {
+        newBaseUrl = ConnectionSettings.normalizeBaseUrl(newBaseUrl);
+        if (ConnectionSettings.requiresNewSession(baseUrl, newBaseUrl)) {
+            clearSession();
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putString("base_url", newBaseUrl)
@@ -192,6 +236,11 @@ public final class MainActivity extends Activity {
     }
 
     private void logout() {
+        clearSession();
+        checkSetupThenShowLogin("Logged out.");
+    }
+
+    private void clearSession() {
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .remove("auth_token")
@@ -201,6 +250,10 @@ public final class MainActivity extends Activity {
                 .remove("household_name")
                 .apply();
         loadPreferences();
+        clearFinancialData();
+    }
+
+    private void clearFinancialData() {
         summary = null;
         budgetDetail = null;
         budgetMonths = new ArrayList<>();
@@ -210,15 +263,19 @@ public final class MainActivity extends Activity {
         merchantRules = new ArrayList<>();
         notifications = new ArrayList<>();
         unreadNotificationCount = 0;
-        checkSetupThenShowLogin("Logged out.");
+        reviewingQueue = false;
     }
 
     private void refreshData(Runnable afterLoad) {
+        if (authToken == null || authToken.isEmpty()) {
+            showLogin("Log in to load your household data.");
+            return;
+        }
         executor.execute(() -> {
             try {
                 List<BudgetMonth> loadedBudgetMonths = api.getBudgetMonths();
                 if (loadedBudgetMonths.isEmpty()) {
-                    mainHandler.post(() -> {
+                    postIfActive(() -> {
                         budgetMonths = loadedBudgetMonths;
                         budgetDetail = null;
                         summary = null;
@@ -240,7 +297,7 @@ public final class MainActivity extends Activity {
                 List<MerchantRule> loadedMerchantRules = api.getMerchantRules();
                 List<NotificationEvent> loadedNotifications = api.getNotifications(selectedBudgetMonthId);
                 int loadedUnreadNotificationCount = api.getUnreadNotificationCount(selectedBudgetMonthId);
-                mainHandler.post(() -> {
+                postIfActive(() -> {
                     budgetDetail = loadedBudgetDetail;
                     summary = loadedBudgetDetail.summary;
                     budgetMonths = loadedBudgetMonths;
@@ -256,7 +313,10 @@ public final class MainActivity extends Activity {
                     afterLoad.run();
                 });
             } catch (Exception exception) {
-                mainHandler.post(() -> showError("Could not load backend data", exception));
+                postIfActive(() -> {
+                    clearFinancialData();
+                    showError("Could not load backend data", exception);
+                });
             }
         });
     }
@@ -280,7 +340,7 @@ public final class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 SetupStatus status = new FamilyFinanceApi(baseUrl).getSetupStatus();
-                mainHandler.post(() -> {
+                postIfActive(() -> {
                     if (status.canInitialize) {
                         showFirstRunSetup(message);
                     } else {
@@ -288,7 +348,7 @@ public final class MainActivity extends Activity {
                     }
                 });
             } catch (Exception exception) {
-                mainHandler.post(() -> showLogin(
+                postIfActive(() -> showLogin(
                         "Backend is unreachable at " + baseUrl + ". Check the server URL and try again."
                 ));
             }
@@ -302,6 +362,7 @@ public final class MainActivity extends Activity {
         }
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
+        baseUrlInput.setHint("Backend URL");
         baseUrlInput.setSingleLine(true);
         baseUrlInput.setText(baseUrl);
         root.addView(baseUrlInput);
@@ -354,7 +415,13 @@ public final class MainActivity extends Activity {
         root.addView(karaPassword);
 
         addButton("Create private household", () -> {
-            String newBaseUrl = baseUrlInput.getText().toString().trim();
+            String newBaseUrl;
+            try {
+                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString());
+            } catch (IllegalArgumentException exception) {
+                toast(exception.getMessage());
+                return;
+            }
             String householdName = householdInput.getText().toString().trim();
             String primaryUsername = danielUsername.getText().toString().trim();
             String primaryPassword = danielPassword.getText().toString();
@@ -390,12 +457,12 @@ public final class MainActivity extends Activity {
                         ));
                     }
                     new FamilyFinanceApi(newBaseUrl).initializeHousehold(householdName, users);
-                    mainHandler.post(() -> {
+                    postIfActive(() -> {
                         saveConnectionPreferences(newBaseUrl, budgetMonthId);
                         showLogin("Household created. Log in with the local credentials you just set.");
                     });
                 } catch (Exception exception) {
-                    mainHandler.post(() -> showFirstRunSetup(exception.getMessage()));
+                    postIfActive(() -> showFirstRunSetup(exception.getMessage()));
                 }
             });
         });
@@ -420,6 +487,7 @@ public final class MainActivity extends Activity {
         }
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
+        baseUrlInput.setHint("Backend URL");
         baseUrlInput.setSingleLine(true);
         baseUrlInput.setText(baseUrl);
         root.addView(baseUrlInput);
@@ -445,25 +513,27 @@ public final class MainActivity extends Activity {
 
         addButton("Log in", () -> {
             int parsedBudgetMonthId;
+            String newBaseUrl;
             try {
-                parsedBudgetMonthId = Integer.parseInt(budgetMonthInput.getText().toString());
-            } catch (NumberFormatException exception) {
-                toast("Budget month ID must be a number.");
+                parsedBudgetMonthId = ConnectionSettings.parseBudgetMonthId(budgetMonthInput.getText().toString());
+                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString());
+            } catch (IllegalArgumentException exception) {
+                toast(exception.getMessage());
                 return;
             }
-            String newBaseUrl = baseUrlInput.getText().toString();
             String username = usernameInput.getText().toString().trim();
             String password = passwordInput.getText().toString();
             if (username.isEmpty() || password.isEmpty()) {
                 toast("Enter username/email and password.");
                 return;
             }
+            saveConnectionPreferences(newBaseUrl, parsedBudgetMonthId);
             showLoading("Logging in...");
             executor.execute(() -> {
                 try {
                     FamilyFinanceApi loginApi = new FamilyFinanceApi(newBaseUrl);
                     JSONObject auth = loginApi.login(username, password);
-                    mainHandler.post(() -> {
+                    postIfActive(() -> {
                         saveConnectionPreferences(newBaseUrl, parsedBudgetMonthId);
                         saveAuthSession(
                                 auth.optString("token"),
@@ -474,12 +544,17 @@ public final class MainActivity extends Activity {
                         refreshData(this::showDashboard);
                     });
                 } catch (Exception exception) {
-                    mainHandler.post(() -> showLogin(LoginErrorMessages.fromException(exception, newBaseUrl)));
+                    postIfActive(() -> showLogin(LoginErrorMessages.fromException(exception, newBaseUrl)));
                 }
             });
         });
         addButton("Check first-run setup", () -> {
-            saveConnectionPreferences(baseUrlInput.getText().toString(), budgetMonthId);
+            try {
+                saveConnectionPreferences(baseUrlInput.getText().toString(), budgetMonthId);
+            } catch (IllegalArgumentException exception) {
+                toast(exception.getMessage());
+                return;
+            }
             checkSetupThenShowLogin(null);
         });
     }
@@ -504,25 +579,35 @@ public final class MainActivity extends Activity {
         int budgetCheckStreak = recordBudgetCheckInStreak();
         int reviewClearStreak = recordReviewClearStreakIfCleared();
         addFact("Signed in", blankAsDash(currentUserName) + " for " + blankAsDash(householdName));
-        addHeroCard(
-                "Cash after upcoming bills",
-                MoneyFormatter.dollars(summary.cashAfterBillsCents),
-                "About " + summary.daysUntilPayday + " day"
-                        + (summary.daysUntilPayday == 1 ? "" : "s")
-                        + " until payday. Included balance is "
-                        + MoneyFormatter.dollars(summary.includedAccountBalanceCents)
-                        + "."
-        );
-        if (summary.hasLowCushion()) {
-            addWarning("Cash remaining after bills is tight for the days until payday. Keep new spending calm and intentional.");
-        } else {
-            addStatusCard(
-                    "Cushion looks steady",
-                    "The current cash cushion is not flagged as low by the backend.",
-                    COLOR_SUCCESS_BG,
-                    COLOR_SUCCESS_TEXT
+        addFact("Budget month", summary.month + (summary.asOf.isEmpty() ? "" : " · as of " + summary.asOf));
+        if (summary.forecastAvailable) {
+            addHeroCard(
+                    "Cash after upcoming bills",
+                    MoneyFormatter.dollars(summary.cashAfterBillsCents),
+                    "About " + summary.daysUntilPayday + " day"
+                            + (summary.daysUntilPayday == 1 ? "" : "s")
+                            + " until payday. Included balance is "
+                            + MoneyFormatter.dollars(summary.includedAccountBalanceCents)
+                            + "."
             );
+            if (summary.hasLowCushion()) {
+                addWarning("Cash remaining after bills is tight for the days until payday. Keep new spending calm and intentional.");
+            } else if (summary.lowCushion != null) {
+                addStatusCard(
+                        "Cushion looks steady",
+                        "The current cash cushion is not flagged as low by the backend.",
+                        COLOR_SUCCESS_BG,
+                        COLOR_SUCCESS_TEXT
+                );
+            }
+        } else {
+            addHeroCard("Included account balance", MoneyFormatter.dollars(summary.includedAccountBalanceCents),
+                    "Cash after bills is unavailable until you add an upcoming payday.");
+            addButton("Add a payday", () -> showPaydayEditor(null));
         }
+        addButton("Check safe to spend", this::showSafeToSpend);
+        addSecondaryButton("Review transactions" + (reviewQueue.isEmpty() ? "" : " (" + reviewQueue.size() + ")"),
+                () -> showTransactions(true));
         addProgressCard(
                 "Transaction review",
                 reviewProgressValue(),
@@ -549,7 +634,8 @@ public final class MainActivity extends Activity {
         addMetric("Assigned total", MoneyFormatter.dollars(summary.assignedTotalCents));
         addMetric("Remaining to assign", MoneyFormatter.dollars(summary.remainingToAssignCents));
         addMetric("Total spent", MoneyFormatter.dollars(summary.totalSpentCents));
-        addMetric("Bills before next payday", MoneyFormatter.dollars(summary.billsBeforePaydayCents));
+        addMetric("Bills before next payday", summary.forecastAvailable
+                ? MoneyFormatter.dollars(summary.billsBeforePaydayCents) : "Add a payday to calculate");
         addMetric("Unread notifications", Integer.toString(unreadNotificationCount));
         addSecondaryButton("Notifications / accountability", this::showNotifications);
 
@@ -570,8 +656,6 @@ public final class MainActivity extends Activity {
                 );
             }
         }
-        addFact("Backend", baseUrl + " | Budget month ID " + budgetMonthId);
-        addFact("Notification viewer", "Unread state is scoped to the signed-in user.");
         addNav();
     }
 
@@ -647,12 +731,10 @@ public final class MainActivity extends Activity {
                 "Remaining to assign. Check-in streak: " + streak + " day"
                         + (streak == 1 ? "" : "s") + "."
         );
-        addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
-        addMetric("Assigned", MoneyFormatter.dollars(summary.assignedTotalCents));
-        addMetric("Total spent", MoneyFormatter.dollars(summary.totalSpentCents));
+        addFact("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
+        addFact("Assigned / spent", MoneyFormatter.dollars(summary.assignedTotalCents)
+                + " / " + MoneyFormatter.dollars(summary.totalSpentCents));
         addSecondaryButton("Switch / create budget month", this::showBudgetMonths);
-        addSecondaryButton("Income planning", this::showIncomePlanning);
-        addSecondaryButton("Bills and paydays", this::showBillsAndPaydays);
 
         addSection("Budget groups");
         if (budgetDetail.groups.isEmpty()) {
@@ -805,6 +887,10 @@ public final class MainActivity extends Activity {
                 toast("Enter a valid planned amount.");
                 return;
             }
+            if (plannedCents < 0) {
+                toast("Planned amount cannot be negative.");
+                return;
+            }
             runMutation(
                     "Saving category...",
                     () -> {
@@ -880,6 +966,10 @@ public final class MainActivity extends Activity {
                 return;
             }
             String selectedKind = kind.getSelectedItem().toString();
+            if (plannedCents < 0 || receivedCents < 0) {
+                toast("Income amounts cannot be negative.");
+                return;
+            }
             runMutation(
                     "Saving income...",
                     () -> {
@@ -897,11 +987,13 @@ public final class MainActivity extends Activity {
 
     private void showBillsAndPaydays() {
         beginScreen("Bills and Paydays");
-        if (summary != null) {
+        if (summary != null && summary.forecastAvailable) {
             addMetric("Bills before next payday", MoneyFormatter.dollars(summary.billsBeforePaydayCents));
             addMetric("Cash after bills", MoneyFormatter.dollars(summary.cashAfterBillsCents));
             addMetric("Next payday", summary.nextPayday);
             addMetric("Days until payday", Integer.toString(summary.daysUntilPayday));
+        } else if (summary != null) {
+            addWarning("Add an upcoming payday to calculate bills and cash remaining before payday.");
         }
         addSection("Expected bills");
         if (budgetDetail == null || budgetDetail.expectedBills.isEmpty()) {
@@ -960,6 +1052,10 @@ public final class MainActivity extends Activity {
                 toast("Enter a bill name and due date.");
                 return;
             }
+            if (!isIsoDate(due)) {
+                toast("Due date must use YYYY-MM-DD.");
+                return;
+            }
             int amountCents;
             try {
                 amountCents = MoneyFormatter.parseDollarAmountToCents(amount.getText().toString());
@@ -967,13 +1063,18 @@ public final class MainActivity extends Activity {
                 toast("Enter a valid bill amount.");
                 return;
             }
+            if (amountCents < 0) {
+                toast("Bill amount cannot be negative.");
+                return;
+            }
+            final boolean isPaid = paid.isChecked();
             runMutation(
                     "Saving bill...",
                     () -> {
                         if (bill == null) {
-                            api.createExpectedBill(budgetMonthId, cleaned, amountCents, due, paid.isChecked());
+                            api.createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid);
                         } else {
-                            api.updateExpectedBill(bill.id, cleaned, amountCents, due, paid.isChecked());
+                            api.updateExpectedBill(bill.id, cleaned, amountCents, due, isPaid);
                         }
                     },
                     () -> refreshData(this::showBillsAndPaydays)
@@ -991,8 +1092,8 @@ public final class MainActivity extends Activity {
         root.addView(paydayDate);
         addButton(payday == null ? "Add payday" : "Save payday", () -> {
             String cleaned = paydayDate.getText().toString().trim();
-            if (cleaned.isEmpty()) {
-                toast("Enter a payday date.");
+            if (!isIsoDate(cleaned)) {
+                toast("Payday must use YYYY-MM-DD.");
                 return;
             }
             runMutation(
@@ -1011,6 +1112,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showTransactions(boolean reviewOnly) {
+        reviewingQueue = reviewOnly;
         beginScreen(reviewOnly ? "Uncategorized Review" : "Transactions");
         List<TransactionDetail> source = reviewOnly ? reviewQueue : transactions;
         if (reviewOnly) {
@@ -1053,27 +1155,37 @@ public final class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 TransactionDetail loaded = api.getTransaction(transactionId);
-                mainHandler.post(() -> renderTransactionDetail(loaded));
+                postIfActive(() -> renderTransactionDetail(loaded));
             } catch (Exception exception) {
-                mainHandler.post(() -> showError("Could not load transaction", exception));
+                postIfActive(() -> showError("Could not load transaction", exception));
             }
         });
     }
 
     private void renderTransactionDetail(TransactionDetail detail) {
         beginScreen("Transaction Detail");
-        addMetric("Name", detail.transaction.name);
-        addMetric("Merchant", blankAsDash(detail.transaction.merchantName));
-        addMetric("Account", blankAsDash(detail.transaction.accountName));
-        addMetric("Amount", MoneyFormatter.dollars(detail.transaction.amountCents));
-        addMetric("Date", detail.transaction.occurredOn);
-        addMetric("Plaid hint", blankAsDash(detail.transaction.categoryHint));
-        addMetric("Suggestion", describeSuggestion(detail));
-        addMetric("Current assignment", describeCategory(detail.finalCategoryId));
-        addMetric("Categorization status", detail.categorizationStatus);
-        addMetric("Reviewed", detail.transaction.reviewed ? "Yes" : "No");
-        addMetric("Ignored/excluded", detail.transaction.ignored ? "Yes" : "No");
+        addHeroCard(detail.transaction.displayName(), MoneyFormatter.dollars(detail.transaction.amountCents),
+                detail.transaction.occurredOn + " · " + blankAsDash(detail.transaction.accountName));
+        addFact("Status", transactionStatusLabel(detail) + (detail.transaction.pending ? " · pending" : ""));
+        addFact("Current category", detail.isSplit() ? "Split across categories" : describeCategory(detail.finalCategoryId));
+        addFact("Suggestion", describeSuggestion(detail));
+        if (!detail.transaction.name.equals(detail.transaction.displayName())) {
+            addFact("Imported name", detail.transaction.name);
+        }
+        if (detail.transaction.categoryHint != null && !detail.transaction.categoryHint.isEmpty()) {
+            addFact("Import hint", detail.transaction.categoryHint);
+        }
         addBudgetImpact(detail);
+        if (detail.transaction.ignored) {
+            addBody("Unignore this transaction before assigning a category or splitting it.");
+            addButton("Unignore transaction", () -> runMutation(
+                    "Updating ignored state...",
+                    () -> api.setIgnored(detail.transaction.id, false, "Unignored in Android"),
+                    () -> afterTransactionSaved(detail.transaction.id)
+            ));
+            addNav();
+            return;
+        }
         if (detail.isSplit()) {
             addSection("Split state");
             for (TransactionAssignment assignment : detail.assignments) {
@@ -1091,6 +1203,11 @@ public final class MainActivity extends Activity {
 
         addSection("Categorize");
         Spinner categorySpinner = categorySpinner();
+        if (detail.finalCategoryId != null) {
+            setSpinnerToCategory(categorySpinner, detail.finalCategoryId);
+        } else if (detail.suggestedCategoryId != null) {
+            setSpinnerToCategory(categorySpinner, detail.suggestedCategoryId);
+        }
         root.addView(categorySpinner);
         CheckBox reviewed = new CheckBox(this);
         reviewed.setText("Mark reviewed after assigning");
@@ -1102,9 +1219,10 @@ public final class MainActivity extends Activity {
                 toast("No category selected.");
                 return;
             }
+            boolean markReviewed = reviewed.isChecked();
             runMutation(
                     "Assigning category...",
-                    () -> api.assignCategory(detail.transaction.id, category.id, reviewed.isChecked()),
+                    () -> api.assignCategory(detail.transaction.id, category.id, markReviewed),
                     () -> afterTransactionSaved(detail.transaction.id)
             );
         });
@@ -1131,13 +1249,20 @@ public final class MainActivity extends Activity {
 
     private void showSplitEditor(TransactionDetail detail) {
         beginScreen("Split Transaction");
-        int totalCents = Math.abs(detail.transaction.amountCents);
+        long magnitude = Math.abs((long) detail.transaction.amountCents);
+        if (magnitude > Integer.MAX_VALUE) {
+            addWarning("This transaction exceeds the amount supported by the split editor.");
+            addButton("Back to transaction", () -> showTransactionDetail(detail.transaction.id));
+            addNav();
+            return;
+        }
+        int totalCents = (int) magnitude;
         addMetric("Transaction", detail.transaction.displayName());
         addMetric("Amount to allocate", MoneyFormatter.dollars(totalCents));
 
         ArrayList<Spinner> categorySpinners = new ArrayList<>();
         ArrayList<EditText> amountInputs = new ArrayList<>();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < Math.max(3, detail.assignments.size()); i++) {
             addSection("Split line " + (i + 1));
             Spinner spinner = categorySpinner();
             categorySpinners.add(spinner);
@@ -1165,7 +1290,6 @@ public final class MainActivity extends Activity {
 
         addButton("Save split", () -> {
             ArrayList<int[]> splits = new ArrayList<>();
-            int total = 0;
             for (int i = 0; i < amountInputs.size(); i++) {
                 String raw = amountInputs.get(i).getText().toString().trim();
                 if (raw.isEmpty()) {
@@ -1188,7 +1312,6 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 splits.add(new int[]{category.id, cents});
-                total += cents;
             }
             if (splits.size() < 2) {
                 toast(BudgetScreenState.splitValidationMessage(totalCents, splitAmounts(splits)));
@@ -1210,7 +1333,7 @@ public final class MainActivity extends Activity {
     }
 
     private void updateSplitRemaining(List<EditText> amountInputs, TextView remaining, int totalCents) {
-        int allocated = 0;
+        long allocated = 0;
         for (EditText input : amountInputs) {
             String raw = input.getText().toString().trim();
             if (raw.isEmpty()) {
@@ -1222,13 +1345,23 @@ public final class MainActivity extends Activity {
                 // Save validation gives the precise error; the preview just avoids crashing while typing.
             }
         }
-        int left = totalCents - allocated;
+        long left = totalCents - allocated;
         remaining.setText("Remaining to allocate: " + MoneyFormatter.dollars(left));
         remaining.setTextColor(left == 0 ? 0xFF155724 : 0xFF856404);
     }
 
     private void afterTransactionSaved(int transactionId) {
         refreshData(() -> {
+            if (!reviewingQueue) {
+                showTransactionDetail(transactionId);
+                return;
+            }
+            for (TransactionDetail pending : reviewQueue) {
+                if (pending.transaction.id == transactionId) {
+                    showTransactionDetail(transactionId);
+                    return;
+                }
+            }
             for (TransactionDetail next : reviewQueue) {
                 if (next.transaction.id != transactionId) {
                     showTransactionDetail(next.transaction.id);
@@ -1274,11 +1407,8 @@ public final class MainActivity extends Activity {
                 addWarning(category.name + " is overspent.");
             }
         } else {
-            int projected = category.remainingCents - Math.abs(detail.transaction.amountCents);
-            addMetric("Projected impact", category.name + " would have " + MoneyFormatter.dollars(projected) + " left");
-            if (projected < 0) {
-                addWarning(category.name + " would be overspent.");
-            }
+            addMetric("Suggested category remaining", category.name + ": " + MoneyFormatter.dollars(category.remainingCents));
+            addBody("This suggestion has not been assigned. Save a category to update the budget.");
         }
     }
 
@@ -1312,9 +1442,10 @@ public final class MainActivity extends Activity {
                 toast("No category selected.");
                 return;
             }
+            boolean includeExisting = applyExisting.isChecked();
             runMutation(
                     "Creating merchant rule...",
-                    () -> api.createMerchantRuleFromTransaction(detail.transaction.id, category.id, applyExisting.isChecked()),
+                    () -> api.createMerchantRuleFromTransaction(detail.transaction.id, category.id, includeExisting),
                     () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
             );
         });
@@ -1334,17 +1465,9 @@ public final class MainActivity extends Activity {
     private MerchantRule findMatchingRule(TransactionDetail detail) {
         if (detail.matchingRuleId != null) {
             for (MerchantRule rule : merchantRules) {
-                if (rule.id == detail.matchingRuleId) {
+                if (rule.active && rule.id == detail.matchingRuleId) {
                     return rule;
                 }
-            }
-        }
-        String haystack = ((detail.transaction.merchantName == null ? "" : detail.transaction.merchantName)
-                + " "
-                + (detail.transaction.name == null ? "" : detail.transaction.name)).toLowerCase();
-        for (MerchantRule rule : merchantRules) {
-            if (rule.active && !rule.merchantMatchText.isEmpty() && haystack.contains(rule.merchantMatchText)) {
-                return rule;
             }
         }
         return null;
@@ -1398,13 +1521,19 @@ public final class MainActivity extends Activity {
             addNav();
             return;
         }
-        if (summary.categories.isEmpty()) {
+        if (BudgetScreenState.activeCategories(summary.categories).isEmpty()) {
             addStatusCard(
                     "No active categories",
                     "Safe-to-spend needs an active category for this month.",
                     COLOR_WARNING_BG,
                     COLOR_WARNING_TEXT
             );
+            addNav();
+            return;
+        }
+        if (!summary.forecastAvailable) {
+            addWarning("Add an upcoming payday before checking safe to spend.");
+            addButton("Add a payday", () -> showPaydayEditor(null));
             addNav();
             return;
         }
@@ -1443,13 +1572,14 @@ public final class MainActivity extends Activity {
                 toast("Enter an amount greater than zero.");
                 return;
             }
+            String purpose = note.getText().toString();
             showLoading("Checking safe to spend...");
             executor.execute(() -> {
                 try {
                     SafeToSpendResult result = api.safeToSpend(budgetMonthId, category.id, cents);
-                    mainHandler.post(() -> renderSafeToSpendResult(result, note.getText().toString()));
+                    postIfActive(() -> renderSafeToSpendResult(result, purpose));
                 } catch (Exception exception) {
-                    mainHandler.post(() -> showError("Safe-to-spend check failed", exception));
+                    postIfActive(() -> showError("Safe-to-spend check failed", exception));
                 }
             });
         });
@@ -1466,6 +1596,8 @@ public final class MainActivity extends Activity {
                 background,
                 textColor
         );
+        addFact("Category", result.categoryName);
+        addFact("Budget month", summary == null ? "" : summary.month);
         addMetric("Budget line fits", result.budgetLineFits ? "Yes" : "No");
         addMetric("Category remaining after purchase", MoneyFormatter.dollars(result.categoryRemainingAfterCents));
         addMetric("Cash after purchase and upcoming bills", MoneyFormatter.dollars(result.cashAfterPurchaseAndBillsCents));
@@ -1474,6 +1606,7 @@ public final class MainActivity extends Activity {
         if (note != null && !note.trim().isEmpty()) {
             addBody("Purpose: " + note.trim());
         }
+        addButton("Check another amount", this::showSafeToSpend);
         addNav();
     }
 
@@ -1487,9 +1620,13 @@ public final class MainActivity extends Activity {
             try {
                 JSONObject accountSettings = api.getAccountSettings();
                 AppDiagnostics diagnostics = api.getDiagnostics();
-                mainHandler.post(() -> renderSettings(accountSettings, diagnostics, null));
+                postIfActive(() -> renderSettings(accountSettings, diagnostics, null));
             } catch (Exception exception) {
-                mainHandler.post(() -> renderSettings(null, null, userFacingError(exception)));
+                postIfActive(() -> {
+                    if (!handleExpiredSession(exception)) {
+                        renderSettings(null, null, userFacingError(exception));
+                    }
+                });
             }
         });
     }
@@ -1501,6 +1638,7 @@ public final class MainActivity extends Activity {
         }
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
+        baseUrlInput.setHint("Backend URL");
         baseUrlInput.setSingleLine(true);
         baseUrlInput.setText(baseUrl);
         root.addView(baseUrlInput);
@@ -1541,12 +1679,16 @@ public final class MainActivity extends Activity {
         addButton("Save and reload", () -> {
             int parsedId;
             try {
-                parsedId = Integer.parseInt(budgetMonthInput.getText().toString());
-            } catch (NumberFormatException exception) {
-                toast("Budget month ID must be a number.");
+                parsedId = ConnectionSettings.parseBudgetMonthId(budgetMonthInput.getText().toString());
+                saveConnectionPreferences(baseUrlInput.getText().toString(), parsedId);
+            } catch (IllegalArgumentException exception) {
+                toast(exception.getMessage());
                 return;
             }
-            saveConnectionPreferences(baseUrlInput.getText().toString(), parsedId);
+            if (authToken.isEmpty()) {
+                showLogin("Backend changed. Log in to load this household.");
+                return;
+            }
             showLoading("Reloading...");
             refreshData(this::showDashboard);
         });
@@ -1604,8 +1746,8 @@ public final class MainActivity extends Activity {
                     "Changing password...",
                     () -> api.changePassword(currentPassword, newPassword),
                     () -> {
-                        toast("Password changed.");
-                        showSettings();
+                        clearSession();
+                        showLogin("Password changed. Log in again with your new password.");
                     }
             );
         });
@@ -1647,9 +1789,9 @@ public final class MainActivity extends Activity {
                 if (linkToken == null || linkToken.trim().isEmpty()) {
                     throw new IllegalStateException("Backend did not return a Plaid link token.");
                 }
-                mainHandler.post(() -> openPlaidLink(linkToken));
+                postIfActive(() -> openPlaidLink(linkToken));
             } catch (Exception exception) {
-                mainHandler.post(() -> showError("Could not start Plaid Link", exception));
+                postIfActive(() -> showError("Could not start Plaid Link", exception));
             }
         });
     }
@@ -1673,9 +1815,9 @@ public final class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 api.exchangePlaidPublicToken(budgetMonthId, publicToken);
-                mainHandler.post(() -> refreshData(this::showSettings));
+                postIfActive(() -> refreshData(this::showSettings));
             } catch (Exception exception) {
-                mainHandler.post(() -> showError("Plaid public token exchange failed", exception));
+                postIfActive(() -> showError("Plaid public token exchange failed", exception));
             }
         });
     }
@@ -1697,9 +1839,9 @@ public final class MainActivity extends Activity {
                 for (Integer plaidItemId : plaidItemIds) {
                     api.syncPlaid(plaidItemId, syncType);
                 }
-                mainHandler.post(() -> refreshData(this::showSettings));
+                postIfActive(() -> refreshData(this::showSettings));
             } catch (Exception exception) {
-                mainHandler.post(() -> showError("Plaid sync failed", exception));
+                postIfActive(() -> showError("Plaid sync failed", exception));
             }
         });
     }
@@ -1709,7 +1851,7 @@ public final class MainActivity extends Activity {
         int background = COLOR_SURFACE;
         int textColor = COLOR_TEXT;
         if (category.isOverspent()) {
-            status = "Overspent by " + MoneyFormatter.dollars(Math.abs(category.remainingCents));
+            status = "Overspent by " + MoneyFormatter.dollars(Math.abs((long) category.remainingCents));
             background = COLOR_DANGER_BG;
             textColor = COLOR_DANGER_TEXT;
         } else if (category.remainingCents == 0) {
@@ -1800,15 +1942,29 @@ public final class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 operation.run();
-                mainHandler.post(onSuccess);
+                postIfActive(onSuccess);
             } catch (Exception exception) {
-                mainHandler.post(() -> showError("Update failed", exception));
+                postIfActive(() -> showError("Update failed", exception));
             }
         });
     }
 
     private void beginScreen(String title) {
+        currentScreen = title;
+        View focus = getCurrentFocus();
+        if (focus != null) {
+            InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (keyboard != null) {
+                keyboard.hideSoftInputFromWindow(focus.getWindowToken(), 0);
+            }
+        }
         ScrollView scrollView = new ScrollView(this);
+        scrollView.setFillViewport(true);
+        scrollView.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            return insets;
+        });
         scrollView.setBackgroundColor(COLOR_BACKGROUND);
         root = new StyledLinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -1827,29 +1983,59 @@ public final class MainActivity extends Activity {
 
     private void showLoading(String message) {
         beginScreen("Family Finance");
+        ProgressBar progress = new ProgressBar(this);
+        progress.setIndeterminateTintList(ColorStateList.valueOf(COLOR_PRIMARY));
+        progress.setContentDescription(message);
+        root.addView(progress);
         addStatusCard("One moment", message, COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK);
     }
 
     private void showError(String context, Exception exception) {
+        if (handleExpiredSession(exception)) {
+            return;
+        }
         beginScreen("Something needs attention");
         addStatusCard(context, userFacingError(exception), COLOR_DANGER_BG, COLOR_DANGER_TEXT);
-        addButton("Log in", () -> showLogin(null));
+        if (authToken == null || authToken.isEmpty()) {
+            addButton("Log in", () -> showLogin(null));
+        }
         addButton("Retry dashboard", () -> refreshData(this::showDashboard));
         addButton("Settings", this::showSettings);
     }
 
     private void addNav() {
-        addSection("Quick actions");
-        addButton("Dashboard", this::showDashboard);
-        addButton("Monthly budget", this::showBudget);
-        addButton("Income planning", this::showIncomePlanning);
-        addButton("Bills and paydays", this::showBillsAndPaydays);
-        addButton("Transactions", () -> showTransactions(false));
-        addButton("Uncategorized review", () -> showTransactions(true));
-        addButton("Safe to spend", this::showSafeToSpend);
-        addButton("Notifications", this::showNotifications);
-        addButton("Accounts / settings", this::showSettings);
-        addDangerButton("Log out", this::logout);
+        addSection("Your household");
+        addNavRow("Dashboard", this::showDashboard, "Monthly budget", this::showBudget);
+        addNavRow("Transactions", () -> showTransactions(false), "Review queue", () -> showTransactions(true));
+        addNavRow("Safe to spend", this::showSafeToSpend, "Bills / paydays", this::showBillsAndPaydays);
+        addNavRow("Income planning", this::showIncomePlanning, "Notifications", this::showNotifications);
+        addSecondaryButton("Accounts / settings", this::showSettings);
+        addSecondaryButton("Refresh household data", () -> {
+            showLoading("Refreshing household data...");
+            refreshData(this::showDashboard);
+        });
+    }
+
+    private void addNavRow(String firstLabel, Runnable firstAction, String secondLabel, Runnable secondAction) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        String[] labels = {firstLabel, secondLabel};
+        Runnable[] actions = {firstAction, secondAction};
+        for (int i = 0; i < labels.length; i++) {
+            Button button = new Button(this);
+            button.setText(labels[i]);
+            button.setAllCaps(false);
+            button.setTextSize(14);
+            button.setTextColor(COLOR_PRIMARY_DARK);
+            button.setBackgroundTintList(ColorStateList.valueOf(COLOR_SURFACE));
+            button.setMinHeight(dp(52));
+            Runnable action = actions[i];
+            button.setOnClickListener(view -> action.run());
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            params.setMargins(i == 0 ? 0 : dp(4), dp(2), i == 0 ? dp(4) : 0, dp(4));
+            row.addView(button, params);
+        }
+        root.addView(row);
     }
 
     private void addMetric(String label, String value) {
@@ -1898,7 +2084,18 @@ public final class MainActivity extends Activity {
     }
 
     private void addDangerButton(String label, Runnable action) {
-        addStyledButton(label, COLOR_DANGER_BG, COLOR_DANGER_TEXT, action);
+        boolean needsConfirmation = label.startsWith("Remove") || label.startsWith("Archive")
+                || label.startsWith("Ignore");
+        addStyledButton(label, COLOR_DANGER_BG, COLOR_DANGER_TEXT, needsConfirmation ? () -> {
+            String message = label.startsWith("Archive")
+                    ? "History will be preserved. This entry will no longer be available for new assignments."
+                    : label.startsWith("Ignore")
+                    ? "This transaction will stay in history and stop counting toward budget spending."
+                    : "This removes the saved entry or assignment from your household plan. Budget totals will refresh.";
+            new AlertDialog.Builder(this).setTitle(label + "?").setMessage(message)
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Confirm", (dialog, which) -> action.run()).show();
+        } : action);
     }
 
     private void addStyledButton(String label, int backgroundColor, int textColor, Runnable action) {
@@ -2052,11 +2249,12 @@ public final class MainActivity extends Activity {
 
     private Spinner categorySpinner() {
         Spinner spinner = new Spinner(this);
+        List<BudgetCategory> available = BudgetScreenState.activeCategories(summary == null ? null : summary.categories);
+        spinner.setTag(available);
+        spinner.setContentDescription("Budget category");
         ArrayList<String> labels = new ArrayList<>();
-        if (summary != null) {
-            for (BudgetCategory category : summary.categories) {
-                labels.add(category.name + " (" + MoneyFormatter.dollars(category.remainingCents) + " left)");
-            }
+        for (BudgetCategory category : available) {
+            labels.add(category.name + " (" + MoneyFormatter.dollars(category.remainingCents) + " left)");
         }
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, labels);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
@@ -2065,10 +2263,17 @@ public final class MainActivity extends Activity {
     }
 
     private BudgetCategory selectedCategory(Spinner spinner) {
-        if (summary == null || summary.categories.isEmpty() || spinner.getSelectedItemPosition() < 0) {
+        List<BudgetCategory> choices = spinnerCategories(spinner);
+        int position = spinner.getSelectedItemPosition();
+        if (position < 0 || position >= choices.size()) {
             return null;
         }
-        return summary.categories.get(spinner.getSelectedItemPosition());
+        return choices.get(position);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<BudgetCategory> spinnerCategories(Spinner spinner) {
+        return (List<BudgetCategory>) spinner.getTag();
     }
 
     private List<Integer> splitAmounts(List<int[]> splits) {
@@ -2114,16 +2319,24 @@ public final class MainActivity extends Activity {
         return message;
     }
 
-    private void setSpinnerToCategory(Spinner spinner, int categoryId) {
-        if (summary == null) {
-            return;
+    private boolean handleExpiredSession(Exception exception) {
+        if (exception instanceof ApiException && ((ApiException) exception).status == 401) {
+            clearSession();
+            showLogin("Your session expired. Log in again to load your household data.");
+            return true;
         }
-        for (int i = 0; i < summary.categories.size(); i++) {
-            if (summary.categories.get(i).id == categoryId) {
+        return false;
+    }
+
+    private void setSpinnerToCategory(Spinner spinner, int categoryId) {
+        List<BudgetCategory> choices = spinnerCategories(spinner);
+        for (int i = 0; i < choices.size(); i++) {
+            if (choices.get(i).id == categoryId) {
                 spinner.setSelection(i);
                 return;
             }
         }
+        spinner.setSelection(-1);
     }
 
     private String describeCategory(Integer categoryId) {
@@ -2151,6 +2364,9 @@ public final class MainActivity extends Activity {
     }
 
     private int recordDailyStreak(String lastDateKey, String streakKey) {
+        String scope = baseUrl + ":" + householdId + ":" + currentUserId + ":";
+        lastDateKey = scope + lastDateKey;
+        streakKey = scope + streakKey;
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         String today = LocalDate.now().toString();
         String lastDate = prefs.getString(lastDateKey, "");
@@ -2178,7 +2394,7 @@ public final class MainActivity extends Activity {
 
     private int recordReviewClearStreakIfCleared() {
         if (!reviewQueue.isEmpty()) {
-            return getSharedPreferences(PREFS, MODE_PRIVATE).getInt(PREF_REVIEW_CLEAR_STREAK, 0);
+            return 0;
         }
         return recordDailyStreak(PREF_LAST_REVIEW_CLEAR_DATE, PREF_REVIEW_CLEAR_STREAK);
     }
@@ -2238,6 +2454,13 @@ public final class MainActivity extends Activity {
     private void styleLooseChild(View child) {
         if (child instanceof EditText) {
             EditText editText = (EditText) child;
+            if (editText.getId() == View.NO_ID && editText.getHint() != null) {
+                editText.setId(View.generateViewId());
+                TextView label = smallLabel(editText.getHint().toString());
+                label.setLabelFor(editText.getId());
+                label.setPadding(0, dp(8), 0, dp(2));
+                root.addView(label);
+            }
             editText.setTextColor(COLOR_TEXT);
             editText.setHintTextColor(COLOR_MUTED);
             editText.setTextSize(15);

@@ -1,5 +1,7 @@
 # Family Finance Accountability App
 
+The September recovery review and verification record is in [docs/overnight-review.md](docs/overnight-review.md). The app remains a private, local Android/SQLite MVP with Plaid Sandbox only.
+
 This workspace starts the staged MVP from the attached build plan.
 
 The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, Milestone 12 MVP usability hardening/data integrity, Milestone 13 MVP release-candidate stabilization, and Milestone 14 Android visual polish/local gamification.
@@ -164,7 +166,7 @@ Do not commit real passwords. The demo credentials below are local-only values f
 
 This staged MVP does not have a production migration system yet. `backend/app/schema.sql` is applied with `CREATE TABLE IF NOT EXISTS`, which is enough for fresh local SQLite databases but does not safely migrate existing databases when columns, indexes, or constraints change.
 
-Current assumption: this is still a dev-only SQLite schema rebuild workflow. During these early milestones, reset local data by deleting the local `.sqlite` database and letting the app initialize a fresh schema. Do not treat existing SQLite files as forward-migratable production data until a real migration tool and migration history are added.
+Current assumption: this is still a dev-only SQLite schema workflow. For a fresh development run, choose a new database path and keep existing data. Stop the backend before backing up an existing SQLite file; preserve any accompanying journal/WAL files. Initialization contains limited additive compatibility updates (including legacy user login columns), not a general production migration framework. The recovery review makes no destructive data migration.
 
 Deferred by design:
 
@@ -272,7 +274,7 @@ Invoke-RestMethod http://127.0.0.1:8080/health
 
 ## Fresh First-Run Setup
 
-For a fresh local database, start the API with an empty or deleted local SQLite file:
+For a fresh local database, start the API with a new local SQLite path:
 
 ```powershell
 python -m backend.app.api --db work\family_finance.sqlite --host 127.0.0.1 --port 8080
@@ -326,7 +328,7 @@ Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/summary -Headers $header
 
 ## Run Demo Seed
 
-The demo seed rebuilds `work/demo_family_finance.sqlite` from scratch with safe local demo data:
+The demo seed creates `work/demo_family_finance.sqlite` with safe synthetic data dated relative to today. It refuses to overwrite an existing file. Use `--db work/another_demo.sqlite` for another demo, and start the API with that same path. An optional `--today YYYY-MM-DD` makes a demonstration reproducible.
 
 - One household and budget month
 - Daniel and Kara local-only demo users
@@ -363,7 +365,7 @@ If `python` is not available on PATH, use the bundled Codex Python runtime:
 C:\Users\Daniel\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m backend.app.demo_seed
 ```
 
-The seed prints the demo database path and budget month ID. Android defaults to budget month ID `1`, which matches a freshly rebuilt demo database.
+The seed prints the demo database path and budget month ID. Android defaults to budget month ID `1`, which matches a freshly created demo database.
 
 ## Run Demo API
 
@@ -406,6 +408,30 @@ Android emulators use `10.0.2.2` to reach the host machine loopback address. Use
 
 The app allows cleartext HTTP for this local MVP demo only. Do not treat that as production network security.
 
+Run Android verification with the installed Android SDK and JDK (Android Studio's bundled JBR works):
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest assembleDebug lintDebug
+```
+
+Changing the backend URL signs out and clears cached financial data before connecting to the new server. A successful password change also requires a fresh login; previous sessions are revoked. The Android client blocks HTTP redirects so a saved bearer token is not forwarded to a redirect destination.
+
+## Recovery behavior and local smoke
+
+- A budget remains readable when there is no upcoming payday. Cash forecast fields are `null` and `forecast_available` is false; the app prompts for a payday instead of showing a zero or a safe result. Safe-to-spend and coach budget proposals still require a future payday. Summary responses also include `as_of` and the backend's configured `low_cushion` decision.
+- Copied months keep income plans but reset received amounts. Bank sync preserves category choices, reconciles changed single-category amounts, and returns changed splits to review while retaining their history. Pending-to-posted replacements count once. Batch transaction changes and their cursor commit together.
+- Incoming/zero transactions cannot be assigned as expenses. Existing unsupported assignments are preserved and flagged by diagnostics. Refund/transfer attribution and account rollover between months still require accounting decisions; connected accounts cannot be moved to another month by relinking.
+- Money requests use exact whole cents. Fractional JSON cents, booleans, malformed dates and invalid flags are rejected; Android rejects fractional cents and overflowing amounts instead of silently rounding or wrapping them.
+
+Repeat the isolated HTTP/persistence smoke without starting another server or touching your local databases:
+
+```powershell
+python -m backend.smoke_review
+```
+
+It creates a temporary synthetic household, uses mock providers, exercises authorization, budgeting, categorization/splits/ignores and safe-to-spend, then verifies saved state after a server restart. It removes only its temporary data.
+
 ## MVP Smoke Test
 
 With the demo API running and the Pixel 8 emulator open, verify:
@@ -442,8 +468,6 @@ Known MVP limitations:
 - Cloud push notifications are not included
 - Public signup, password reset, email verification, OAuth, and a production auth provider are not included
 - Budget change approval is not implemented
-- Budget group names are not exposed by the current backend summary route
-- Funding edits are placeholder-only
 - AI autonomous budget changes are not included
 - MCP/tool integration is not included
 
@@ -512,3 +536,5 @@ $env:OPENAI_TIMEOUT_SECONDS = "10"
 `OPENAI_API_KEY` is required only when `COACH_PROVIDER=openai`. Never commit `.env` files or real keys. Real OpenAI API use may incur cost, so keep `COACH_PROVIDER=mock` for tests and demos unless you intentionally opt in locally.
 
 The OpenAI provider is a direct backend provider abstraction for short coach calls. It does not use the Agents SDK, does not expose provider internals to Android, does not access Plaid, and does not mutate budget, category, or transaction data.
+
+Provider output cannot replace structured backend facts, the safe-to-spend decision, or draft amounts/category IDs. Stop/discuss decisions use deterministic wording. Optional model prose on other results remains advisory and is not guaranteed factually correct; live OpenAI was not used in recovery verification. Keep the default mock provider for the reproducible local demo.
