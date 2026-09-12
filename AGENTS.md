@@ -44,7 +44,7 @@ Do not add unless the current milestone explicitly asks for it:
 - autonomous coach budget changes
 - full visual redesign
 
-Plaid is Sandbox-only until explicitly changed.
+Stage 2 explicitly permits production Plaid for this private household's USAA checking/savings connection. Keep it disabled by default; verify Trial entitlement, institution access, encrypted recovery, and financial reconciliation before live use. No paid-plan upgrade or additional products are authorized.
 
 ## Security Rules
 

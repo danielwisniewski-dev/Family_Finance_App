@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-LATEST_VERSION = 2
+LATEST_VERSION = 3
 
 
 def add_column(connection, table, column, definition):
@@ -42,7 +42,31 @@ def private_sessions(connection):
     connection.execute("CREATE TABLE IF NOT EXISTS app_secret_checks (name TEXT PRIMARY KEY, sealed_value TEXT NOT NULL)")
 
 
-MIGRATIONS = [(1, "local_mvp_baseline", baseline), (2, "expiring_sessions_and_throttling", private_sessions)]
+def live_bank_data(connection):
+    connection.execute("""CREATE TABLE IF NOT EXISTS bank_sync_state (
+        plaid_item_id INTEGER PRIMARY KEY REFERENCES plaid_items(id),
+        environment TEXT NOT NULL CHECK(environment = 'production'),
+        balance_checked_at TEXT, transactions_checked_at TEXT,
+        transactions_updated_at TEXT, history_complete INTEGER NOT NULL DEFAULT 0,
+        reconciled_at TEXT, reconciled_month TEXT,
+        balance_error INTEGER NOT NULL DEFAULT 1, transaction_error INTEGER NOT NULL DEFAULT 1)""")
+    # Keep the original account and transaction IDs. Account ownership is household-wide;
+    # a bank transaction's date determines its budget month, even across a posting change.
+    connection.execute("""CREATE VIEW IF NOT EXISTS transaction_budget_months AS
+        SELECT t.id AS transaction_id, b.id AS budget_month_id
+        FROM account_transactions t JOIN cash_accounts a ON a.id = t.cash_account_id
+        JOIN budget_months anchor ON anchor.id = a.budget_month_id
+        JOIN budget_months b ON b.household_id = anchor.household_id
+            AND ((a.plaid_item_id IS NOT NULL AND b.month = substr(t.occurred_on, 1, 7))
+                 OR (a.plaid_item_id IS NULL AND b.id = anchor.id))""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS transaction_refunds (
+        transaction_id INTEGER PRIMARY KEY REFERENCES account_transactions(id),
+        budget_category_id INTEGER NOT NULL REFERENCES budget_categories(id),
+        amount_cents INTEGER NOT NULL CHECK(amount_cents > 0))""")
+
+
+MIGRATIONS = [(1, "local_mvp_baseline", baseline), (2, "expiring_sessions_and_throttling", private_sessions),
+              (3, "live_bank_sync_and_months", live_bank_data)]
 
 
 def migrate(connection: sqlite3.Connection) -> None:

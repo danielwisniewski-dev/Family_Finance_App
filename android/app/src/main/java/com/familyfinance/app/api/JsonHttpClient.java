@@ -51,7 +51,7 @@ public final class JsonHttpClient {
             connection.setInstanceFollowRedirects(false);
             connection.setRequestMethod(method);
             connection.setConnectTimeout(5_000);
-            connection.setReadTimeout(5_000);
+            connection.setReadTimeout(path.startsWith("/plaid/") ? 120_000 : 5_000);
             connection.setRequestProperty("Accept", "application/json");
             if (!bearerToken.isEmpty()) {
                 connection.setRequestProperty("Authorization", "Bearer " + bearerToken);

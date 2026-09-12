@@ -79,6 +79,21 @@ public final class JsonHttpClientTest {
     }
 
     @Test
+    public void bankSyncReportsFailureEvenWithSuccessfulHttpStatus() {
+        respond("/plaid/sync", 200, "{\"success\":false,\"error_message\":\"Reconnect USAA in Settings\"}");
+        ApiException error = assertThrows(ApiException.class,
+                () -> new FamilyFinanceApi(new JsonHttpClient(baseUrl, "synthetic-test-session")).syncPlaid(1, "balance"));
+        assertEquals("Reconnect USAA in Settings", error.getMessage());
+    }
+
+    @Test
+    public void bankSyncRequiresExplicitSuccess() {
+        respond("/plaid/sync", 200, "{}");
+        assertThrows(ApiException.class,
+                () -> new FamilyFinanceApi(new JsonHttpClient(baseUrl)).syncPlaid(1, "transaction"));
+    }
+
+    @Test
     public void doesNotFollowRedirectsOrForwardSessionTokens() {
         responses.put("/redirect", new Response(302, "<html>Redirecting</html>", baseUrl + "/target"));
         respond("/target", 200, "{}");

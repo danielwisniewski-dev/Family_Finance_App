@@ -350,8 +350,8 @@ class BudgetRepository:
         return {
             "backend_reachable": True,
             "database_initialized": setup["initialized"],
-            "plaid_mode": "disabled" if self.settings.hosted else "sandbox",
-            "plaid_sandbox_only": True,
+            "plaid_mode": "production" if self.settings.plaid_enabled else "disabled" if self.settings.hosted else "sandbox",
+            "plaid_sandbox_only": not self.settings.plaid_enabled,
             "current_user": auth_context["user"],
             "current_household": auth_context["household"],
             "active_budget_month_id": active_budget_month_id,
@@ -365,6 +365,8 @@ class BudgetRepository:
         if budget_month_id is None:
             return diagnostic_check("safe_to_spend_ready", False, "", "No active budget month is available for safe-to-spend.", 0)
         try:
+            from .bank_data import require_bank_ready
+            require_bank_ready(self, budget_month_id, household_today())
             snapshot = self._load_snapshot(budget_month_id)
             category = next((item for item in snapshot["categories"] if not item.archived), None)
             if category is None:
@@ -783,7 +785,11 @@ class BudgetRepository:
                     c.planned_cents,
                     c.archived,
                     c.display_order,
-                    COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0) AS spent_cents
+                    COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0)
+                    - COALESCE((SELECT SUM(r.amount_cents) FROM transaction_refunds r
+                        JOIN account_transactions rt ON rt.id=r.transaction_id
+                        JOIN transaction_budget_months rm ON rm.transaction_id=rt.id
+                        WHERE r.budget_category_id=c.id AND rt.ignored=0 AND rm.budget_month_id=g.budget_month_id),0) AS spent_cents
                 FROM budget_categories c
                 LEFT JOIN (
                     SELECT budget_category_id, SUM(amount_cents) AS manual_spent_cents
@@ -797,7 +803,7 @@ class BudgetRepository:
                     JOIN cash_accounts ca ON ca.id = t.cash_account_id
                     WHERE a.active = 1
                         AND t.ignored = 0
-                        AND ca.budget_month_id = ?
+                        AND t.id IN (SELECT transaction_id FROM transaction_budget_months WHERE budget_month_id=?)
                     GROUP BY a.budget_category_id
                 ) ts ON ts.budget_category_id = c.id
                 JOIN budget_groups g ON g.id = c.budget_group_id
@@ -937,6 +943,12 @@ class BudgetRepository:
             return
         values.append(account_id)
         with self.connect() as connection:
+            if balance_cents is not None:
+                row = connection.execute("SELECT plaid_item_id FROM cash_accounts WHERE id=?", (account_id,)).fetchone()
+                if row and row[0] is not None:
+                    raise ValueError("Connected balances must come from bank sync")
+            if included_in_cash_reality is not None:
+                connection.execute("UPDATE bank_sync_state SET reconciled_at=NULL WHERE plaid_item_id IN (SELECT plaid_item_id FROM cash_accounts WHERE id=? AND included_in_cash_reality != ?)", (account_id, int(included_in_cash_reality)))
             connection.execute(
                 f"UPDATE cash_accounts SET {', '.join(assignments)} WHERE id = ?",
                 values,
@@ -945,9 +957,16 @@ class BudgetRepository:
     def list_accounts(self, budget_month_id: int) -> list[AccountLine]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM cash_accounts WHERE budget_month_id = ? ORDER BY id",
-                (budget_month_id,),
+                """SELECT a.* FROM cash_accounts a JOIN budget_months anchor ON anchor.id=a.budget_month_id
+                   WHERE (a.plaid_item_id IS NULL AND a.budget_month_id=?) OR
+                         (a.plaid_item_id IS NOT NULL AND anchor.household_id=(SELECT household_id FROM budget_months WHERE id=?)) ORDER BY a.id""",
+                (budget_month_id, budget_month_id),
             ).fetchall()
+        return [account_from_row(row) for row in rows]
+
+    def list_accounts_for_item(self, item_id):
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM cash_accounts WHERE plaid_item_id=? ORDER BY id", (item_id,)).fetchall()
         return [account_from_row(row) for row in rows]
 
     def household_id_for_budget_month(self, budget_month_id: int) -> int:
@@ -1223,6 +1242,7 @@ class BudgetRepository:
         official_name: str | None = None,
         available_balance_cents: int | None = None,
         current_balance_cents: int | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> int:
         validate_account_type(account_type)
         validate_integer_cents(balance_cents, "balance_cents")
@@ -1230,7 +1250,7 @@ class BudgetRepository:
             validate_integer_cents(available_balance_cents, "available_balance_cents")
         if current_balance_cents is not None:
             validate_integer_cents(current_balance_cents, "current_balance_cents")
-        with self.connect() as connection:
+        with (nullcontext(_connection) if _connection is not None else self.connect()) as connection:
             budget_month = connection.execute(
                 "SELECT household_id FROM budget_months WHERE id = ?",
                 (budget_month_id,),
@@ -1407,6 +1427,8 @@ class BudgetRepository:
                     raise ValueError("Imported transaction cannot move to another account")
                 transaction_id = int(existing["id"])
                 assignments = self._active_assignments(connection, transaction_id)
+                if existing["ignored_reason"] == "Removed by Plaid sync":
+                    connection.execute("UPDATE account_transactions SET ignored=0,ignored_reason=NULL,reviewed=0 WHERE id=?", (transaction_id,))
                 connection.execute(
                     """
                     UPDATE account_transactions
@@ -1440,11 +1462,19 @@ class BudgetRepository:
                         metadata={"pending_transaction_id": existing["plaid_transaction_id"],
                                   "plaid_transaction_id": plaid_transaction_id},
                     )
+                date_moved = existing["occurred_on"][:7] != occurred_on.isoformat()[:7]
+                if date_moved:
+                    self._supersede_active_assignments(connection, transaction_id)
+                    assignments = ()
+                    connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
+                    connection.execute("UPDATE account_transactions SET reviewed=0 WHERE id=?", (transaction_id,))
                 if existing["amount_cents"] != amount_cents:
+                    connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
                     self._supersede_active_assignments(connection, transaction_id)
                     # A full single-category assignment follows the bank amount. Split
                     # allocation needs a person's decision; retain its rows as history.
-                    if len(assignments) == 1 and assignments[0]["source"] != "split" and amount_cents < 0:
+                    if (len(assignments) == 1 and assignments[0]["source"] != "split" and amount_cents < 0
+                            and not connection.execute("SELECT c.archived OR g.archived FROM budget_categories c JOIN budget_groups g ON g.id=c.budget_group_id WHERE c.id=?", (assignments[0]["budget_category_id"],)).fetchone()[0]):
                         assignment = assignments[0]
                         self._insert_assignment(
                             connection, transaction_id=transaction_id,
@@ -1510,6 +1540,7 @@ class BudgetRepository:
                 return False
             already_removed = bool(row["ignored"]) and row["ignored_reason"] == "Removed by Plaid sync"
             self._supersede_active_assignments(connection, int(row["id"]))
+            connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (row["id"],))
             connection.execute(
                 """
                 UPDATE account_transactions
@@ -1588,7 +1619,7 @@ class BudgetRepository:
                 SELECT t.*, a.name AS account_name
                 FROM account_transactions t
                 JOIN cash_accounts a ON a.id = t.cash_account_id
-                WHERE a.budget_month_id = ?
+                WHERE t.id IN (SELECT transaction_id FROM transaction_budget_months WHERE budget_month_id=?)
                 ORDER BY t.occurred_on, t.id
                 """,
                 (budget_month_id,),
@@ -1599,7 +1630,7 @@ class BudgetRepository:
         return [
             detail
             for detail in self.list_budget_transactions(budget_month_id)
-            if not detail.transaction.ignored and not detail.assignments
+            if detail.categorization_status == "uncategorized"
         ]
 
     def list_transaction_review_queue(self, budget_month_id: int) -> list[TransactionDetail]:
@@ -1616,7 +1647,7 @@ class BudgetRepository:
     ) -> list[TransactionDetail]:
         if status not in {"needs_review", "uncategorized", "reviewed", "ignored", "all"}:
             raise ValueError("status must be needs_review, uncategorized, reviewed, ignored, or all")
-        clauses = ["a.budget_month_id = ?"]
+        clauses = ["t.id IN (SELECT transaction_id FROM transaction_budget_months WHERE budget_month_id=?)"]
         values: list[Any] = [budget_month_id]
         if start_date is not None:
             clauses.append("t.occurred_on >= ?")
@@ -1647,7 +1678,7 @@ class BudgetRepository:
             return [
                 detail
                 for detail in details
-                if not detail.transaction.ignored and not detail.assignments
+                if detail.categorization_status == "uncategorized"
             ]
         if status == "reviewed":
             return [
@@ -1671,6 +1702,20 @@ class BudgetRepository:
             if row is None:
                 raise LookupError(f"Transaction {transaction_id} not found")
             return self._transaction_detail_from_row(connection, row)
+
+    def assign_transaction_refund(self, transaction_id, category_id, actor_user_id=None):
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            transaction = self._require_transaction(connection, transaction_id)
+            self._validate_category_for_transaction(connection, transaction_id, category_id)
+            if transaction["amount_cents"] <= 0 or transaction["pending"]:
+                raise ValueError("Only a posted incoming transaction can be applied as a refund")
+            self._supersede_active_assignments(connection, transaction_id)
+            connection.execute("INSERT INTO transaction_refunds(transaction_id,budget_category_id,amount_cents) VALUES (?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET budget_category_id=excluded.budget_category_id,amount_cents=excluded.amount_cents", (transaction_id, category_id, transaction["amount_cents"]))
+            connection.execute("UPDATE account_transactions SET reviewed=1, ignored=0, ignored_reason=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (transaction_id,))
+            self._record_transaction_event(connection, transaction_id=transaction_id, event_type="refund_assigned", category_id=category_id, amount_cents=transaction["amount_cents"])
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            self._insert_notification_event(connection, household_id=context["household_id"], budget_month_id=context["budget_month_id"], event_type="refund_assigned", actor_user_id=actor_user_id, affected_entity_type="transaction", affected_entity_id=transaction_id, title="Refund applied", message="A posted refund was applied to " + self._category_name(connection, category_id) + ".", severity="info", metadata={"transaction_id": transaction_id, "category_id": category_id})
 
     def mark_transaction_reviewed(
         self,
@@ -1725,6 +1770,7 @@ class BudgetRepository:
             amount_cents = budget_amount_cents(transaction["amount_cents"])
             previous_assignments = self._active_assignments(connection, transaction_id)
             self._supersede_active_assignments(connection, transaction_id)
+            connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
             self._insert_assignment(
                 connection,
                 transaction_id=transaction_id,
@@ -1798,6 +1844,7 @@ class BudgetRepository:
             self._require_transaction(connection, transaction_id)
             previous_assignments = self._active_assignments(connection, transaction_id)
             self._supersede_active_assignments(connection, transaction_id)
+            connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
             connection.execute(
                 """
                 UPDATE account_transactions
@@ -1963,6 +2010,7 @@ class BudgetRepository:
         actor_user_id: int | None = None,
     ) -> None:
         with self.connect() as connection:
+            connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
             self._require_transaction(connection, transaction_id)
             if ignored:
                 self._supersede_active_assignments(connection, transaction_id)
@@ -3020,7 +3068,13 @@ class BudgetRepository:
         urgency: Urgency = "planned_want",
         actor_user_id: int | None = None,
     ) -> SafeToSpendResult:
-        snapshot = self._load_snapshot(budget_month_id)
+        from .bank_data import require_bank_ready
+        # Hold off writers while freshness, categories, bills and account balances are
+        # read. Release before emitting notifications through a separate connection.
+        with self.connect() as guard:
+            guard.execute("BEGIN IMMEDIATE")
+            require_bank_ready(self, budget_month_id, today)
+            snapshot = self._load_snapshot(budget_month_id)
         category = next((item for item in snapshot["categories"] if item.id == category_id), None)
         if category is None:
             raise LookupError(f"Category {category_id} is not part of budget month {budget_month_id}")
@@ -3205,7 +3259,7 @@ class BudgetRepository:
             """
             SELECT
                 b.household_id,
-                b.id AS budget_month_id,
+                (SELECT budget_month_id FROM transaction_budget_months WHERE transaction_id=t.id) AS budget_month_id,
                 t.name AS transaction_name
             FROM account_transactions t
             JOIN cash_accounts a ON a.id = t.cash_account_id
@@ -3417,6 +3471,7 @@ class BudgetRepository:
 
     def _transaction_detail_from_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> TransactionDetail:
         transaction_id = int(row["id"])
+        refund = connection.execute("SELECT budget_category_id FROM transaction_refunds WHERE transaction_id=?", (transaction_id,)).fetchone()
         assignment_rows = connection.execute(
             """
             SELECT *
@@ -3444,6 +3499,7 @@ class BudgetRepository:
             suggestion_source=suggestion["source"],
             suggestion_reason=suggestion["reason"],
             matching_rule_id=suggestion["rule_id"],
+            refund_category_id=refund[0] if refund else None,
         )
 
     def _require_transaction(self, connection: sqlite3.Connection, transaction_id: int) -> sqlite3.Row:
@@ -3466,8 +3522,8 @@ class BudgetRepository:
             SELECT c.id
             FROM budget_categories c
             JOIN budget_groups g ON g.id = c.budget_group_id
-            JOIN cash_accounts a ON a.budget_month_id = g.budget_month_id
-            JOIN account_transactions t ON t.cash_account_id = a.id
+            JOIN transaction_budget_months m ON m.budget_month_id = g.budget_month_id
+            JOIN account_transactions t ON t.id = m.transaction_id
             WHERE t.id = ? AND c.id = ? AND c.archived = 0 AND g.archived = 0
             """,
             (transaction_id, category_id),
@@ -3589,15 +3645,15 @@ class BudgetRepository:
             JOIN budget_categories c ON c.id = r.budget_category_id
             JOIN budget_groups g ON g.id = c.budget_group_id
             JOIN budget_months b ON b.id = g.budget_month_id
-            JOIN cash_accounts a ON a.budget_month_id = b.id
-            WHERE a.id = ?
+            JOIN transaction_budget_months m ON m.budget_month_id = b.id
+            WHERE m.transaction_id = ?
                 AND r.household_id = b.household_id
                 AND r.active = 1
                 AND c.archived = 0
                 AND g.archived = 0
             ORDER BY r.priority, r.id
             """,
-            (transaction["cash_account_id"],),
+            (transaction["id"],),
         ).fetchall()
         for rule in rule_rows:
             if rule["merchant_match_text"] in haystack:
@@ -3722,7 +3778,11 @@ class BudgetRepository:
                     c.name,
                     c.planned_cents,
                     c.archived,
-                    COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0) AS spent_cents
+                    COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0)
+                    - COALESCE((SELECT SUM(r.amount_cents) FROM transaction_refunds r
+                        JOIN account_transactions rt ON rt.id=r.transaction_id
+                        JOIN transaction_budget_months rm ON rm.transaction_id=rt.id
+                        WHERE r.budget_category_id=c.id AND rt.ignored=0 AND rm.budget_month_id=g.budget_month_id),0) AS spent_cents
                 FROM budget_categories c
                 JOIN budget_groups g ON g.id = c.budget_group_id
                 LEFT JOIN (
@@ -3737,7 +3797,7 @@ class BudgetRepository:
                     JOIN cash_accounts ca ON ca.id = t.cash_account_id
                     WHERE a.active = 1
                         AND t.ignored = 0
-                        AND ca.budget_month_id = ?
+                        AND t.id IN (SELECT transaction_id FROM transaction_budget_months WHERE budget_month_id=?)
                     GROUP BY a.budget_category_id
                 ) ts ON ts.budget_category_id = c.id
                 WHERE g.budget_month_id = ?
@@ -3747,12 +3807,15 @@ class BudgetRepository:
                 (budget_month_id, budget_month_id),
             ).fetchall()
             bill_rows = connection.execute(
-                "SELECT * FROM expected_bills WHERE budget_month_id = ? ORDER BY due_on, id",
-                (budget_month_id,),
+                """SELECT e.* FROM expected_bills e JOIN budget_months b ON b.id=e.budget_month_id
+                   WHERE b.household_id=? ORDER BY e.due_on,e.id""",
+                (budget_month["household_id"],),
             ).fetchall()
             account_rows = connection.execute(
-                "SELECT * FROM cash_accounts WHERE budget_month_id = ? ORDER BY id",
-                (budget_month_id,),
+                """SELECT a.* FROM cash_accounts a JOIN budget_months anchor ON anchor.id=a.budget_month_id
+                   WHERE (a.plaid_item_id IS NULL AND a.budget_month_id=?) OR
+                         (a.plaid_item_id IS NOT NULL AND anchor.household_id=(SELECT household_id FROM budget_months WHERE id=?)) ORDER BY a.id""",
+                (budget_month_id, budget_month_id),
             ).fetchall()
             payday_rows = connection.execute(
                 "SELECT payday_date FROM paydays WHERE household_id = ? ORDER BY payday_date",
@@ -3967,6 +4030,7 @@ def account_from_row(row: sqlite3.Row) -> AccountLine:
         subtype=row["subtype"],
         available_balance_cents=row["available_balance_cents"],
         current_balance_cents=row["current_balance_cents"],
+        last_balance_synced_at=row["last_balance_synced_at"],
     )
 
 

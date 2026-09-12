@@ -55,6 +55,7 @@ class RuntimeSettings:
     setup_code: str = field(default="", repr=False)
     encryption_key: str = field(default="", repr=False)
     session_seconds: int = 7 * 24 * 60 * 60
+    plaid_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "RuntimeSettings":
@@ -62,17 +63,29 @@ class RuntimeSettings:
         if mode not in {"local", "hosted"}:
             raise ValueError("FF_MODE must be local or hosted")
         settings = cls(hosted=mode == "hosted", setup_code=os.environ.get("FF_SETUP_CODE", ""),
-                       encryption_key=os.environ.get("FF_ENCRYPTION_KEY", ""))
+                       encryption_key=os.environ.get("FF_ENCRYPTION_KEY", ""),
+                       plaid_enabled=os.environ.get("FF_PLAID_ENABLED", "false") == "true")
         if settings.hosted:
             ZoneInfo(os.environ.get("FF_TIMEZONE", "America/New_York"))
             if len(settings.setup_code) < 32 or len(settings.encryption_key) < 32:
                 raise SecretError("Hosted mode requires FF_SETUP_CODE and FF_ENCRYPTION_KEY with at least 32 random characters each")
             if hmac.compare_digest(settings.setup_code, settings.encryption_key):
                 raise SecretError("Setup and encryption keys must be different")
-            if os.environ.get("PLAID_ENV", "sandbox") != "sandbox" or os.environ.get("PLAID_SECRET"):
+            if not settings.plaid_enabled and (os.environ.get("PLAID_ENV", "sandbox") != "sandbox" or os.environ.get("PLAID_SECRET")):
                 raise ValueError("Stage 1 hosted mode does not allow bank credentials or production Plaid")
+            if settings.plaid_enabled:
+                if (os.environ.get("PLAID_ENV") != "production"
+                        or os.environ.get("FF_PLAID_TRIAL_CONFIRMED") != "true"
+                        or not os.environ.get("PLAID_CLIENT_ID") or not os.environ.get("PLAID_SECRET")
+                        or not os.environ.get("PLAID_USAA_INSTITUTION_ID")
+                        or os.environ.get("PLAID_PRODUCTS", "transactions") != "transactions"
+                        or os.environ.get("PLAID_COUNTRY_CODES", "US") != "US"
+                        or os.environ.get("PLAID_REDIRECT_URI")):
+                    raise ValueError("Stage 2 requires verified Trial/USAA access, Transactions only, US, and native Android package registration")
             if os.environ.get("COACH_PROVIDER", "mock") != "mock" or os.environ.get("OPENAI_API_KEY"):
                 raise ValueError("Stage 1 hosted mode requires the mock coach without provider credentials")
+        elif settings.plaid_enabled or os.environ.get("PLAID_ENV", "sandbox") != "sandbox":
+            raise ValueError("Production Plaid requires the encrypted hosted runtime")
         return settings
 
     def require_setup_code(self, supplied: object) -> None:

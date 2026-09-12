@@ -180,6 +180,18 @@ public final class FamilyFinanceApi {
         return accounts;
     }
 
+    public JSONObject getBankStatus(int monthId) throws ApiException {
+        return client.get("/budget-months/" + monthId + "/bank-status");
+    }
+
+    public void reconcileBank(int monthId, String revision) throws Exception {
+        client.post("/budget-months/" + monthId + "/bank-reconciliation", new JSONObject().put("revision", revision));
+    }
+
+    public void assignRefund(int transactionId, int categoryId) throws Exception {
+        client.post("/transactions/" + transactionId + "/refund", new JSONObject().put("category_id", categoryId));
+    }
+
     public String createPlaidLinkToken() throws ApiException {
         try {
             JSONObject payload = new JSONObject();
@@ -209,7 +221,11 @@ public final class FamilyFinanceApi {
             JSONObject payload = new JSONObject();
             payload.put("plaid_item_id", plaidItemId);
             payload.put("sync_type", syncType);
-            return client.post("/plaid/sync", payload);
+            JSONObject result = client.post("/plaid/sync", payload);
+            if (!result.optBoolean("success", false)) {
+                throw new ApiException(result.optString("error_message", "Bank sync failed. Retry or reconnect in Settings."));
+            }
+            return result;
         } catch (ApiException exception) {
             throw exception;
         } catch (Exception exception) {

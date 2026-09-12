@@ -8,7 +8,7 @@ from http import HTTPStatus
 from pathlib import Path
 
 from .api import ApiHandler, MAX_REQUEST_BODY_BYTES
-from .backup import BackupScheduler, create_backup
+from .backup import BackupScheduler, create_backup, restore_backup
 from .coach import build_coach_service_from_env
 from .db import BudgetRepository
 from .plaid import build_plaid_service_from_env
@@ -82,7 +82,10 @@ def prepare_application() -> Application:
     # Save the old database BEFORE any upgrade. Never migrate an existing personal file in place without recovery.
     if db_path.exists():
         import uuid
-        create_backup(db_path, directory / ("pre-upgrade-" + uuid.uuid4().hex + ".ffbackup"), settings.encryption_key)
+        import tempfile
+        archive = create_backup(db_path, directory / ("pre-upgrade-" + uuid.uuid4().hex + ".ffbackup"), settings.encryption_key)
+        with tempfile.TemporaryDirectory(prefix="family-finance-upgrade-check-") as temporary:
+            restore_backup(archive, Path(temporary) / "verify.sqlite", settings.encryption_key)
     repository = BudgetRepository(db_path, settings)
     repository.initialize()
     backups = BackupScheduler(db_path, directory, settings.encryption_key)
