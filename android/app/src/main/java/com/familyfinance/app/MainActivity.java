@@ -117,12 +117,19 @@ public final class MainActivity extends Activity {
     private List<NotificationEvent> notifications = new ArrayList<>();
     private int unreadNotificationCount;
     private PlaidHandler plaidHandler;
+    private JSONObject bankStatus = new JSONObject();
+    private boolean repairingBank;
     private boolean reviewingQueue;
     private String currentScreen = "";
     private volatile boolean destroyed;
     private boolean savedConnectionReset;
     private final LinkResultHandler plaidResultHandler = new LinkResultHandler(
             linkSuccess -> {
+                if (repairingBank) {
+                    repairingBank = false;
+                    syncPlaidItems("all");
+                    return Unit.INSTANCE;
+                }
                 String publicToken = linkSuccess.getPublicToken();
                 if (publicToken == null || publicToken.trim().isEmpty()) {
                     toast("Plaid Link did not return a public token.");
@@ -133,7 +140,7 @@ public final class MainActivity extends Activity {
             },
             linkExit -> {
                 String message = linkExit.getError() == null ? "Plaid Link was cancelled."
-                        : "Plaid Link could not finish. Check your Sandbox connection and try again.";
+                        : "Plaid Link could not finish. Retry or reconnect in Settings.";
                 showSettings();
                 toast(message);
                 return Unit.INSTANCE;
@@ -143,6 +150,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        repairingBank = savedInstanceState != null && savedInstanceState.getBoolean("repairingBank", false);
         if (!BuildConfig.DEBUG) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         loadPreferences();
         if (savedConnectionReset) {
@@ -185,6 +193,12 @@ public final class MainActivity extends Activity {
             return;
         }
         super.onBackPressed();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putBoolean("repairingBank", repairingBank);
     }
 
     @Override
@@ -316,6 +330,7 @@ public final class MainActivity extends Activity {
                 List<TransactionDetail> loadedTransactions = api.getTransactions(selectedBudgetMonthId);
                 List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(selectedBudgetMonthId);
                 List<CashAccount> loadedAccounts = api.getAccounts(selectedBudgetMonthId);
+                JSONObject loadedBankStatus = api.getBankStatus(selectedBudgetMonthId);
                 List<MerchantRule> loadedMerchantRules = api.getMerchantRules();
                 List<NotificationEvent> loadedNotifications = api.getNotifications(selectedBudgetMonthId);
                 int loadedUnreadNotificationCount = api.getUnreadNotificationCount(selectedBudgetMonthId);
@@ -329,6 +344,7 @@ public final class MainActivity extends Activity {
                     transactions = loadedTransactions;
                     reviewQueue = loadedReviewQueue;
                     accounts = loadedAccounts;
+                    bankStatus = loadedBankStatus;
                     merchantRules = loadedMerchantRules;
                     notifications = loadedNotifications;
                     unreadNotificationCount = loadedUnreadNotificationCount;
@@ -595,6 +611,12 @@ public final class MainActivity extends Activity {
 
     private void showDashboard() {
         beginScreen("Dashboard");
+        if (bankStatus.optBoolean("enabled")) {
+            addFact("Saved bank balances checked (UTC)", bankStatus.optString("balance_checked_at", "Not checked"));
+            if (!bankStatus.optBoolean("ready")) {
+                addWarning("Bank data needs attention before safe-to-spend. Open Settings to sync and reconcile USAA.");
+            }
+        }
         if (summary == null) {
             if (budgetMonths.isEmpty()) {
                 addStatusCard(
@@ -1247,7 +1269,7 @@ public final class MainActivity extends Activity {
         reviewed.setText("Mark reviewed after assigning");
         reviewed.setChecked(true);
         root.addView(reviewed);
-        addButton("Assign category", () -> {
+        addButton(detail.transaction.amountCents > 0 ? "Apply posted refund to category" : "Assign category", () -> {
             BudgetCategory category = selectedCategory(categorySpinner);
             if (category == null) {
                 toast("No category selected.");
@@ -1256,7 +1278,10 @@ public final class MainActivity extends Activity {
             boolean markReviewed = reviewed.isChecked();
             runMutation(
                     "Assigning category...",
-                    () -> api.assignCategory(detail.transaction.id, category.id, markReviewed),
+                    () -> {
+                        if (detail.transaction.amountCents > 0) api.assignRefund(detail.transaction.id, category.id);
+                        else api.assignCategory(detail.transaction.id, category.id, markReviewed);
+                    },
                     () -> afterTransactionSaved(detail.transaction.id)
             );
         });
@@ -1277,6 +1302,11 @@ public final class MainActivity extends Activity {
                 () -> api.setIgnored(detail.transaction.id, !detail.transaction.ignored, "Marked in Android MVP"),
                 () -> afterTransactionSaved(detail.transaction.id)
         ));
+        addButton("Mark as transfer (exclude from budget)", () -> runMutation(
+                "Marking transfer...",
+                () -> api.setIgnored(detail.transaction.id, true, "Transfer confirmed by household"),
+                () -> afterTransactionSaved(detail.transaction.id)));
+        addBody("A transfer affects the bank balance but is excluded from category spending. Apply incoming money as a refund only when it reverses spending; record pay in the income plan.");
         addMerchantRuleControls(detail);
         addNav();
     }
@@ -1654,7 +1684,19 @@ public final class MainActivity extends Activity {
             try {
                 JSONObject accountSettings = api.getAccountSettings();
                 AppDiagnostics diagnostics = api.getDiagnostics();
-                postIfActive(() -> renderSettings(accountSettings, diagnostics, null));
+                JSONObject loadedBankStatus = budgetMonthId > 0 ? api.getBankStatus(budgetMonthId) : new JSONObject();
+                List<CashAccount> loadedBankAccounts = new ArrayList<>();
+                JSONArray accountArray = loadedBankStatus.optJSONArray("accounts");
+                if (accountArray != null) {
+                    for (int i = 0; i < accountArray.length(); i++) {
+                        loadedBankAccounts.add(CashAccount.fromJson(accountArray.getJSONObject(i)));
+                    }
+                }
+                postIfActive(() -> {
+                    bankStatus = loadedBankStatus;
+                    accounts = loadedBankAccounts;
+                    renderSettings(accountSettings, diagnostics, null);
+                });
             } catch (Exception exception) {
                 postIfActive(() -> {
                     if (!handleExpiredSession(exception)) {
@@ -1685,7 +1727,7 @@ public final class MainActivity extends Activity {
         addFact("Signed in", blankAsDash(currentUserName) + "  |  " + blankAsDash(householdName));
         addFact("Current user ID", currentUserId == 0 ? "-" : Integer.toString(currentUserId));
         addFact("Household ID", householdId == 0 ? "-" : Integer.toString(householdId));
-        addFact("Plaid mode", "Sandbox");
+        addFact("Bank mode", bankStatus.optString("mode", "unavailable"));
         if (diagnostics != null) {
             addSection("Diagnostics");
             addFact("Backend reachable", diagnostics.backendReachable ? "Yes" : "No");
@@ -1787,19 +1829,32 @@ public final class MainActivity extends Activity {
         });
         addDangerButton("Log out", this::logout);
 
-        if (BuildConfig.BANK_LINKING_ENABLED) {
-            addSection("Plaid Sandbox");
-            addButton("Link bank with Plaid Sandbox", this::preparePlaidLink);
-            addButton("Sync balances", () -> syncPlaidItems("balance"));
-            addButton("Sync transactions", () -> syncPlaidItems("transaction"));
+        addSection("USAA bank connection");
+        if (BuildConfig.BANK_LINKING_ENABLED && bankStatus.optBoolean("enabled")) {
+            addButton(bankStatus.optBoolean("connected") ? "Reconnect USAA" : "Connect USAA with Plaid", this::preparePlaidLink);
+            addButton("Sync bank data", () -> syncPlaidItems("all"));
+            addFact("Balances checked (UTC)", bankStatus.optString("balance_checked_at", "Not checked"));
+            addFact("Transactions downloaded (UTC)", bankStatus.optString("transactions_checked_at", "Not downloaded"));
+            addFact("Bank transaction update", bankStatus.optString("transactions_updated_at", "Unavailable"));
+            addFact("History complete", bankStatus.optBoolean("history_complete") ? "Yes" : "Waiting for bank history");
+            addBody("Refresh household data reads saved data. Sync bank data checks Plaid. Transactions can lag behind USAA.");
+            JSONArray issues = bankStatus.optJSONArray("issues");
+            if (issues != null) for (int i=0; i<issues.length(); i++) addWarning(issues.optString(i));
+            addBody("Before confirming, compare each included account's available and current balances and recent posted/pending transactions with USAA. Review transfers, refunds, duplicate manual entries, and bills already paid. Bank data does not automatically mark bills paid or record income in your plan.");
+            if (bankStatus.optBoolean("can_reconcile")) {
+                addButton("I compared USAA and confirmed this month's data", () -> runMutation(
+                        "Saving bank reconciliation...",
+                        () -> api.reconcileBank(budgetMonthId, bankStatus.optString("revision")),
+                        () -> refreshData(this::showSettings)));
+            }
+            addFact("Reconciled this month", bankStatus.optBoolean("reconciled") ? "Yes" : "No");
         } else {
-            addBody("Stage 1: bank connections become available after live sync verification.");
+            addBody("Bank linking is not enabled on this backend.");
         }
 
         addSection("Account inclusion");
         if (accounts.isEmpty()) {
-            addBody(BuildConfig.BANK_LINKING_ENABLED ? "No linked checking or savings accounts returned. Link Plaid Sandbox or add demo accounts from the backend seed flow."
-                    : "No accounts connected yet. Account balances will appear after bank setup in stage 2.");
+            addBody("No checking or savings accounts connected yet.");
         } else {
             for (CashAccount account : accounts) {
                 addBody(account.name
@@ -1807,6 +1862,8 @@ public final class MainActivity extends Activity {
                         + " | " + MoneyFormatter.dollars(account.balanceCents)
                         + " | mask " + blankAsDash(account.mask)
                         + " | " + (account.includedInCashReality ? "included" : "excluded"));
+                addFact("Available", account.availableBalanceCents == null ? "Unavailable" : MoneyFormatter.dollars(account.availableBalanceCents));
+                addFact("Current", account.currentBalanceCents == null ? "Unavailable" : MoneyFormatter.dollars(account.currentBalanceCents));
                 addButton(
                         account.includedInCashReality ? "Exclude " + account.name : "Include " + account.name,
                         () -> runMutation(
@@ -1821,7 +1878,8 @@ public final class MainActivity extends Activity {
     }
 
     private void preparePlaidLink() {
-        showLoading("Preparing Plaid Sandbox Link...");
+        repairingBank = bankStatus.optBoolean("connected");
+        showLoading("Preparing USAA connection...");
         executor.execute(() -> {
             try {
                 String linkToken = api.createPlaidLinkToken();
@@ -1863,6 +1921,7 @@ public final class MainActivity extends Activity {
 
     private void syncPlaidItems(String syncType) {
         Set<Integer> plaidItemIds = new LinkedHashSet<>();
+        if (bankStatus.optInt("connection_id") > 0) plaidItemIds.add(bankStatus.optInt("connection_id"));
         for (CashAccount account : accounts) {
             if (account.plaidItemId > 0) {
                 plaidItemIds.add(account.plaidItemId);
@@ -1876,7 +1935,10 @@ public final class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 for (Integer plaidItemId : plaidItemIds) {
-                    api.syncPlaid(plaidItemId, syncType);
+                    if ("all".equals(syncType)) {
+                        api.syncPlaid(plaidItemId, "balance");
+                        api.syncPlaid(plaidItemId, "transaction");
+                    } else api.syncPlaid(plaidItemId, syncType);
                 }
                 postIfActive(() -> refreshData(this::showSettings));
             } catch (Exception exception) {

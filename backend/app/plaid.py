@@ -471,6 +471,9 @@ class PlaidConnectionService:
 
 
 def build_plaid_service_from_env(repository: BudgetRepository) -> PlaidConnectionService:
+    if repository.settings.plaid_enabled:
+        from .live_plaid import LivePlaidService
+        return LivePlaidService(repository)
     return PlaidConnectionService(
         repository,
         client=PlaidSandboxClient(),

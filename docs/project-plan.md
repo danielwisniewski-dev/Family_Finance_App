@@ -2,6 +2,8 @@
 
 ## Purpose
 
+Current rollout: [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md). Earlier milestone descriptions below remain historical background.
+
 Build a private household finance accountability app for Daniel and Kara.
 
 The app should help the household make better spending decisions before money disappears by combining:

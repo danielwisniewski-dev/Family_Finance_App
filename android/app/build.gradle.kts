@@ -10,8 +10,8 @@ android {
         applicationId = "com.familyfinance.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.5.0-stage1"
+        versionCode = 3
+        versionName = "0.6.0-stage2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -43,7 +43,7 @@ android {
         getByName("release") {
             isDebuggable = false
             buildConfigField("String", "DEFAULT_BACKEND_URL", "\"$betaUrl\"")
-            buildConfigField("boolean", "BANK_LINKING_ENABLED", "false")
+            buildConfigField("boolean", "BANK_LINKING_ENABLED", "true")
             if (!signingPath.isNullOrBlank()) signingConfig = signingConfigs.getByName("privateBeta")
         }
     }

@@ -158,7 +158,7 @@ class Stage1HostingTests(unittest.TestCase):
         self.assertIsNone(self.repo.auth_context_for_token(auth["token"]))
         with self.repo.connect() as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], migrations.LATEST_VERSION)
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], migrations.LATEST_VERSION)
 
     def test_migrations_rollback_ddl_and_reject_future_schema(self):
         path = self.directory / "rollback.sqlite"

@@ -65,6 +65,7 @@ class AccountLine:
     subtype: str | None = None
     available_balance_cents: int | None = None
     current_balance_cents: int | None = None
+    last_balance_synced_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,9 +118,12 @@ class TransactionDetail:
     suggestion_source: str | None = None
     suggestion_reason: str | None = None
     matching_rule_id: int | None = None
+    refund_category_id: int | None = None
 
     @property
     def final_category_id(self) -> int | None:
+        if self.refund_category_id is not None:
+            return self.refund_category_id
         if len(self.assignments) == 1:
             return self.assignments[0].category_id
         return None
@@ -128,15 +132,19 @@ class TransactionDetail:
     def categorization_status(self) -> str:
         if self.transaction.ignored:
             return "ignored"
+        if self.refund_category_id is not None:
+            return "refund"
         if len(self.assignments) > 1:
             return "split"
         if len(self.assignments) == 1:
             return self.assignments[0].source
+        if self.transaction.amount_cents >= 0 and self.transaction.reviewed:
+            return "reviewed_inflow"
         return "uncategorized"
 
     @property
     def needs_review(self) -> bool:
-        return not self.transaction.reviewed or (not self.transaction.ignored and not self.assignments)
+        return not self.transaction.reviewed or (not self.transaction.ignored and self.transaction.amount_cents < 0 and not self.assignments)
 
 
 @dataclass(frozen=True)

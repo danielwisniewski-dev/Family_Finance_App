@@ -84,8 +84,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/setup/status":
                 status = self.repository.setup_status(self.optional_auth())
                 status["setup_code_required"] = self.repository.settings.hosted
-                status["bank_linking_enabled"] = not self.repository.settings.hosted
+                status["bank_linking_enabled"] = self.repository.settings.plaid_enabled or not self.repository.settings.hosted
                 self.send_json(status)
+                return
+            if resource_path(parsed.path, "budget-months", "bank-status"):
+                auth = self.require_auth()
+                month_id = int(parsed.path.split("/")[2])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                from .bank_data import bank_status
+                self.send_json(bank_status(self.repository, month_id))
                 return
             if parsed.path == "/settings/account":
                 auth = self.require_auth()
@@ -218,6 +225,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = self.read_json()
+            if resource_path(parsed.path, "transactions", "refund"):
+                auth = self.require_auth()
+                transaction_id = int(parsed.path.split("/")[2])
+                self.repository.require_transaction_access(transaction_id, auth["household_id"])
+                category_id = require_int(payload, "category_id")
+                self.repository.require_category_access(category_id, auth["household_id"])
+                self.repository.assign_transaction_refund(transaction_id, category_id, auth["user_id"])
+                self.send_json({"ok": True})
+                return
             if parsed.path == "/auth/login":
                 auth_payload = self.repository.authenticate_local_user(
                     login=str(payload.get("username") or payload.get("email") or ""),
@@ -429,6 +445,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     },
                 )
                 self.send_json({"coach": coach_payload})
+                return
+            if resource_path(parsed.path, "budget-months", "bank-reconciliation"):
+                auth = self.require_auth()
+                month_id = int(parsed.path.split("/")[2])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                from .bank_data import reconcile_bank
+                self.send_json(reconcile_bank(self.repository, month_id, payload.get("revision")))
                 return
             if parsed.path == "/plaid/link-token":
                 auth = self.require_auth()
@@ -787,8 +810,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         context = self.repository.auth_context_for_token(token.strip())
         if context is None:
             raise UnauthorizedError("Authentication required")
-        if self.repository.settings.hosted and urlparse(self.path).path.startswith("/plaid/"):
-            raise PermissionError("Bank linking is unavailable during stage 1")
+        if self.repository.settings.hosted and not self.repository.settings.plaid_enabled and urlparse(self.path).path.startswith("/plaid/"):
+            raise PermissionError("Bank linking is not enabled on this backend")
         return context
 
     def optional_auth(self) -> dict[str, Any] | None:

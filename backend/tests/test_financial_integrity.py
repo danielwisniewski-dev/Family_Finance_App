@@ -246,7 +246,7 @@ class FinancialIntegrityTests(unittest.TestCase):
         self.assertIsNotNone(index)
 
     def test_signed_cash_balances_preserve_overdraft_and_reject_fractional_cents(self) -> None:
-        self.repo.update_cash_account(account_id=self.account, balance_cents=-1573)
+        self.repo.update_connected_account_balance(plaid_item_id=self.item, plaid_account_id="synthetic-account", balance_cents=-1573)
         summary = self.repo.get_summary(self.month, date(2026, 1, 25))
         self.assertEqual(summary.included_account_balance_cents, -1573)
         result = self.repo.safe_to_spend(budget_month_id=self.month, category_id=self.food,

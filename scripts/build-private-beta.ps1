@@ -22,12 +22,8 @@ function Protect-SigningFile([string]$Path) {
     [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($Path), $fileAcl)
 }
 
-if ((Test-Path -LiteralPath $keyFile) -and !(Test-Path -LiteralPath $passwordFile)) {
-    throw 'Existing signing key has no local password file. Restore its password; do not replace the key.'
-}
-if (!(Test-Path -LiteralPath $passwordFile)) {
-    $newPassword = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
-    [IO.File]::WriteAllText($passwordFile, $newPassword)
+if (!(Test-Path -LiteralPath $keyFile) -or !(Test-Path -LiteralPath $passwordFile)) {
+    throw 'Stage 2 requires the existing stage 1 signing key and password. Restore them; do not generate replacements.'
 }
 Protect-SigningFile $passwordFile
 $env:JAVA_HOME = $JavaHome
@@ -36,19 +32,13 @@ $env:FF_ANDROID_KEYSTORE = $keyFile
 $env:FF_ANDROID_STORE_PASSWORD = [IO.File]::ReadAllText($passwordFile)
 $env:FF_ANDROID_KEY_PASSWORD = $env:FF_ANDROID_STORE_PASSWORD
 try {
-    if (!(Test-Path -LiteralPath $keyFile)) {
-        & (Join-Path $JavaHome 'bin\keytool.exe') -genkeypair -keystore $keyFile -storetype PKCS12 `
-            -alias family-finance-beta -keyalg RSA -keysize 3072 -validity 10000 `
-            -dname 'CN=Family Finance Private Beta' -storepass:env FF_ANDROID_STORE_PASSWORD -keypass:env FF_ANDROID_KEY_PASSWORD
-        if ($LASTEXITCODE -ne 0) { throw 'Signing key creation failed.' }
-    }
     Protect-SigningFile $keyFile
     Push-Location (Join-Path $projectRoot 'android')
     try {
         & .\gradlew.bat --offline assembleRelease "-PbetaBackendUrl=$BackendUrl"
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
     } finally { Pop-Location }
-    $outputFile = Join-Path $releaseDirectory 'family-finance-stage1.apk'
+    $outputFile = Join-Path $releaseDirectory 'family-finance-stage2.apk'
     Copy-Item -LiteralPath (Join-Path $projectRoot 'android\app\build\outputs\apk\release\app-release.apk') -Destination $outputFile
     Write-Output "Signed release: $outputFile"
     if ($BackendUrl -eq 'https://configure-backend.invalid') {
