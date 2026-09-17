@@ -2,7 +2,11 @@
 
 ## Purpose
 
-Current rollout: [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md). Earlier milestone descriptions below remain historical background.
+Current release: [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md), merged in PR #19 and deployed September 12, 2026. Native USAA linking and the user's bank-data comparison passed; Daniel reported the app working well on September 17. Earlier milestone descriptions below remain historical background; the Stage 2 record distinguishes completed checks from acceptance checks not yet individually recorded.
+
+The [September interface update](interface-tweaks.md), Android `0.6.1-interface` / code 4, is implemented and locally verified. Daniel reviewed the preview and approved committing/publishing it to GitHub. It improves the dashboard/streak, transaction review and multi-select, merchant-rule management, notification noise, and automatic bank sync before spending checks. Production deployment and phone updates remain pending; backend financial checks are preserved.
+
+Preserve the live household/database, Plaid connection, and Android signing key. Supporting two or three extended-family households was discussed only as a future possibility; no implementation, extra connections, paid-plan upgrade, or broader onboarding is authorized by that discussion.
 
 Build a private household finance accountability app for Daniel and Kara.
 

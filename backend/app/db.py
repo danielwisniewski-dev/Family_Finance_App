@@ -1795,25 +1795,23 @@ class BudgetRepository:
                 amount_cents=amount_cents,
             )
             previous_category_ids = [int(row["budget_category_id"]) for row in previous_assignments]
+            recategorized = bool(previous_category_ids) and previous_category_ids != [category_id]
+            if not recategorized:
+                # Routine assignments remain in transaction history without notifying the household.
+                return
             context = self._notification_context_for_transaction(connection, transaction_id)
             category_name = self._category_name(connection, category_id)
-            recategorized = bool(previous_category_ids) and previous_category_ids != [category_id]
             old_category_name = (
                 self._category_name(connection, previous_category_ids[0])
                 if len(previous_category_ids) == 1
                 else None
             )
-            if recategorized:
-                title = "Transaction recategorized"
-                message = (
-                    f"{context['transaction_name']} moved from {old_category_name or 'multiple categories'} "
-                    f"to {category_name}."
-                )
-                event_type = "transaction_recategorized"
-            else:
-                title = "Transaction category assigned"
-                message = f"{context['transaction_name']} was assigned to {category_name}."
-                event_type = "transaction_category_assigned"
+            title = "Transaction recategorized"
+            message = (
+                f"{context['transaction_name']} moved from {old_category_name or 'multiple categories'} "
+                f"to {category_name}."
+            )
+            event_type = "transaction_recategorized"
             self._insert_notification_event(
                 connection,
                 household_id=context["household_id"],
@@ -1933,25 +1931,6 @@ class BudgetRepository:
                 source="split",
                 amount_cents=actual_total,
                 metadata={"split_count": len(split_rows)},
-            )
-            context = self._notification_context_for_transaction(connection, transaction_id)
-            self._insert_notification_event(
-                connection,
-                household_id=context["household_id"],
-                budget_month_id=context["budget_month_id"],
-                event_type="transaction_split",
-                actor_user_id=actor_user_id,
-                affected_entity_type="transaction",
-                affected_entity_id=transaction_id,
-                title="Transaction split",
-                message=f"{context['transaction_name']} was split across {len(split_rows)} categories.",
-                severity="info",
-                metadata={
-                    "transaction_id": transaction_id,
-                    "split_count": len(split_rows),
-                    "amount_cents": actual_total,
-                    "category_ids": [int(row["category_id"]) for row in split_rows],
-                },
             )
 
     def remove_transaction_split(

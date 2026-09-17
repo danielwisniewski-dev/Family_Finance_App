@@ -17,6 +17,8 @@ import org.json.JSONObject;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 public final class FamilyFinanceApi {
     private final JsonHttpClient client;
@@ -537,15 +539,51 @@ public final class FamilyFinanceApi {
     }
 
     public void archiveMerchantRule(int ruleId) throws ApiException {
+        client.delete("/merchant-category-rules/" + ruleId);
+    }
+
+    public void updateMerchantRule(int ruleId, String matchText, int categoryId) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
-            payload.put("active", false);
+            payload.put("merchant_match_text", matchText.trim());
+            payload.put("category_id", categoryId);
+            payload.put("apply_to_existing_unreviewed", false);
             client.patch("/merchant-category-rules/" + ruleId, payload);
         } catch (ApiException exception) {
             throw exception;
         } catch (Exception exception) {
-            throw new ApiException("Could not build merchant rule archive request", exception);
+            throw new ApiException("Could not build merchant rule update request", exception);
         }
+    }
+
+    public SafeToSpendResult syncAndCheckSafeToSpend(
+            int budgetMonthId, int categoryId, int purchaseAmountCents
+    ) throws ApiException {
+        // Read current connection state instead of relying on the dashboard's cached snapshot.
+        JSONObject status = getBankStatus(budgetMonthId);
+        if (!(status.opt("enabled") instanceof Boolean)) {
+            throw new ApiException("Bank connection status is unavailable. Please retry this check.");
+        }
+        if (status.optBoolean("enabled")) {
+            Set<Integer> itemIds = new LinkedHashSet<>();
+            if (status.optInt("connection_id") > 0) itemIds.add(status.optInt("connection_id"));
+            JSONArray accounts = status.optJSONArray("accounts");
+            if (accounts != null) {
+                for (int i = 0; i < accounts.length(); i++) {
+                    JSONObject account = accounts.optJSONObject(i);
+                    if (account != null && account.optInt("plaid_item_id") > 0) {
+                        itemIds.add(account.optInt("plaid_item_id"));
+                    }
+                }
+            }
+            if (itemIds.isEmpty()) throw new ApiException("Connect USAA in Accounts / Settings before checking safe to spend.");
+            for (int itemId : itemIds) {
+                syncPlaid(itemId, "balance");
+                syncPlaid(itemId, "transaction");
+            }
+        }
+        // The backend still enforces review, reconciliation, freshness, and all spending rules.
+        return safeToSpend(budgetMonthId, categoryId, purchaseAmountCents);
     }
 
     public void markNotificationRead(int notificationId) throws ApiException {

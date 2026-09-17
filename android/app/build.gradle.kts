@@ -10,8 +10,8 @@ android {
         applicationId = "com.familyfinance.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.6.0-stage2"
+        versionCode = 4
+        versionName = "0.6.1-interface"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

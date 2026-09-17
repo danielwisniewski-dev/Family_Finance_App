@@ -1,5 +1,7 @@
 # Repository recovery review — 2026-09-11
 
+Historical recovery record. Later deployment status is in [Stage 2](stage-2-usaa-plaid.md); the current interface change set and verification are in [the interface update](interface-tweaks.md). Approval boundaries below describe that earlier review.
+
 ## Review follow-up — 2026-09-11
 
 Daniel reviewed the app, reported no detected errors, and approved committing this recovery batch. The synthetic review API was restarted for his walkthrough. The verification results below remain applicable; no implementation changes were made after those checks. The pre-commit whitespace and scoped secret/junk checks passed again. The overnight handoff below records the state before that approval; push, PR publication and merge remain unapproved.

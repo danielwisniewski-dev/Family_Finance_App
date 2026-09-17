@@ -13,6 +13,7 @@ import java.util.List;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertNull;
 
 public final class BudgetScreenStateTest {
     @Test
@@ -73,6 +74,23 @@ public final class BudgetScreenStateTest {
         BudgetCategory archived = new BudgetCategory(10, "Old groceries", 500, 200, 300, true);
         BudgetCategory active = new BudgetCategory(11, "Groceries", 500, 200, 300, false);
         assertEquals(Collections.singletonList(active), BudgetScreenState.activeCategories(Arrays.asList(archived, active)));
+    }
+
+    @Test
+    public void alphabetizedDropdownKeepsPromptEmptyAndCategoryIdsAligned() {
+        BudgetCategory mortgage = new BudgetCategory(10, "Mortgage", 500, 0, 500, false);
+        BudgetCategory groceries = new BudgetCategory(40, "groceries", 500, 0, 500, false);
+        BudgetCategory archived = new BudgetCategory(11, "Auto", 500, 0, 500, true);
+        List<BudgetCategory> original = Arrays.asList(mortgage, groceries, archived);
+        List<BudgetCategory> choices = BudgetScreenState.sortedCategoryChoices(original);
+        assertEquals(Arrays.asList(groceries, mortgage), choices);
+        assertSame(mortgage, original.get(0));
+        assertNull(BudgetScreenState.categoryChoice(choices, -1));
+        assertNull(BudgetScreenState.categoryChoice(choices, 0));
+        assertSame(groceries, BudgetScreenState.categoryChoice(choices, 1));
+        assertSame(mortgage, BudgetScreenState.categoryChoice(choices, 2));
+        assertNull(BudgetScreenState.categoryChoice(choices, 3));
+        assertNull(BudgetScreenState.categoryChoice(Collections.emptyList(), 0));
     }
 
     private static TransactionDetail detail(
