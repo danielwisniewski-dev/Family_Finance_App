@@ -510,9 +510,9 @@ class TransactionCategorizationTests(unittest.TestCase):
         events = self.repository.list_notification_events(household_id=self.household_id)
         event_types = [event.event_type for event in events]
         serialized = "\n".join(str(event.metadata) for event in events)
-        self.assertIn("transaction_category_assigned", event_types)
+        self.assertNotIn("transaction_category_assigned", event_types)
         self.assertIn("transaction_recategorized", event_types)
-        self.assertIn("transaction_split", event_types)
+        self.assertNotIn("transaction_split", event_types)
         self.assertIn("transaction_ignored", event_types)
         self.assertIn("transaction_unignored", event_types)
         self.assertIn("merchant_rule_created", event_types)

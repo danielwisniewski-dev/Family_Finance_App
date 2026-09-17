@@ -1,10 +1,12 @@
 # Family Finance Accountability App
 
-Stage 1 private-beta security, Render configuration, backups, migration, and signed Android build instructions are in [docs/stage-1-private-beta.md](docs/stage-1-private-beta.md). Live USAA linking remains stage 2; the hosted stage 1 entry point explicitly disables bank connections.
+The private Android beta is deployed on Render with the Stage 2 USAA/Plaid integration. PR #19 was merged and deployed on September 12, 2026; Daniel confirmed native USAA linking and matching bank data. On September 17 he reported that the app is working well. See [the Stage 2 runbook and acceptance record](docs/stage-2-usaa-plaid.md) for verified results and checks not yet individually recorded.
 
-The September recovery review and verification record is in [docs/overnight-review.md](docs/overnight-review.md). The app remains a private, local Android/SQLite MVP with Plaid Sandbox only.
+Stage 1 security, Render configuration, encrypted backups, migration, and signed Android build instructions remain in [docs/stage-1-private-beta.md](docs/stage-1-private-beta.md). The earlier recovery review is in [docs/overnight-review.md](docs/overnight-review.md). Local development uses Sandbox; the existing private household explicitly enabled Production Plaid under the Trial plan.
 
-This workspace starts the staged MVP from the attached build plan.
+The tested interface update is Android `0.6.1-interface`, code 4. Daniel reviewed the local preview and approved publishing the changes to GitHub. It adds the streak/personal-best dashboard, streamlined transaction review and multi-select categorization, merchant-rule management, quieter routine notifications, and bank sync before safe-to-spend. See [interface release notes, verification, and delivery guidance](docs/interface-tweaks.md). Merge, production deployment, and phone installation remain pending.
+
+The milestone descriptions below document how the app was built. Preserve the existing hosted household/database, bank connection, and Android signing key when making changes. Broader household access remains deferred.
 
 The implemented slices are Milestone 1, Milestone 2, Milestone 3 backend scaffolding, Milestone 4 Android MVP screens, Milestone 5A/5B backend coach scaffolding, Milestone 6 spouse accountability notifications, Milestone 7 private household access, Milestone 8 Plaid Sandbox linking/sync, Milestone 9 budget setup/monthly planning, Milestone 10 transaction review workflow and merchant rules, Milestone 11 household setup/settings, Milestone 12 MVP usability hardening/data integrity, Milestone 13 MVP release-candidate stabilization, and Milestone 14 Android visual polish/local gamification.
 
@@ -107,7 +109,7 @@ Milestone 8 adds Plaid Sandbox linking and sync:
 - Removed Plaid transactions marked ignored/auditable rather than deleted
 - Sanitized sync errors that do not expose Plaid or OpenAI secrets
 
-This is Sandbox-only. `PLAID_ENV` must be `sandbox`; production Plaid is intentionally unsupported in this app.
+Milestone 8 was Sandbox-only. Local development still requires `PLAID_ENV=sandbox`; Stage 2 adds explicitly enabled Production access for the private USAA connection through the hosted runtime.
 
 Milestone 9 adds budget setup and monthly planning edits:
 
@@ -168,7 +170,7 @@ Do not commit real passwords. The demo credentials below are local-only values f
 
 Stage 1 adds ordered, transactional SQLite migrations with a version ledger. The known local MVP schema is the baseline; upgrades reject future versions and inconsistent history. Hosted startup creates an encrypted recovery archive before upgrading an existing database.
 
-The hosted beta starts with a fresh database. Preserve existing local data. For a later import, use the offline copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
+The hosted beta already has an initialized household and a schema 3 database. Never reset or reseed it. For an offline local import, use the copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
 
 Deferred by design:
 
@@ -181,7 +183,7 @@ Deferred by design:
 Still intentionally excluded:
 
 - Production auth
-- Production Plaid
+- Production Plaid outside the explicitly enabled private Stage 2 USAA connection
 - AI autonomous budget changes
 - Receipt scanning
 - Credit cards
@@ -197,7 +199,10 @@ Milestone 3 API routes are backend-only JSON routes:
 GET /budget-months/{budget_month_id}/transactions
 GET /budget-months/{budget_month_id}/transaction-review-queue
 GET /transactions/{transaction_id}
+GET /merchant-category-rules?include_inactive=true
 POST /merchant-category-rules
+PATCH /merchant-category-rules/{rule_id}
+DELETE /merchant-category-rules/{rule_id}
 PATCH /transactions/{transaction_id}/review
 PATCH /transactions/{transaction_id}/category
 PATCH /transactions/{transaction_id}/split
@@ -228,7 +233,11 @@ Send `"category_id": null` to remove the active category assignment. Split paylo
 
 Ignored transactions remain in transaction history and audit events, but active category assignments are superseded and ignored transactions do not reduce category remaining.
 
+Android manual category assignment sends `reviewed: true`. New selections start blank and active categories are alphabetical; an existing merchant-rule editor or split editor can show its saved category. Merchant-rule edits do not apply to existing transactions unless explicitly requested through the API. Deleting a rule archives it and preserves past assignments. Routine category assignments and splits retain audit history without creating new notifications; recategorization still notifies.
+
 ## Run Tests
+
+Install the backend dependencies from `requirements.txt` into the Python environment used for tests; the hosted HTTP tests require Waitress. A missing test dependency is not a reason to skip those tests.
 
 Use Python from your PATH:
 
@@ -286,7 +295,7 @@ In Android, open the app with backend URL `http://10.0.2.2:8080`, tap `Check fir
 
 ## Plaid Sandbox Setup
 
-Do not use production Plaid credentials with this app. For local Sandbox linking:
+Do not use Production credentials with the local Sandbox backend. Hosted Production setup is documented separately in [the Stage 2 runbook](docs/stage-2-usaa-plaid.md). For local Sandbox linking:
 
 1. In the Plaid Dashboard, add Android package name `com.familyfinance.app` to the allowed Android package names.
 2. Set local environment variables outside git:
@@ -301,7 +310,7 @@ $env:PLAID_COUNTRY_CODES = "US"
 
 `PLAID_REDIRECT_URI` is optional and should only be set if your Plaid Dashboard/app configuration requires it.
 
-The local Sandbox backend creates Link tokens and exchanges public tokens. Android never receives Plaid access tokens or token refs. Local Sandbox mode without an encryption key retains the legacy token store. With `FF_ENCRYPTION_KEY`, token values are encrypted; plaintext legacy values require the explicit offline upgrade. Stage 1 hosted mode disables all bank linking. Live Plaid remains a separate stage 2 requirement.
+The local Sandbox backend creates Link tokens and exchanges public tokens. Android never receives Plaid access tokens or token refs. Local Sandbox mode without an encryption key retains the legacy token store. With `FF_ENCRYPTION_KEY`, token values are encrypted; plaintext legacy values require the explicit offline upgrade. Hosted linking stays disabled by default and requires the explicit Stage 2 Production/Trial configuration already applied to the existing private service.
 
 Sandbox manual flow:
 
@@ -311,8 +320,8 @@ Sandbox manual flow:
 4. Tap `Link bank with Plaid Sandbox`.
 5. Complete Plaid Link with Sandbox test credentials.
 6. Confirm linked checking/savings accounts appear.
-7. Tap `Sync balances` and `Sync transactions`.
-8. Confirm imported transactions appear in `Transactions` and uncategorized items appear in `Uncategorized review`.
+7. Use the available bank-sync controls in Accounts / settings; the live Stage 2 flow has a combined `Sync bank data` action.
+8. Confirm imported transactions appear in `Transactions` and items needing attention appear in `Transaction Review`.
 
 Credit cards, loans, and investments returned by Plaid are ignored for this MVP.
 
@@ -423,7 +432,7 @@ Changing the backend URL signs out and clears cached financial data before conne
 
 - A budget remains readable when there is no upcoming payday. Cash forecast fields are `null` and `forecast_available` is false; the app prompts for a payday instead of showing a zero or a safe result. Safe-to-spend and coach budget proposals still require a future payday. Summary responses also include `as_of` and the backend's configured `low_cushion` decision.
 - Copied months keep income plans but reset received amounts. Bank sync preserves category choices, reconciles changed single-category amounts, and returns changed splits to review while retaining their history. Pending-to-posted replacements count once. Batch transaction changes and their cursor commit together.
-- Incoming/zero transactions cannot be assigned as expenses. Existing unsupported assignments are preserved and flagged by diagnostics. Refund/transfer attribution and account rollover between months still require accounting decisions; connected accounts cannot be moved to another month by relinking.
+- Incoming/zero transactions cannot be assigned as expenses. Existing unsupported assignments are preserved and flagged by diagnostics. Stage 2 supports explicit transfer exclusion and single-category refunds; imports still do not automatically plan income. Transaction dates determine budget-month membership, and connected accounts cannot be moved to another month by relinking. See the Stage 2 runbook for reconciliation and rollover rules.
 - Money requests use exact whole cents. Fractional JSON cents, booleans, malformed dates and invalid flags are rejected; Android rejects fractional cents and overflowing amounts instead of silently rounding or wrapping them.
 
 Repeat the isolated HTTP/persistence smoke without starting another server or touching your local databases:
@@ -440,12 +449,13 @@ With the demo API running and the Pixel 8 emulator open, verify:
 
 - Login succeeds with local-only Daniel or Kara demo credentials.
 - Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
-- Dashboard also shows local-only budget check-in/review progress cues without changing backend financial state.
+- Dashboard starts with the check-in streak, personal best, and daily encouragement. Its compact month/sync line and cash-cushion heading use backend data; the Transaction Review card opens the queue.
 - Monthly budget shows polished backend groups/categories and supports budget month switching/copy-forward, category add/edit/archive, and funding edits.
-- Safe to spend returns a backend-calculated result and required phrase.
-- Uncategorized review shows empty or non-empty state from backend data, plus local-only queue progress/cleared messaging.
+- Safe to spend syncs the enabled connected bank before requesting the backend result and required phrase. Failed sync stops calculation; review and explicit reconciliation gates remain. A manual demo without bank linking needs no sync.
+- Transaction Review shows empty or non-empty state from backend data, plus local-only queue progress/cleared messaging. Category choices start blank and are alphabetical. Select transactions assigns only the selected eligible rows and reports partial completion if a save fails.
 - Tapping a transaction opens transaction detail when demo transactions exist.
-- Transaction detail can assign a category, split a transaction, toggle reviewed/unreviewed, create a merchant rule, and ignore/unignore a transaction.
+- Transaction detail can assign and review a category in one save, split a transaction, confirm an existing assignment when needed, create a merchant rule, and ignore/unignore a transaction. Merchant rules opens an alphabetical list with Edit/Delete; those actions preserve past transaction categories.
+- New basic assignments and splits do not add notifications. Existing notification history is retained.
 - Accounts / settings shows account inclusion, Plaid Sandbox actions, account settings, and diagnostics/integrity checks.
 - Logout clears the local MVP token and returns to the login screen.
 
@@ -457,14 +467,13 @@ Real in current MVP:
 - Local mock/demo account and transaction data
 - Local-only Android motivational progress/streak display state
 
-Known MVP limitations:
+Current scope and limitations:
 
-- Login/household access is a private local access layer, not production auth
-- Local token storage is suitable for this local/Sandbox MVP only, not production-grade credential storage
+- Login/household access is a private access layer without a managed identity provider
+- Local Sandbox token storage without an encryption key is for development only; hosted Plaid tokens are encrypted and Android release sessions use Keystore protection
 - Android motivational streak/progress cues are local to the device/app data and are not a backend accountability record
-- Local/private MVP only; there is no hosted deployment
-- Plaid is Sandbox-only and requires local Plaid env vars for live linking
-- Production Plaid is not supported
+- Private Render deployment for the existing household; public or extended-family onboarding is not enabled
+- Production Plaid is limited to the explicitly enabled USAA checking/savings integration; local development remains Sandbox-only
 - Credit cards are not supported
 - Receipt scanning is not included
 - Cloud push notifications are not included

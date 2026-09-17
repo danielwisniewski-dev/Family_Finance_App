@@ -4,6 +4,7 @@ import com.familyfinance.app.model.BudgetCategory;
 import com.familyfinance.app.model.TransactionDetail;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 public final class BudgetScreenState {
@@ -55,6 +56,19 @@ public final class BudgetScreenState {
             }
         }
         return result;
+    }
+
+    public static List<BudgetCategory> sortedCategoryChoices(List<BudgetCategory> categories) {
+        List<BudgetCategory> result = activeCategories(categories);
+        result.sort(Comparator.comparing((BudgetCategory category) -> category.name, String.CASE_INSENSITIVE_ORDER)
+                .thenComparingInt(category -> category.id));
+        return result;
+    }
+
+    public static BudgetCategory categoryChoice(List<BudgetCategory> choices, int spinnerPosition) {
+        // Position zero is the prompt, never a financial category.
+        int index = spinnerPosition - 1;
+        return index >= 0 && index < choices.size() ? choices.get(index) : null;
     }
 
     public static String splitValidationMessage(int transactionTotalCents, List<Integer> splitAmountsCents) {

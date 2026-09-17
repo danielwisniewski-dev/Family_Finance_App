@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -17,8 +18,10 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.ArrayAdapter;
+import android.widget.AdapterView;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
@@ -48,10 +51,15 @@ import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
 import com.familyfinance.app.state.BudgetScreenState;
+import com.familyfinance.app.state.CheckInStreak;
 import com.familyfinance.app.state.ConnectionSettings;
+import com.familyfinance.app.state.DashboardText;
+import com.familyfinance.app.state.EncouragementMessages;
 import com.familyfinance.app.state.LoginErrorMessages;
 import com.familyfinance.app.state.MoneyFormatter;
 import com.familyfinance.app.state.SecureSessionStore;
+import com.familyfinance.app.state.SelectedCategoryAssigner;
+import com.familyfinance.app.state.TransactionReviewState;
 import com.plaid.link.Plaid;
 import com.plaid.link.PlaidHandler;
 import com.plaid.link.configuration.LinkTokenConfiguration;
@@ -68,6 +76,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.time.LocalDate;
 import java.time.YearMonth;
+import java.time.ZoneId;
 
 import kotlin.Unit;
 
@@ -77,6 +86,7 @@ public final class MainActivity extends Activity {
     private static final int DEFAULT_BUDGET_MONTH_ID = 1;
     private static final String PREF_LAST_BUDGET_CHECK_DATE = "last_budget_check_date";
     private static final String PREF_BUDGET_CHECK_STREAK = "budget_check_streak";
+    private static final String PREF_BEST_BUDGET_CHECK_STREAK = "best_budget_check_streak";
     private static final String PREF_LAST_REVIEW_CLEAR_DATE = "last_review_clear_date";
     private static final String PREF_REVIEW_CLEAR_STREAK = "review_clear_streak";
 
@@ -184,8 +194,16 @@ public final class MainActivity extends Activity {
         if ("Family Finance".equals(currentScreen)) {
             return;
         }
+        if ("Assignment stopped".equals(currentScreen)) {
+            refreshData(() -> showTransactions(true));
+            return;
+        }
         if (authToken != null && !authToken.isEmpty() && !"Dashboard".equals(currentScreen)) {
-            if ("Transaction Detail".equals(currentScreen)) {
+            if ("Edit merchant rule".equals(currentScreen)) {
+                showMerchantRules();
+            } else if ("Merchant rules".equals(currentScreen)) {
+                showTransactions(reviewingQueue);
+            } else if ("Transaction Detail".equals(currentScreen) || "Select transactions".equals(currentScreen)) {
                 showTransactions(reviewingQueue);
             } else {
                 showDashboard();
@@ -611,11 +629,9 @@ public final class MainActivity extends Activity {
 
     private void showDashboard() {
         beginScreen("Dashboard");
-        if (bankStatus.optBoolean("enabled")) {
-            addFact("Saved bank balances checked (UTC)", bankStatus.optString("balance_checked_at", "Not checked"));
-            if (!bankStatus.optBoolean("ready")) {
-                addWarning("Bank data needs attention before safe-to-spend. Open Settings to sync and reconcile USAA.");
-            }
+        if (summary != null) {
+            LocalDate today = LocalDate.now();
+            addCheckInStreakCard(recordBudgetCheckInStreak(today), today);
         }
         if (summary == null) {
             if (budgetMonths.isEmpty()) {
@@ -632,43 +648,37 @@ public final class MainActivity extends Activity {
             addNav();
             return;
         }
-        int budgetCheckStreak = recordBudgetCheckInStreak();
         int reviewClearStreak = recordReviewClearStreakIfCleared();
-        addFact("Signed in", blankAsDash(currentUserName) + " for " + blankAsDash(householdName));
-        addFact("Budget month", summary.month + (summary.asOf.isEmpty() ? "" : " · as of " + summary.asOf));
+        addFact("Budget month", DashboardText.budgetMonth(summary.month) + " · "
+                + DashboardText.lastBankSync(bankStatus.optString("transactions_checked_at", ""),
+                        bankStatus.optString("balance_checked_at", ""), ZoneId.systemDefault()));
         if (summary.forecastAvailable) {
+            boolean lowCushion = summary.hasLowCushion();
+            String cushionTitle = lowCushion ? "Cash cushion is tight"
+                    : Boolean.FALSE.equals(summary.lowCushion) ? "Cushion looks steady" : "Cash after upcoming bills";
             addHeroCard(
-                    "Cash after upcoming bills",
+                    cushionTitle,
                     MoneyFormatter.dollars(summary.cashAfterBillsCents),
-                    "About " + summary.daysUntilPayday + " day"
+                    "Left after upcoming bills. About " + summary.daysUntilPayday + " day"
                             + (summary.daysUntilPayday == 1 ? "" : "s")
                             + " until payday. Included balance is "
                             + MoneyFormatter.dollars(summary.includedAccountBalanceCents)
-                            + "."
+                            + ".",
+                    lowCushion ? COLOR_WARNING_BG : COLOR_SURFACE_ALT,
+                    lowCushion ? COLOR_WARNING_TEXT : COLOR_PRIMARY_DARK
             );
-            if (summary.hasLowCushion()) {
-                addWarning("Cash remaining after bills is tight for the days until payday. Keep new spending calm and intentional.");
-            } else if (summary.lowCushion != null) {
-                addStatusCard(
-                        "Cushion looks steady",
-                        "The current cash cushion is not flagged as low by the backend.",
-                        COLOR_SUCCESS_BG,
-                        COLOR_SUCCESS_TEXT
-                );
-            }
         } else {
             addHeroCard("Included account balance", MoneyFormatter.dollars(summary.includedAccountBalanceCents),
                     "Cash after bills is unavailable until you add an upcoming payday.");
             addButton("Add a payday", () -> showPaydayEditor(null));
         }
         addButton("Check safe to spend", this::showSafeToSpend);
-        addSecondaryButton("Review transactions" + (reviewQueue.isEmpty() ? "" : " (" + reviewQueue.size() + ")"),
-                () -> showTransactions(true));
         addProgressCard(
                 "Transaction review",
                 reviewProgressValue(),
                 reviewProgressPercent(),
-                reviewProgressDetail()
+                reviewProgressDetail(),
+                () -> showTransactions(true)
         );
         if (reviewQueue.isEmpty()) {
             addStatusCard(
@@ -679,12 +689,6 @@ public final class MainActivity extends Activity {
                     COLOR_SUCCESS_TEXT
             );
         }
-        addMetricCard(
-                "Budget check-in streak",
-                budgetCheckStreak + " day" + (budgetCheckStreak == 1 ? "" : "s"),
-                "Local-only encouragement. It does not change financial records."
-        );
-
         addSection("Month at a glance");
         addMetric("Planned income", MoneyFormatter.dollars(summary.plannedIncomeTotalCents));
         addMetric("Assigned total", MoneyFormatter.dollars(summary.assignedTotalCents));
@@ -780,7 +784,7 @@ public final class MainActivity extends Activity {
             addNav();
             return;
         }
-        int streak = recordBudgetCheckInStreak();
+        int streak = recordBudgetCheckInStreak(LocalDate.now()).days;
         addHeroCard(
                 summary.month,
                 MoneyFormatter.dollars(summary.remainingToAssignCents),
@@ -1169,7 +1173,8 @@ public final class MainActivity extends Activity {
 
     private void showTransactions(boolean reviewOnly) {
         reviewingQueue = reviewOnly;
-        beginScreen(reviewOnly ? "Uncategorized Review" : "Transactions");
+        beginScreen(reviewOnly ? "Transaction Review" : "Transactions");
+        addSecondaryButton("Merchant rules", this::showMerchantRules);
         List<TransactionDetail> source = reviewOnly ? reviewQueue : transactions;
         if (reviewOnly) {
             int clearStreak = recordReviewClearStreakIfCleared();
@@ -1199,11 +1204,166 @@ public final class MainActivity extends Activity {
                     COLOR_SUCCESS_TEXT
             );
         } else {
+            if (reviewOnly && source.stream().anyMatch(TransactionReviewState::canAssignTogether)) {
+                addSecondaryButton("Select transactions", this::showTransactionSelection);
+            }
             for (TransactionDetail detail : source) {
                 addTransactionButton(detail);
             }
         }
         addNav();
+    }
+
+    private void showTransactionSelection() {
+        reviewingQueue = true;
+        beginScreen("Select transactions");
+        addBody("Choose spending transactions for the same category. Refunds and splits are reviewed individually.");
+        List<TransactionDetail> selected = new ArrayList<>();
+        LinearLayout footer = new LinearLayout(this);
+        footer.setOrientation(LinearLayout.HORIZONTAL);
+        footer.setPadding(dp(14), dp(8), dp(14), dp(8));
+        footer.setBackgroundColor(COLOR_BACKGROUND);
+        Button cancel = selectionAction("Cancel", false);
+        cancel.setOnClickListener(view -> showTransactions(true));
+        footer.addView(cancel);
+        Button choose = selectionAction("Assign selected (0)", true);
+        choose.setEnabled(false);
+        choose.setOnClickListener(view -> showSelectedCategoryDialog(new ArrayList<>(selected)));
+        footer.addView(choose);
+        for (TransactionDetail detail : reviewQueue) {
+            if (!TransactionReviewState.canAssignTogether(detail)) continue;
+            CheckBox row = new CheckBox(this);
+            row.setText(detail.transaction.displayName() + "\n"
+                    + MoneyFormatter.dollars(detail.transaction.amountCents) + " | " + detail.transaction.occurredOn
+                    + "\n" + detail.transaction.accountName + " | " + transactionStatusLabel(detail));
+            row.setPadding(dp(12), dp(12), dp(12), dp(12));
+            row.setMinHeight(dp(80));
+            row.setBackground(rounded(COLOR_SURFACE, COLOR_BORDER, 14));
+            row.setOnCheckedChangeListener((button, checked) -> {
+                if (checked) selected.add(detail); else selected.remove(detail);
+                choose.setText("Assign selected (" + selected.size() + ")");
+                choose.setEnabled(!selected.isEmpty());
+                row.setBackground(rounded(checked ? COLOR_SURFACE_ALT : COLOR_SURFACE,
+                        checked ? COLOR_PRIMARY : COLOR_BORDER, 14));
+            });
+            root.addView(row);
+        }
+        // Keep the action within reach while the list scrolls.
+        ScrollView scroll = (ScrollView) root.getParent();
+        ((ViewGroup) scroll.getParent()).removeView(scroll);
+        scroll.setOnApplyWindowInsetsListener(null);
+        scroll.setPadding(0, 0, 0, 0);
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(COLOR_BACKGROUND);
+        screen.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            return insets;
+        });
+        screen.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        screen.addView(footer);
+        setContentView(screen);
+        screen.requestApplyInsets();
+    }
+
+    private Button selectionAction(String text, boolean primary) {
+        Button button = new Button(this);
+        button.setText(text);
+        button.setAllCaps(false);
+        button.setTextSize(15);
+        button.setMinHeight(dp(52));
+        button.setTextColor(primary ? COLOR_SURFACE : COLOR_PRIMARY_DARK);
+        button.setBackgroundTintList(new ColorStateList(
+                new int[][]{new int[]{-android.R.attr.state_enabled}, new int[]{}},
+                new int[]{COLOR_BORDER, primary ? COLOR_PRIMARY : COLOR_SURFACE}));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT,
+                primary ? 2 : 1);
+        params.setMargins(dp(4), 0, dp(4), 0);
+        button.setLayoutParams(params);
+        return button;
+    }
+
+    private void showSelectedCategoryDialog(List<TransactionDetail> selected) {
+        if (selected.isEmpty()) return;
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(20), dp(8), dp(20), dp(8));
+        long total = 0;
+        for (TransactionDetail detail : selected) total -= (long) detail.transaction.amountCents;
+        content.addView(mutedText(MoneyFormatter.dollars(total) + " in spending. Assigning also marks these transactions reviewed."));
+        Spinner category = categorySpinner();
+        category.setMinimumHeight(dp(54));
+        content.addView(category);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Assign " + selected.size() + " transaction" + (selected.size() == 1 ? "" : "s"))
+                .setView(content)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Assign selected", null)
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            Button assign = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            assign.setEnabled(false);
+            category.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                @Override
+                public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                    assign.setEnabled(selectedCategory(category) != null);
+                }
+                @Override
+                public void onNothingSelected(AdapterView<?> parent) { assign.setEnabled(false); }
+            });
+            assign.setOnClickListener(view -> {
+                BudgetCategory choice = selectedCategory(category);
+                if (choice == null) return;
+                dialog.dismiss();
+                assignSelectedTransactions(selected, choice);
+            });
+        });
+        dialog.show();
+    }
+
+    private void assignSelectedTransactions(List<TransactionDetail> selected, BudgetCategory category) {
+        FamilyFinanceApi assignmentApi = api;
+        showLoading("Assigning " + selected.size() + " transactions...");
+        executor.execute(() -> {
+            SelectedCategoryAssigner.Result result = SelectedCategoryAssigner.assign(selected, category.id,
+                    new SelectedCategoryAssigner.Gateway() {
+                        private void ensureActive() throws ApiException {
+                            if (destroyed || Thread.currentThread().isInterrupted()) {
+                                throw new ApiException("Assignment interrupted. Reload to check the saved transactions.");
+                            }
+                        }
+                        @Override
+                        public TransactionDetail load(int id) throws Exception {
+                            ensureActive();
+                            return assignmentApi.getTransaction(id);
+                        }
+                        @Override
+                        public void assignAndReview(int id, int categoryId) throws Exception {
+                            ensureActive();
+                            assignmentApi.assignCategory(id, categoryId, true);
+                        }
+                    });
+            postIfActive(() -> {
+                String saved = result.confirmed + " transaction" + (result.confirmed == 1 ? "" : "s")
+                        + " assigned to " + category.name + " and reviewed.";
+                if (result.error == null && !result.changed) {
+                    refreshData(() -> {
+                        showTransactions(true);
+                        toast(saved);
+                    });
+                } else if (result.error != null && handleExpiredSession(result.error)) {
+                    toast(saved + " Log in again to check the remaining transactions.");
+                } else {
+                    beginScreen("Assignment stopped");
+                    addBody(saved);
+                    addBody(result.changed
+                            ? "A selected transaction changed since you selected it. Reload the review queue before continuing."
+                            : "The remaining saves could not be confirmed. Reload to see what was saved before trying again.");
+                    addButton("Reload review queue", () -> refreshData(() -> showTransactions(true)));
+                }
+            });
+        });
     }
 
     private void showTransactionDetail(int transactionId) {
@@ -1242,6 +1402,14 @@ public final class MainActivity extends Activity {
             addNav();
             return;
         }
+        if (TransactionReviewState.canConfirmExisting(detail)) {
+            String confirmLabel = detail.isSplit() ? "Confirm existing split"
+                    : detail.finalCategoryId != null ? "Confirm current category" : "Confirm incoming transaction";
+            addButton(confirmLabel, () -> runMutation(
+                    "Confirming transaction...",
+                    () -> api.markReviewed(detail.transaction.id, true),
+                    () -> afterTransactionSaved(detail.transaction.id)));
+        }
         if (detail.isSplit()) {
             addSection("Split state");
             for (TransactionAssignment assignment : detail.assignments) {
@@ -1259,28 +1427,18 @@ public final class MainActivity extends Activity {
 
         addSection("Categorize");
         Spinner categorySpinner = categorySpinner();
-        if (detail.finalCategoryId != null) {
-            setSpinnerToCategory(categorySpinner, detail.finalCategoryId);
-        } else if (detail.suggestedCategoryId != null) {
-            setSpinnerToCategory(categorySpinner, detail.suggestedCategoryId);
-        }
         root.addView(categorySpinner);
-        CheckBox reviewed = new CheckBox(this);
-        reviewed.setText("Mark reviewed after assigning");
-        reviewed.setChecked(true);
-        root.addView(reviewed);
         addButton(detail.transaction.amountCents > 0 ? "Apply posted refund to category" : "Assign category", () -> {
             BudgetCategory category = selectedCategory(categorySpinner);
             if (category == null) {
                 toast("No category selected.");
                 return;
             }
-            boolean markReviewed = reviewed.isChecked();
             runMutation(
                     "Assigning category...",
                     () -> {
                         if (detail.transaction.amountCents > 0) api.assignRefund(detail.transaction.id, category.id);
-                        else api.assignCategory(detail.transaction.id, category.id, markReviewed);
+                        else api.assignCategory(detail.transaction.id, category.id, true);
                     },
                     () -> afterTransactionSaved(detail.transaction.id)
             );
@@ -1292,11 +1450,6 @@ public final class MainActivity extends Activity {
                     () -> afterTransactionSaved(detail.transaction.id)
             ));
         }
-        addButton(detail.transaction.reviewed ? "Mark unreviewed" : "Mark reviewed", () -> runMutation(
-                "Updating review state...",
-                () -> api.markReviewed(detail.transaction.id, !detail.transaction.reviewed),
-                () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
-        ));
         addDangerButton(detail.transaction.ignored ? "Unignore transaction" : "Ignore/exclude transaction", () -> runMutation(
                 "Updating ignored state...",
                 () -> api.setIgnored(detail.transaction.id, !detail.transaction.ignored, "Marked in Android MVP"),
@@ -1478,6 +1631,7 @@ public final class MainActivity extends Activity {
 
     private void addMerchantRuleControls(TransactionDetail detail) {
         addSection("Merchant rule");
+        addSecondaryButton("Manage merchant rules", this::showMerchantRules);
         MerchantRule matchingRule = findMatchingRule(detail);
         if (matchingRule != null) {
             addBody("Existing rule: " + matchingRule.merchantMatchText + " -> " + matchingRule.categoryName);
@@ -1490,11 +1644,6 @@ public final class MainActivity extends Activity {
         }
         addBody("A new rule affects future matching transactions. Current unreviewed matches are optional.");
         Spinner ruleCategory = categorySpinner();
-        if (detail.finalCategoryId != null) {
-            setSpinnerToCategory(ruleCategory, detail.finalCategoryId);
-        } else if (detail.suggestedCategoryId != null) {
-            setSpinnerToCategory(ruleCategory, detail.suggestedCategoryId);
-        }
         root.addView(ruleCategory);
         CheckBox applyExisting = new CheckBox(this);
         applyExisting.setText("Also apply to current unreviewed matches");
@@ -1524,6 +1673,109 @@ public final class MainActivity extends Activity {
                 ? ""
                 : " (" + detail.suggestionReason + ")";
         return detail.suggestionSource + category + reason;
+    }
+
+    private void showMerchantRules() {
+        showLoading("Loading merchant rules...");
+        executor.execute(() -> {
+            try {
+                List<MerchantRule> loaded = api.getMerchantRules();
+                postIfActive(() -> {
+                    merchantRules = loaded;
+                    renderMerchantRules(false);
+                });
+            } catch (Exception exception) {
+                postIfActive(() -> showError("Could not load merchant rules", exception));
+            }
+        });
+    }
+
+    private void renderMerchantRules(boolean includeDeleted) {
+        beginScreen("Merchant rules");
+        addBody("Rules assign categories to future matching transactions. You still review those transactions.");
+        List<MerchantRule> sorted = new ArrayList<>(merchantRules);
+        sorted.sort((left, right) -> {
+            if (left.active != right.active) return left.active ? -1 : 1;
+            return String.CASE_INSENSITIVE_ORDER.compare(left.merchantMatchText, right.merchantMatchText);
+        });
+        long activeCount = sorted.stream().filter(rule -> rule.active).count();
+        addSection(activeCount + " active rule" + (activeCount == 1 ? "" : "s"));
+        if (activeCount == 0) addBody("Create a rule from a transaction's detail screen.");
+        if (activeCount < sorted.size()) {
+            CheckBox deleted = new CheckBox(this);
+            deleted.setText("Show deleted rules");
+            deleted.setChecked(includeDeleted);
+            deleted.setOnCheckedChangeListener((button, checked) -> renderMerchantRules(checked));
+            root.addView(deleted);
+        }
+        for (MerchantRule rule : sorted) {
+            if (!rule.active && !includeDeleted) continue;
+            LinearLayout card = cardLayout(COLOR_SURFACE, COLOR_BORDER);
+            TextView merchant = smallLabel(rule.merchantMatchText);
+            merchant.setTextSize(17);
+            card.addView(merchant);
+            card.addView(mutedText(rule.categoryName + (rule.active ? "" : " · Deleted")));
+            if (rule.active) {
+                LinearLayout actions = new LinearLayout(this);
+                for (String label : new String[]{"Edit", "Delete"}) {
+                    Button button = new Button(this);
+                    button.setText(label);
+                    button.setAllCaps(false);
+                    button.setContentDescription(label + " rule for " + rule.merchantMatchText);
+                    button.setTextColor("Delete".equals(label) ? COLOR_DANGER_TEXT : COLOR_PRIMARY_DARK);
+                    button.setOnClickListener(view -> {
+                        if ("Edit".equals(label)) showMerchantRuleEditor(rule);
+                        else confirmDeleteMerchantRule(rule);
+                    });
+                    actions.addView(button, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                }
+                card.addView(actions);
+            }
+            root.addView(card);
+        }
+        addSecondaryButton("Back to transactions", () -> showTransactions(reviewingQueue));
+        addNav();
+    }
+
+    private void showMerchantRuleEditor(MerchantRule rule) {
+        beginScreen("Edit merchant rule");
+        addBody("Changes apply to future matches. Existing transaction categories stay as they are.");
+        addSection("Merchant text to match");
+        EditText match = new EditText(this);
+        match.setSingleLine(true);
+        match.setText(rule.merchantMatchText);
+        root.addView(match);
+        addSection("Category");
+        addBody("Current category: " + rule.categoryName);
+        Spinner category = categorySpinner();
+        setSpinnerToCategory(category, rule.categoryId);
+        root.addView(category);
+        addButton("Save rule", () -> {
+            String text = match.getText().toString().trim();
+            BudgetCategory selected = selectedCategory(category);
+            if (text.isEmpty()) {
+                toast("Enter merchant text to match.");
+                return;
+            }
+            if (selected == null) {
+                toast("Choose an active category.");
+                return;
+            }
+            runMutation("Saving merchant rule...",
+                    () -> api.updateMerchantRule(rule.id, text, selected.id), this::showMerchantRules);
+        });
+        addSecondaryButton("Cancel", this::showMerchantRules);
+    }
+
+    private void confirmDeleteMerchantRule(MerchantRule rule) {
+        new AlertDialog.Builder(this)
+                .setTitle("Delete merchant rule?")
+                .setMessage("Stop automatically categorizing matches for \"" + rule.merchantMatchText
+                        + "\"? Past transactions and their categories will stay unchanged.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Delete", (dialog, which) -> runMutation("Deleting merchant rule...",
+                        () -> api.archiveMerchantRule(rule.id), this::showMerchantRules))
+                .show();
     }
 
     private MerchantRule findMatchingRule(TransactionDetail detail) {
@@ -1603,7 +1855,7 @@ public final class MainActivity extends Activity {
         }
         addStatusCard(
                 "Ask before spending",
-                "Choose the category and amount. The answer comes from backend budget and cash-reality rules.",
+                "Choose the category and amount. We'll sync your connected bank before checking your budget and upcoming bills.",
                 COLOR_SURFACE_ALT,
                 COLOR_PRIMARY_DARK
         );
@@ -1637,17 +1889,31 @@ public final class MainActivity extends Activity {
                 return;
             }
             String purpose = note.getText().toString();
-            showLoading("Checking safe to spend...");
-            executor.execute(() -> {
-                try {
-                    SafeToSpendResult result = api.safeToSpend(budgetMonthId, category.id, cents);
-                    postIfActive(() -> renderSafeToSpendResult(result, purpose));
-                } catch (Exception exception) {
-                    postIfActive(() -> showError("Safe-to-spend check failed", exception));
-                }
-            });
+            checkSafeToSpend(category.id, cents, purpose);
         });
         addNav();
+    }
+
+    private void checkSafeToSpend(int categoryId, int cents, String purpose) {
+        showLoading("Syncing bank data and checking safe to spend...");
+        FamilyFinanceApi requestApi = api;
+        int monthId = budgetMonthId;
+        executor.execute(() -> {
+            try {
+                SafeToSpendResult result = requestApi.syncAndCheckSafeToSpend(monthId, categoryId, cents);
+                postIfActive(() -> refreshData(() -> renderSafeToSpendResult(result, purpose)));
+            } catch (Exception exception) {
+                postIfActive(() -> {
+                    if (handleExpiredSession(exception)) return;
+                    beginScreen("Safe to spend needs attention");
+                    addStatusCard("We couldn't finish this check", userFacingError(exception), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+                    addButton("Retry this amount", () -> checkSafeToSpend(categoryId, cents, purpose));
+                    addSecondaryButton("Review transactions", () -> refreshData(() -> showTransactions(true)));
+                    addSecondaryButton("Accounts / settings", this::showSettings);
+                    addSecondaryButton("Back to dashboard", () -> refreshData(this::showDashboard));
+                });
+            }
+        });
     }
 
     private void renderSafeToSpendResult(SafeToSpendResult result, String note) {
@@ -2220,6 +2486,41 @@ public final class MainActivity extends Activity {
         root.addView(button);
     }
 
+    private void addCheckInStreakCard(CheckInStreak streak, LocalDate today) {
+        LinearLayout card = cardLayout(COLOR_SURFACE_ALT, 0xFFBFD5C8);
+        card.addView(smallLabel("Budget check-in"));
+
+        TextView current = new TextView(this);
+        current.setText("\uD83D\uDD25 " + streak.days + "-day streak");
+        current.setContentDescription("Budget check-in streak: " + streak.days
+                + (streak.days == 1 ? " day" : " days"));
+        current.setTextColor(COLOR_PRIMARY_DARK);
+        current.setTextSize(30);
+        current.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        current.setPadding(0, dp(2), 0, dp(8));
+        card.addView(current);
+
+        TextView best = new TextView(this);
+        best.setText("\uD83C\uDFC6 Personal best: " + streak.bestDays
+                + (streak.bestDays == 1 ? " day" : " days"));
+        best.setContentDescription("Personal best: " + streak.bestDays
+                + (streak.bestDays == 1 ? " day" : " days"));
+        best.setTextColor(COLOR_WARNING_TEXT);
+        best.setTextSize(14);
+        best.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        best.setPadding(dp(10), dp(6), dp(10), dp(6));
+        best.setBackground(rounded(COLOR_WARNING_BG, COLOR_WARNING_BG, 10));
+        card.addView(best, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView encouragement = mutedText(EncouragementMessages.forDate(today));
+        encouragement.setTextColor(COLOR_PRIMARY_DARK);
+        encouragement.setTextSize(15);
+        encouragement.setPadding(0, dp(10), 0, 0);
+        card.addView(encouragement);
+        root.addView(card);
+    }
+
     private void addMetricCard(String label, String value, String detail) {
         LinearLayout card = cardLayout(COLOR_SURFACE, COLOR_BORDER);
         TextView labelView = smallLabel(label);
@@ -2239,12 +2540,18 @@ public final class MainActivity extends Activity {
     }
 
     private void addHeroCard(String label, String value, String detail) {
-        LinearLayout card = cardLayout(COLOR_SURFACE_ALT, 0xFFBFD5C8);
+        addHeroCard(label, value, detail, COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK);
+    }
+
+    private void addHeroCard(String label, String value, String detail, int backgroundColor, int textColor) {
+        LinearLayout card = cardLayout(backgroundColor,
+                backgroundColor == COLOR_SURFACE_ALT ? 0xFFBFD5C8 : backgroundColor);
         TextView labelView = smallLabel(label);
+        labelView.setTextColor(textColor);
         card.addView(labelView);
         TextView valueView = new TextView(this);
         valueView.setText(value);
-        valueView.setTextColor(COLOR_PRIMARY_DARK);
+        valueView.setTextColor(textColor);
         valueView.setTextSize(34);
         valueView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         valueView.setPadding(0, dp(2), 0, dp(8));
@@ -2275,8 +2582,12 @@ public final class MainActivity extends Activity {
     }
 
     private void addProgressCard(String title, String value, int progressPercent, String detail) {
+        addProgressCard(title, value, progressPercent, detail, null);
+    }
+
+    private void addProgressCard(String title, String value, int progressPercent, String detail, Runnable action) {
         LinearLayout card = cardLayout(COLOR_SURFACE, COLOR_BORDER);
-        TextView titleView = smallLabel(title);
+        TextView titleView = smallLabel(action == null ? title : title + "  \u203A");
         card.addView(titleView);
         TextView valueView = new TextView(this);
         valueView.setText(value);
@@ -2299,6 +2610,24 @@ public final class MainActivity extends Activity {
         card.addView(progressBar);
         if (detail != null && !detail.trim().isEmpty()) {
             card.addView(mutedText(detail));
+        }
+        if (action != null) {
+            card.setOnClickListener(view -> action.run());
+            card.setFocusable(true);
+            card.setForeground(new RippleDrawable(ColorStateList.valueOf(0x24236B4E),
+                    null, rounded(0xFFFFFFFF, 0xFFFFFFFF, 14)));
+            card.setContentDescription(title + ". " + value + ". "
+                    + (detail == null ? "" : detail + " ") + "Open transaction review.");
+            card.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+                @Override
+                public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
+                    super.onInitializeAccessibilityNodeInfo(host, info);
+                    info.setClassName(Button.class.getName());
+                }
+            });
+            for (int i = 0; i < card.getChildCount(); i++) {
+                card.getChildAt(i).setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+            }
         }
         root.addView(card);
     }
@@ -2350,26 +2679,23 @@ public final class MainActivity extends Activity {
 
     private Spinner categorySpinner() {
         Spinner spinner = new Spinner(this);
-        List<BudgetCategory> available = BudgetScreenState.activeCategories(summary == null ? null : summary.categories);
+        List<BudgetCategory> available = BudgetScreenState.sortedCategoryChoices(summary == null ? null : summary.categories);
         spinner.setTag(available);
         spinner.setContentDescription("Budget category");
         ArrayList<String> labels = new ArrayList<>();
+        labels.add("Choose a category...");
         for (BudgetCategory category : available) {
             labels.add(category.name + " (" + MoneyFormatter.dollars(category.remainingCents) + " left)");
         }
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, labels);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinner.setAdapter(adapter);
+        spinner.setSelection(0);
         return spinner;
     }
 
     private BudgetCategory selectedCategory(Spinner spinner) {
-        List<BudgetCategory> choices = spinnerCategories(spinner);
-        int position = spinner.getSelectedItemPosition();
-        if (position < 0 || position >= choices.size()) {
-            return null;
-        }
-        return choices.get(position);
+        return BudgetScreenState.categoryChoice(spinnerCategories(spinner), spinner.getSelectedItemPosition());
     }
 
     @SuppressWarnings("unchecked")
@@ -2433,11 +2759,11 @@ public final class MainActivity extends Activity {
         List<BudgetCategory> choices = spinnerCategories(spinner);
         for (int i = 0; i < choices.size(); i++) {
             if (choices.get(i).id == categoryId) {
-                spinner.setSelection(i);
+                spinner.setSelection(i + 1);
                 return;
             }
         }
-        spinner.setSelection(-1);
+        spinner.setSelection(0);
     }
 
     private String describeCategory(Integer categoryId) {
@@ -2489,8 +2815,20 @@ public final class MainActivity extends Activity {
         return nextStreak;
     }
 
-    private int recordBudgetCheckInStreak() {
-        return recordDailyStreak(PREF_LAST_BUDGET_CHECK_DATE, PREF_BUDGET_CHECK_STREAK);
+    private CheckInStreak recordBudgetCheckInStreak(LocalDate today) {
+        // Keep the existing scope and keys so an app update preserves each person's streak.
+        String scope = baseUrl + ":" + householdId + ":" + currentUserId + ":";
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        CheckInStreak streak = CheckInStreak.record(today,
+                prefs.getString(scope + PREF_LAST_BUDGET_CHECK_DATE, ""),
+                prefs.getInt(scope + PREF_BUDGET_CHECK_STREAK, 0),
+                prefs.getInt(scope + PREF_BEST_BUDGET_CHECK_STREAK, 0));
+        prefs.edit()
+                .putString(scope + PREF_LAST_BUDGET_CHECK_DATE, today.toString())
+                .putInt(scope + PREF_BUDGET_CHECK_STREAK, streak.days)
+                .putInt(scope + PREF_BEST_BUDGET_CHECK_STREAK, streak.bestDays)
+                .apply();
+        return streak;
     }
 
     private int recordReviewClearStreakIfCleared() {

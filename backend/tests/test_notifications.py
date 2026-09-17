@@ -87,7 +87,7 @@ class NotificationEventTests(unittest.TestCase):
             )
         ]
 
-    def test_category_assignment_creates_notification_event(self) -> None:
+    def test_routine_category_assignment_is_quiet_but_preserves_history(self) -> None:
         transaction_id = self.import_transaction()
 
         self.repository.assign_transaction_category(
@@ -95,11 +95,34 @@ class NotificationEventTests(unittest.TestCase):
             category_id=self.groceries_id,
         )
 
-        events = self.events("transaction_category_assigned")
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["affected_entity_id"], transaction_id)
-        self.assertEqual(events[0]["severity"], "info")
-        self.assertIn("Fresh Market", events[0]["message"])
+        self.assertEqual(self.events("transaction_category_assigned"), [])
+        detail = self.repository.get_transaction_detail(transaction_id)
+        self.assertEqual(detail.final_category_id, self.groceries_id)
+        self.assertTrue(detail.transaction.reviewed)
+        with self.repository.connect() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM transaction_categorization_events WHERE transaction_id=? AND event_type='category_assigned'",
+                (transaction_id,),
+            ).fetchone()[0], 1)
+        self.repository.assign_transaction_category(transaction_id=transaction_id, category_id=self.groceries_id)
+        self.assertEqual(self.events("transaction_category_assigned"), [])
+        self.assertEqual(self.events("transaction_recategorized"), [])
+
+    def test_basic_split_is_quiet_but_preserves_allocations_and_history(self) -> None:
+        transaction_id = self.import_transaction()
+        self.repository.split_transaction(transaction_id=transaction_id, splits=[
+            {"category_id": self.groceries_id, "amount_cents": 1500},
+            {"category_id": self.dining_id, "amount_cents": 1000},
+        ])
+        self.assertEqual(self.events("transaction_split"), [])
+        detail = self.repository.get_transaction_detail(transaction_id)
+        self.assertEqual(sum(a.amount_cents for a in detail.assignments), 2500)
+        self.assertTrue(detail.transaction.reviewed)
+        with self.repository.connect() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM transaction_categorization_events WHERE transaction_id=? AND event_type='transaction_split'",
+                (transaction_id,),
+            ).fetchone()[0], 1)
 
     def test_recategorization_creates_notification_event(self) -> None:
         transaction_id = self.import_transaction()
@@ -228,7 +251,10 @@ class NotificationEventTests(unittest.TestCase):
             transaction_id=transaction_id,
             category_id=self.groceries_id,
         )
-        created = self.events("transaction_category_assigned", user_id=self.spouse_one_id)[0]
+        self.repository.assign_transaction_category(
+            transaction_id=transaction_id, category_id=self.dining_id,
+        )
+        created = self.events("transaction_recategorized", user_id=self.spouse_one_id)[0]
 
         self.assertEqual(
             self.repository.unread_notification_count(
@@ -245,7 +271,7 @@ class NotificationEventTests(unittest.TestCase):
             ),
             before,
         )
-        reread = self.events("transaction_category_assigned", user_id=self.spouse_one_id)[0]
+        reread = self.events("transaction_recategorized", user_id=self.spouse_one_id)[0]
         self.assertIsNotNone(reread["read_at"])
         self.assertEqual(reread["read_by_user_id"], self.spouse_one_id)
 
@@ -255,16 +281,19 @@ class NotificationEventTests(unittest.TestCase):
             transaction_id=transaction_id,
             category_id=self.groceries_id,
         )
-        spouse_one_event = self.events("transaction_category_assigned", user_id=self.spouse_one_id)[0]
-        spouse_two_event = self.events("transaction_category_assigned", user_id=self.spouse_two_id)[0]
+        self.repository.assign_transaction_category(
+            transaction_id=transaction_id, category_id=self.dining_id,
+        )
+        spouse_one_event = self.events("transaction_recategorized", user_id=self.spouse_one_id)[0]
+        spouse_two_event = self.events("transaction_recategorized", user_id=self.spouse_two_id)[0]
 
         self.assertIsNone(spouse_one_event["read_at"])
         self.assertIsNone(spouse_two_event["read_at"])
 
         self.repository.mark_notification_read(int(spouse_one_event["id"]), user_id=self.spouse_one_id)
 
-        spouse_one_after = self.events("transaction_category_assigned", user_id=self.spouse_one_id)[0]
-        spouse_two_after = self.events("transaction_category_assigned", user_id=self.spouse_two_id)[0]
+        spouse_one_after = self.events("transaction_recategorized", user_id=self.spouse_one_id)[0]
+        spouse_two_after = self.events("transaction_recategorized", user_id=self.spouse_two_id)[0]
         self.assertIsNotNone(spouse_one_after["read_at"])
         self.assertIsNone(spouse_two_after["read_at"])
 
@@ -282,7 +311,10 @@ class NotificationEventTests(unittest.TestCase):
             transaction_id=transaction_id,
             category_id=self.groceries_id,
         )
-        event = self.events("transaction_category_assigned", user_id=self.spouse_one_id)[0]
+        self.repository.assign_transaction_category(
+            transaction_id=transaction_id, category_id=self.dining_id,
+        )
+        event = self.events("transaction_recategorized", user_id=self.spouse_one_id)[0]
 
         self.repository.mark_notification_read(int(event["id"]), user_id=self.spouse_one_id)
 

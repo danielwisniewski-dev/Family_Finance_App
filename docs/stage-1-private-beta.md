@@ -1,5 +1,7 @@
 # Stage 1 private beta
 
+Historical Stage 1 runbook. For the deployed USAA integration and latest reviewed interface changes, see [Stage 2](stage-2-usaa-plaid.md) and [the interface update](interface-tweaks.md). Version numbers and rollout status below describe Stage 1, not the current source release.
+
 Stage 1 prepares secure hosting and Android installation for Daniel and Kara. It does **not** enable live financial imports. USAA linking, sync freshness, account/month rollover, transfer/refund treatment, and reconciliation remain stage 2 launch requirements. Do not treat a fresh stage 1 database as a complete picture of household cash.
 
 ## Deployment shape and cost

@@ -241,12 +241,14 @@ class ApiTests(unittest.TestCase):
             },
         )
 
+        self.patch(f"/transactions/{transaction_id}/ignore", {"ignored": True, "reason": "Transfer"})
+
         notifications = self.get(f"/budget-months/{budget_month['id']}/notifications?user_id={user_id}")
         count = self.get(f"/budget-months/{budget_month['id']}/notifications/unread-count?user_id={user_id}")
         assigned = [
             item
             for item in notifications["notifications"]
-            if item["event_type"] == "transaction_category_assigned"
+            if item["event_type"] == "transaction_ignored"
         ][0]
 
         self.assertGreaterEqual(count["unread_count"], 1)
