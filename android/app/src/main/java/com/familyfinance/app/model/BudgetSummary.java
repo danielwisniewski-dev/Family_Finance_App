@@ -126,7 +126,7 @@ public final class BudgetSummary {
     public List<BudgetCategory> categoriesNeedingAttention() {
         ArrayList<BudgetCategory> result = new ArrayList<>();
         for (BudgetCategory category : categories) {
-            if (!category.archived && category.remainingCents <= 0) {
+            if (!category.archived && category.remainingCents < 0) {
                 result.add(category);
             }
         }

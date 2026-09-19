@@ -3,6 +3,9 @@ package com.familyfinance.app.model;
 import org.json.JSONObject;
 import org.junit.Test;
 
+import java.util.Arrays;
+import java.util.List;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertFalse;
@@ -36,6 +39,35 @@ public final class BudgetSummaryTest {
         assertEquals(1, summary.categories.size());
         assertTrue(summary.categories.get(0).isOverspent());
         assertEquals(1, summary.categoriesNeedingAttention().size());
+    }
+
+    @Test
+    public void attentionIncludesOnlyActiveCategoriesBelowZeroRemaining() {
+        BudgetCategory overspent = new BudgetCategory(1, "Overspent", 100, 101, -1, false);
+        BudgetCategory fullyUsed = new BudgetCategory(2, "Fully used", 100, 100, 0, false);
+        BudgetCategory available = new BudgetCategory(3, "Available", 100, 99, 1, false);
+        BudgetCategory archived = new BudgetCategory(4, "Archived", 100, 101, -1, true);
+        BudgetSummary summary = summaryWithCategories(fullyUsed, archived, available, overspent);
+
+        List<BudgetCategory> attention = summary.categoriesNeedingAttention();
+
+        assertEquals(1, attention.size());
+        assertEquals(overspent.id, attention.get(0).id);
+        assertEquals(4, summary.categories.size()); // Filtering must preserve category history.
+    }
+
+    @Test
+    public void fullyUsedAndPositiveCategoriesLeaveAttentionEmpty() {
+        BudgetSummary summary = summaryWithCategories(
+                new BudgetCategory(1, "Fully used", 100, 100, 0, false),
+                new BudgetCategory(2, "Available", 100, 99, 1, false));
+
+        assertTrue(summary.categoriesNeedingAttention().isEmpty());
+    }
+
+    private BudgetSummary summaryWithCategories(BudgetCategory... categories) {
+        return new BudgetSummary(1, "2026-09", 10000, 2000, 8000, 10,
+                "2026-09-29", Arrays.asList(categories));
     }
 
     private JSONObject budget() throws Exception {

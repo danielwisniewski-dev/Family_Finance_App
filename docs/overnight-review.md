@@ -1,6 +1,6 @@
 # Repository recovery review — 2026-09-11
 
-Historical recovery record. Later deployment status is in [Stage 2](stage-2-usaa-plaid.md); the current interface change set and verification are in [the interface update](interface-tweaks.md). Approval boundaries below describe that earlier review.
+Historical recovery record. Later deployment status is in [Stage 2](stage-2-usaa-plaid.md); the current Android changes and verification are in [the warmer interface update](ui-warmth.md). Approval boundaries below describe that earlier review.
 
 ## Review follow-up — 2026-09-11
 

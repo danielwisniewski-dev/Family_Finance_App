@@ -4,7 +4,9 @@
 
 Current release: [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md), merged in PR #19 and deployed September 12, 2026. Native USAA linking and the user's bank-data comparison passed; Daniel reported the app working well on September 17. Earlier milestone descriptions below remain historical background; the Stage 2 record distinguishes completed checks from acceptance checks not yet individually recorded.
 
-The [September interface update](interface-tweaks.md), Android `0.6.1-interface` / code 4, is implemented and locally verified. Daniel reviewed the preview and approved committing/publishing it to GitHub. It improves the dashboard/streak, transaction review and multi-select, merchant-rule management, notification noise, and automatic bank sync before spending checks. Production deployment and phone updates remain pending; backend financial checks are preserved.
+The [September interface update](interface-tweaks.md), Android `0.6.1-interface` / code 4, was merged in PR #20 and its backend deployed September 17. It improves the dashboard/streak, transaction review and multi-select, merchant-rule management, notification noise, and automatic bank sync before spending checks. Physical phone acceptance remains unobserved; backend financial checks are preserved.
+
+The approved [warmer interface follow-up](ui-warmth.md), Android `0.6.2-warmth` / code 5, adds sage/green/gold styling, distinct typography, illustrations, confirmed-action celebrations, and dashboard refinements. Daniel authorized GitHub publication and signed phone delivery September 19. The versioned APK uses the original signing certificate and existing HTTPS backend; physical phone installation is not yet verified. This follow-up changes no backend financial logic or household data and requires no backend deployment or migration.
 
 Preserve the live household/database, Plaid connection, and Android signing key. Supporting two or three extended-family households was discussed only as a future possibility; no implementation, extra connections, paid-plan upgrade, or broader onboarding is authorized by that discussion.
 
