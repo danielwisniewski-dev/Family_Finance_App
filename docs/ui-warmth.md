@@ -24,7 +24,7 @@ This change adds no backend or financial behavior, database migration, bank conn
 
 Daniel approved documentation updates, GitHub publication, and signed phone delivery on September 19. Source is published through the milestone branch `codex/ui-warmth-celebrations` and a PR against `main`; merging still requires his explicit approval. The signed APK is `work/releases/family-finance-0.6.2-warmth.apk`, version code 5, package `com.familyfinance.app`, using the original signing certificate and the existing HTTPS backend. It is not debuggable; cleartext traffic and app-data backup remain disabled. Signing files and both earlier release APKs were verified unchanged.
 
-APK SHA-256: `C4A1820FD57E3470FFC0B6AA6A80E798F8D7C023A9787EE0D6203827675BDBF0`.
+APK SHA-256: `52AB08A53F5B0B37EF1D2AB653CD26B053F5751B093A5F18E760EA4199797BB0`.
 
 To install on each phone:
 
