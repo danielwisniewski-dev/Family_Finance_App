@@ -13,7 +13,7 @@ import java.util.Locale;
 /** Display formatting only; sync dates come from saved backend data. */
 public final class DashboardText {
     private static final DateTimeFormatter MONTH = DateTimeFormatter.ofPattern("MMM uuuu", Locale.US);
-    private static final DateTimeFormatter SYNC = DateTimeFormatter.ofPattern("MMM d, uuuu, h:mm a z", Locale.US);
+    private static final DateTimeFormatter SYNC = DateTimeFormatter.ofPattern("MMM d, h:mm a", Locale.US);
 
     private DashboardText() { }
 
@@ -28,10 +28,10 @@ public final class DashboardText {
 
     public static String lastBankSync(String transactionsCheckedAt, String balancesCheckedAt, ZoneId zone) {
         Instant transactions = timestamp(transactionsCheckedAt);
-        if (transactions != null) return "Last bank sync: " + september(SYNC.format(transactions.atZone(zone)));
+        if (transactions != null) return "Last sync: " + september(SYNC.format(transactions.atZone(zone)));
         Instant balances = timestamp(balancesCheckedAt);
-        if (balances != null) return "Last balance sync: " + september(SYNC.format(balances.atZone(zone)));
-        return "Bank sync: not available yet";
+        if (balances != null) return "Balance sync: " + september(SYNC.format(balances.atZone(zone)));
+        return "Last sync: unavailable";
     }
 
     private static Instant timestamp(String value) {

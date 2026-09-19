@@ -2,6 +2,8 @@
 
 Android version `0.6.1-interface` (code 4) builds on Stage 2. This update requires no database migration or household reset. Preserve the existing production database, Plaid connection, encryption key, and Android signing key. The existing Stage 2 documentation closeout belongs in this change set.
 
+This release was merged and its backend deployed September 17. The subsequent Android `0.6.2-warmth` / code 5 release is documented in [the warmer interface update](ui-warmth.md).
+
 ## Dashboard
 
 - Check-in streak at the top, with a personal best and 40 original daily encouragement messages.
@@ -31,9 +33,9 @@ Android version `0.6.1-interface` (code 4) builds on Stage 2. This update requir
 
 The notification change requires a backend deployment, and the interface changes require an Android update using the original signing key. Verification uses disposable synthetic data; no live financial changes are part of this milestone. Commit, merge, deployment, and phone installation are separate from local verification.
 
-Daniel reviewed the local preview and authorized documentation updates, commit, push, and a GitHub PR on September 17. Merge and production rollout remain pending. Only the debug APK has been built for this update; no new signed release or phone installation is claimed.
+Daniel approved publication and merged [PR #20](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/20). Its backend was deployed September 17 at commit `32824df9d0e2dcfcf58cb1ca547ba3076acfa5fe`, after encrypted backup and recovery verification. Post-deployment health, database integrity, and preservation checks passed. The signed `work/releases/family-finance-0.6.1-interface.apk` is version code 4, uses the original certificate, and targets the existing HTTPS backend. Physical phone installation has not been independently observed; operational evidence is in ignored `work/interface-tweaks-handoff.md`.
 
-The existing release script still writes `work/releases/family-finance-stage2.apk`. Before an authorized release build, preserve that historical Stage 2 APK; verify the new artifact is `0.6.1-interface` / code 4 and matches the original certificate. Do not regenerate signing files, reinstall by uninstalling, relink the existing bank, or reset/reseed the hosted database. Consult the Stage 2 operational handoff before deployment because its SSH/runtime key-environment caveat remains unresolved.
+The versioned release build preserved the historical Stage 2 APK and signing files. Future updates must retain the original signing certificate and installed app data: do not regenerate signing files, uninstall the phone app, relink the existing bank, or reset/reseed the hosted database. Before any later backend operation, consult the operational handoff: the saved Render encryption key matched the working runtime, while SSH supplied a different key and must not be blindly trusted for recovery or backup helpers.
 
 ## Verification and local preview
 

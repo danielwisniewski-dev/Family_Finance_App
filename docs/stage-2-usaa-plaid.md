@@ -2,9 +2,11 @@
 
 This milestone enables an explicit, private Production Plaid connection for Daniel and Kara. Production is disabled by default in source configuration and explicitly enabled on the existing Render service. Synthetic tests alone do not establish live financial correctness.
 
-## Current handoff — September 17, 2026
+## Current handoff — September 19, 2026
 
-The subsequent [interface update](interface-tweaks.md) is locally verified and approved for GitHub publication, but has not been deployed or installed on the phones. Its Android version is `0.6.1-interface`, code 4. The Stage 2 release/deployment observations below remain historical facts. In the new app, safe-to-spend automatically calls the existing balance and transaction sync APIs before requesting a result; all backend readiness checks still apply.
+The subsequent [interface update](interface-tweaks.md), Android `0.6.1-interface` / code 4, was merged in [PR #20](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/20), and its backend was deployed September 17 with the household database, recovery key, and Plaid connection preserved. Its signed APK uses the original certificate; physical phone installation has not been independently observed. Safe-to-spend automatically calls the existing balance and transaction sync APIs before requesting a result; all backend readiness checks still apply.
+
+The [warmer interface update](ui-warmth.md), Android `0.6.2-warmth` / code 5, adds visual polish, confirmed-action celebrations, and dashboard refinements. Daniel approved GitHub publication and signed phone delivery September 19. It requires no backend deployment, migration, or bank reconnection; see its release notes for delivery and verification. The Stage 2 observations below remain historical facts.
 
 - Daniel merged [PR #19](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/19) and deleted its remote branch. Release commit `16e9de6c2667b90e8970e5dd1798f5f27db80ea7` was deployed September 12; local `main` and GitHub `main` were verified to match on September 17 before these documentation edits.
 - The existing Render service runs schema 3 with the original household and recovery key preserved. Blueprint Sync was verified paused and Auto-Deploy off. Daniel entered credentials directly in Render and saved/deployed the Production/Trial configuration. Do not reapply the disabled Blueprint defaults over the live configuration.
