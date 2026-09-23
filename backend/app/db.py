@@ -13,6 +13,7 @@ from typing import Any, Iterable, Iterator
 
 from .auth import hash_password, hash_session_token, new_session_token, verify_password
 from .migrations import migrate
+from .funds import FundRepositoryMixin, cash_context, fund_rows
 from .dates import household_today
 from .security import RateLimitError, RuntimeSettings, attempt_key
 from .domain import (
@@ -51,9 +52,10 @@ FORBIDDEN_METADATA_TERMS = (
 )
 
 DUMMY_PASSWORD_HASH = hash_password(new_session_token())
+UNCHANGED = object()
 
 
-class BudgetRepository:
+class BudgetRepository(FundRepositoryMixin):
     def __init__(self, db_path: str | Path, settings: RuntimeSettings | None = None):
         self.db_path = Path(db_path)
         self.settings = settings or RuntimeSettings()
@@ -785,6 +787,7 @@ class BudgetRepository:
                     c.planned_cents,
                     c.archived,
                     c.display_order,
+                    c.reserve_fund_id,
                     COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0)
                     - COALESCE((SELECT SUM(r.amount_cents) FROM transaction_refunds r
                         JOIN account_transactions rt ON rt.id=r.transaction_id
@@ -824,14 +827,20 @@ class BudgetRepository:
             ).fetchall()
 
         categories_by_group: dict[int, list[dict[str, Any]]] = {}
+        summary_categories = {category.id: category for category in summary.categories}
         for row in category_rows:
+            if int(row["id"]) not in summary_categories:
+                continue
             category = {
                 "id": int(row["id"]),
                 "budget_group_id": int(row["budget_group_id"]),
                 "name": row["name"],
                 "planned_cents": int(row["planned_cents"]),
                 "spent_cents": int(row["spent_cents"]),
-                "remaining_cents": int(row["planned_cents"]) - int(row["spent_cents"]),
+                "remaining_cents": summary_categories[int(row["id"])].remaining_cents,
+                "reserve_fund_id": row["reserve_fund_id"],
+                "fund_balance_cents": summary_categories[int(row["id"])].fund_balance_cents,
+                "contributed_cents": summary_categories[int(row["id"])].contributed_cents,
                 "archived": bool(row["archived"]),
                 "display_order": int(row["display_order"]),
             }
@@ -868,6 +877,7 @@ class BudgetRepository:
                 "amount_cents": int(row["amount_cents"]),
                 "due_on": row["due_on"],
                 "paid": bool(row["paid"]),
+                "reserve_fund_id": row["reserve_fund_id"],
             }
             for row in bill_rows
         ]
@@ -1606,7 +1616,7 @@ class BudgetRepository:
                 SELECT *
                 FROM account_transactions
                 WHERE cash_account_id = ?
-                ORDER BY occurred_on, id
+                ORDER BY occurred_on DESC, id DESC
                 """,
                 (cash_account_id,),
             ).fetchall()
@@ -1620,7 +1630,7 @@ class BudgetRepository:
                 FROM account_transactions t
                 JOIN cash_accounts a ON a.id = t.cash_account_id
                 WHERE t.id IN (SELECT transaction_id FROM transaction_budget_months WHERE budget_month_id=?)
-                ORDER BY t.occurred_on, t.id
+                ORDER BY t.occurred_on DESC, t.id DESC
                 """,
                 (budget_month_id,),
             ).fetchall()
@@ -1665,7 +1675,7 @@ class BudgetRepository:
                 FROM account_transactions t
                 JOIN cash_accounts a ON a.id = t.cash_account_id
                 WHERE {' AND '.join(clauses)}
-                ORDER BY t.occurred_on, t.id
+                ORDER BY t.occurred_on DESC, t.id DESC
                 """,
                 values,
             ).fetchall()
@@ -1673,7 +1683,14 @@ class BudgetRepository:
         if status == "all":
             return details
         if status == "needs_review":
-            return [detail for detail in details if detail.needs_review]
+            # Keep newest-first order within each group. Suggestions are not
+            # assignments; refunds and active split lines are assigned categories.
+            return sorted(
+                (detail for detail in details if detail.needs_review),
+                key=lambda detail: not (
+                    detail.final_category_id is not None or detail.assignments
+                ),
+            )
         if status == "uncategorized":
             return [
                 detail
@@ -1725,6 +1742,11 @@ class BudgetRepository:
     ) -> None:
         with self.connect() as connection:
             self._require_transaction(connection, transaction_id)
+            context = self._notification_context_for_transaction(connection, transaction_id)
+            if actor_user_id is not None:
+                self._validate_user_for_household(
+                    connection, context["household_id"], actor_user_id
+                )
             connection.execute(
                 """
                 UPDATE account_transactions
@@ -1738,20 +1760,20 @@ class BudgetRepository:
                 transaction_id=transaction_id,
                 event_type="marked_reviewed" if reviewed else "marked_unreviewed",
             )
-            context = self._notification_context_for_transaction(connection, transaction_id)
-            self._insert_notification_event(
-                connection,
-                household_id=context["household_id"],
-                budget_month_id=context["budget_month_id"],
-                event_type="transaction_marked_reviewed" if reviewed else "transaction_marked_unreviewed",
-                actor_user_id=actor_user_id,
-                affected_entity_type="transaction",
-                affected_entity_id=transaction_id,
-                title="Transaction marked reviewed" if reviewed else "Transaction marked unreviewed",
-                message=f"{context['transaction_name']} was marked {'reviewed' if reviewed else 'unreviewed'}.",
-                severity="info",
-                metadata={"transaction_id": transaction_id, "reviewed": reviewed},
-            )
+            if not reviewed:
+                self._insert_notification_event(
+                    connection,
+                    household_id=context["household_id"],
+                    budget_month_id=context["budget_month_id"],
+                    event_type="transaction_marked_unreviewed",
+                    actor_user_id=actor_user_id,
+                    affected_entity_type="transaction",
+                    affected_entity_id=transaction_id,
+                    title="Transaction marked unreviewed",
+                    message=f"{context['transaction_name']} was marked unreviewed.",
+                    severity="info",
+                    metadata={"transaction_id": transaction_id, "reviewed": False},
+                )
 
     def assign_transaction_category(
         self,
@@ -2769,6 +2791,8 @@ class BudgetRepository:
         values.append(category_id)
         with self.connect() as connection:
             before = self._notification_context_for_category(connection, category_id)
+            if archived is False and connection.execute("SELECT 1 FROM reserve_funds f JOIN budget_categories c ON c.reserve_fund_id=f.id WHERE c.id=? AND f.archived=1", (category_id,)).fetchone():
+                raise ValueError("Restore the provision fund before restoring its budget category")
             if budget_group_id is not None:
                 target = self._notification_context_for_budget_group(connection, budget_group_id)
                 if target["budget_month_id"] != before["budget_month_id"]:
@@ -2828,6 +2852,8 @@ class BudgetRepository:
             context = self._notification_context_for_category(connection, category_id)
             if bool(context["archived"]) or bool(context["group_archived"]):
                 raise ValueError("Cannot record spending against an archived category")
+            if connection.execute("SELECT reserve_fund_id FROM budget_categories WHERE id=?", (category_id,)).fetchone()[0] is not None:
+                raise ValueError("Use Set aside for provision funding, or categorize an actual bank transaction for fund spending")
             return insert_and_return_id(
                 connection,
                 """
@@ -2846,18 +2872,23 @@ class BudgetRepository:
         due_on: date,
         paid: bool = False,
         actor_user_id: int | None = None,
+        reserve_fund_id: int | None = None,
     ) -> int:
         name = clean_required_text(name, "name")
         validate_positive_cents(amount_cents, "amount_cents")
         with self.connect() as connection:
             context = self._notification_context_for_budget_month(connection, budget_month_id)
+            if reserve_fund_id is not None:
+                fund = self._require_fund(connection, reserve_fund_id, context["household_id"])
+                if fund["archived"]:
+                    raise ValueError("Cannot link a new bill to an archived provision fund")
             bill_id = insert_and_return_id(
                 connection,
                 """
-                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid, reserve_fund_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (budget_month_id, name, amount_cents, due_on.isoformat(), 1 if paid else 0),
+                (budget_month_id, name, amount_cents, due_on.isoformat(), 1 if paid else 0, reserve_fund_id),
             )
             self._insert_notification_event(
                 connection,
@@ -2883,6 +2914,7 @@ class BudgetRepository:
         due_on: date | None = None,
         paid: bool | None = None,
         actor_user_id: int | None = None,
+        reserve_fund_id=UNCHANGED,
     ) -> None:
         assignments: list[str] = []
         values: list[Any] = []
@@ -2900,11 +2932,18 @@ class BudgetRepository:
         if paid is not None:
             assignments.append("paid = ?")
             values.append(1 if paid else 0)
+        if reserve_fund_id is not UNCHANGED:
+            assignments.append("reserve_fund_id = ?")
+            values.append(reserve_fund_id)
         if not assignments:
             return
         values.append(bill_id)
         with self.connect() as connection:
             before = self._notification_context_for_bill(connection, bill_id)
+            if reserve_fund_id is not UNCHANGED and reserve_fund_id is not None:
+                fund = self._require_fund(connection, reserve_fund_id, before["household_id"])
+                if fund["archived"]:
+                    raise ValueError("Cannot link a bill to an archived provision fund")
             connection.execute(f"UPDATE expected_bills SET {', '.join(assignments)} WHERE id = ?", values)
             self._insert_notification_event(
                 connection,
@@ -3024,7 +3063,10 @@ class BudgetRepository:
             )
 
     def get_summary(self, budget_month_id: int, today: date) -> BudgetSummary:
-        snapshot = self._load_snapshot(budget_month_id)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            snapshot = self._load_snapshot(budget_month_id)
+            funds = cash_context(connection, snapshot["budget_month"]["household_id"], budget_month_id, today)
         return summarize_budget(
             budget_month_id=budget_month_id,
             month=snapshot["budget_month"]["month"],
@@ -3035,6 +3077,9 @@ class BudgetRepository:
             paydays=snapshot["paydays"],
             today=today,
             low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
+            reserved_cash_cents=funds["reserved_cash_cents"],
+            reserve_covered_bills_cents=funds["reserve_covered_bills_cents"],
+            reserve_issues=tuple(funds["issues"]),
         )
 
     def safe_to_spend(
@@ -3054,6 +3099,12 @@ class BudgetRepository:
             guard.execute("BEGIN IMMEDIATE")
             require_bank_ready(self, budget_month_id, today)
             snapshot = self._load_snapshot(budget_month_id)
+            category = next((item for item in snapshot["categories"] if item.id == category_id), None)
+            funds = cash_context(guard, snapshot["budget_month"]["household_id"], budget_month_id, today,
+                                 fund_id=category.reserve_fund_id if category else None,
+                                 purchase_amount_cents=purchase_amount_cents)
+            if funds["issues"]:
+                raise ValueError(funds["issues"][0])
         category = next((item for item in snapshot["categories"] if item.id == category_id), None)
         if category is None:
             raise LookupError(f"Category {category_id} is not part of budget month {budget_month_id}")
@@ -3066,6 +3117,10 @@ class BudgetRepository:
             today=today,
             urgency=urgency,
             low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
+            reserved_cash_cents=funds["reserved_cash_cents"],
+            funded_purchase_cents=funds["funded_purchase_cents"],
+            reserve_covered_bills_cents=funds["reserve_covered_bills_cents"],
+            reserve_covered_bills_after_cents=funds["reserve_covered_bills_after_cents"],
         )
         if result.warning_level in {
             WarningLevel.CAUTION,
@@ -3372,6 +3427,7 @@ class BudgetRepository:
                 SELECT id FROM budget_groups WHERE budget_month_id = ?
             )
                 AND archived = 0
+                AND NOT EXISTS (SELECT 1 FROM reserve_funds f WHERE f.id=budget_categories.reserve_fund_id AND f.archived=1)
             ORDER BY display_order, id
             """,
             (source_budget_month_id,),
@@ -3382,10 +3438,10 @@ class BudgetRepository:
                 continue
             connection.execute(
                 """
-                INSERT INTO budget_categories(budget_group_id, name, planned_cents, archived, display_order)
-                VALUES (?, ?, ?, 0, ?)
+                INSERT INTO budget_categories(budget_group_id, name, planned_cents, archived, display_order, reserve_fund_id)
+                VALUES (?, ?, ?, 0, ?, ?)
                 """,
-                (new_group_id, row["name"], row["planned_cents"], row["display_order"]),
+                (new_group_id, row["name"], row["planned_cents"], row["display_order"], row["reserve_fund_id"]),
             )
 
         bill_rows = connection.execute(
@@ -3395,14 +3451,15 @@ class BudgetRepository:
         for row in bill_rows:
             connection.execute(
                 """
-                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid)
-                VALUES (?, ?, ?, ?, 0)
+                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid, reserve_fund_id)
+                VALUES (?, ?, ?, ?, 0, ?)
                 """,
                 (
                     target_budget_month_id,
                     row["name"],
                     row["amount_cents"],
                     same_day_in_month(row["due_on"], target_month),
+                    row["reserve_fund_id"],
                 ),
             )
 
@@ -3504,6 +3561,7 @@ class BudgetRepository:
             JOIN transaction_budget_months m ON m.budget_month_id = g.budget_month_id
             JOIN account_transactions t ON t.id = m.transaction_id
             WHERE t.id = ? AND c.id = ? AND c.archived = 0 AND g.archived = 0
+                AND NOT EXISTS (SELECT 1 FROM reserve_funds f WHERE f.id=c.reserve_fund_id AND f.archived=1)
             """,
             (transaction_id, category_id),
         ).fetchone()
@@ -3523,6 +3581,7 @@ class BudgetRepository:
             JOIN budget_groups g ON g.id = c.budget_group_id
             JOIN budget_months b ON b.id = g.budget_month_id
             WHERE b.household_id = ? AND c.id = ? AND c.archived = 0 AND g.archived = 0
+                AND NOT EXISTS (SELECT 1 FROM reserve_funds f WHERE f.id=c.reserve_fund_id AND f.archived=1)
             """,
             (household_id, category_id),
         ).fetchone()
@@ -3630,6 +3689,7 @@ class BudgetRepository:
                 AND r.active = 1
                 AND c.archived = 0
                 AND g.archived = 0
+                AND NOT EXISTS (SELECT 1 FROM reserve_funds f WHERE f.id=c.reserve_fund_id AND f.archived=1)
             ORDER BY r.priority, r.id
             """,
             (transaction["id"],),
@@ -3757,6 +3817,7 @@ class BudgetRepository:
                     c.name,
                     c.planned_cents,
                     c.archived,
+                    c.reserve_fund_id,
                     COALESCE(ms.manual_spent_cents, 0) + COALESCE(ts.transaction_spent_cents, 0)
                     - COALESCE((SELECT SUM(r.amount_cents) FROM transaction_refunds r
                         JOIN account_transactions rt ON rt.id=r.transaction_id
@@ -3800,6 +3861,7 @@ class BudgetRepository:
                 "SELECT payday_date FROM paydays WHERE household_id = ? ORDER BY payday_date",
                 (budget_month["household_id"],),
             ).fetchall()
+            funds_by_id = {f["id"]: f for f in fund_rows(connection, budget_month["household_id"], budget_month_id)}
 
         if account_rows:
             included_account_balance_cents = sum(
@@ -3828,7 +3890,10 @@ class BudgetRepository:
                     name=row["name"],
                     planned_cents=row["planned_cents"],
                     spent_cents=row["spent_cents"],
-                    archived=bool(row["archived"]),
+                    archived=bool(row["archived"]) or bool(row["reserve_fund_id"] and funds_by_id[row["reserve_fund_id"]]["archived"]),
+                    reserve_fund_id=row["reserve_fund_id"],
+                    fund_balance_cents=funds_by_id[row["reserve_fund_id"]]["balance_cents"] if row["reserve_fund_id"] else None,
+                    contributed_cents=funds_by_id[row["reserve_fund_id"]]["contributed_this_month_cents"] if row["reserve_fund_id"] else 0,
                 )
                 for row in category_rows
             ],
@@ -3838,6 +3903,7 @@ class BudgetRepository:
                     amount_cents=row["amount_cents"],
                     due_on=date.fromisoformat(row["due_on"]),
                     paid=bool(row["paid"]),
+                    reserve_fund_id=row["reserve_fund_id"],
                 )
                 for row in bill_rows
             ],

@@ -10,6 +10,9 @@ import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionDetail;
+import com.familyfinance.app.model.ProvisionFunds;
+import com.familyfinance.app.model.BankRefreshStatus;
+import com.familyfinance.app.state.PendingFundAction;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -19,6 +22,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.function.Consumer;
 
 public final class FamilyFinanceApi {
     private final JsonHttpClient client;
@@ -117,6 +121,22 @@ public final class FamilyFinanceApi {
 
     public BudgetDetail getBudgetDetail(int budgetMonthId) throws ApiException {
         return BudgetDetail.fromJson(client.get("/budget-months/" + budgetMonthId + "/budget-detail"));
+    }
+
+    public ProvisionFunds getProvisionFunds(int budgetMonthId) throws ApiException {
+        return ProvisionFunds.fromJson(client.get("/budget-months/" + budgetMonthId + "/funds"));
+    }
+
+    public void createProvisionFund(int budgetMonthId, JSONObject payload) throws ApiException {
+        client.post("/budget-months/" + budgetMonthId + "/funds", payload);
+    }
+
+    public void updateProvisionFund(int fundId, JSONObject payload) throws ApiException {
+        client.patch("/funds/" + fundId, payload);
+    }
+
+    public void applyFundAction(PendingFundAction action) throws Exception {
+        client.post("/funds/" + action.fundId + (action.transfer ? "/transfer" : "/entries"), action.payload());
     }
 
     public List<BudgetMonth> getBudgetMonths() throws ApiException {
@@ -337,6 +357,10 @@ public final class FamilyFinanceApi {
     }
 
     public int createExpectedBill(int budgetMonthId, String name, int amountCents, String dueOn, boolean paid) throws ApiException {
+        return createExpectedBill(budgetMonthId, name, amountCents, dueOn, paid, null);
+    }
+
+    public int createExpectedBill(int budgetMonthId, String name, int amountCents, String dueOn, boolean paid, Integer reserveFundId) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
             payload.put("budget_month_id", budgetMonthId);
@@ -344,6 +368,7 @@ public final class FamilyFinanceApi {
             payload.put("amount_cents", amountCents);
             payload.put("due_on", dueOn);
             payload.put("paid", paid);
+            if (reserveFundId != null) payload.put("reserve_fund_id", reserveFundId);
             return client.post("/expected-bills", payload).optInt("id");
         } catch (ApiException exception) {
             throw exception;
@@ -353,18 +378,104 @@ public final class FamilyFinanceApi {
     }
 
     public void updateExpectedBill(int billId, String name, int amountCents, String dueOn, boolean paid) throws ApiException {
+        updateExpectedBill(billId, name, amountCents, dueOn, paid, null, false);
+    }
+
+    public void updateExpectedBill(int billId, String name, int amountCents, String dueOn, boolean paid,
+            Integer reserveFundId, boolean updateFundLink) throws ApiException {
         try {
-            JSONObject payload = new JSONObject();
-            payload.put("name", name);
-            payload.put("amount_cents", amountCents);
-            payload.put("due_on", dueOn);
-            payload.put("paid", paid);
+            JSONObject payload = expectedBillUpdatePayload(name, amountCents, dueOn, paid, reserveFundId, updateFundLink);
             client.patch("/expected-bills/" + billId, payload);
         } catch (ApiException exception) {
             throw exception;
         } catch (Exception exception) {
             throw new ApiException("Could not update expected bill", exception);
         }
+    }
+
+    /** Normal sync imports Plaid's available data; it never requests a bank refresh. */
+    public JSONObject syncAvailableBankData(int budgetMonthId) throws ApiException {
+        JSONObject status = getBankStatus(budgetMonthId);
+        for (int itemId : bankConnectionIds(status)) {
+            syncPlaid(itemId, "balance");
+            syncPlaid(itemId, "transaction");
+        }
+        return getBankStatus(budgetMonthId);
+    }
+
+    private static Set<Integer> bankConnectionIds(JSONObject status) throws ApiException {
+        if (!(status.opt("enabled") instanceof Boolean) || !status.optBoolean("enabled")) {
+            throw new ApiException("Bank sync is unavailable on this backend.");
+        }
+        Set<Integer> itemIds = new LinkedHashSet<>();
+        if (status.optInt("connection_id") > 0) itemIds.add(status.optInt("connection_id"));
+        JSONArray accounts = status.optJSONArray("accounts");
+        if (accounts != null) for (int i = 0; i < accounts.length(); i++) {
+            JSONObject account = accounts.optJSONObject(i);
+            if (account != null && account.optInt("plaid_item_id") > 0) itemIds.add(account.optInt("plaid_item_id"));
+        }
+        if (itemIds.isEmpty()) throw new ApiException("Connect USAA in Accounts / Settings before syncing bank data.");
+        return itemIds;
+    }
+
+    public BankRefreshStatus requestFreshBankData(int budgetMonthId, Consumer<BankRefreshStatus> progress) throws ApiException {
+        return requestFreshBankData(budgetMonthId, progress, Thread::sleep);
+    }
+
+    @FunctionalInterface
+    interface RefreshPause { void waitFor(long milliseconds) throws InterruptedException; }
+
+    BankRefreshStatus requestFreshBankData(int budgetMonthId, Consumer<BankRefreshStatus> progress,
+            RefreshPause pause) throws ApiException {
+        try {
+            Set<Integer> itemIds = bankConnectionIds(getBankStatus(budgetMonthId));
+            BankRefreshStatus status = null;
+            for (int itemId : itemIds) {
+                // This POST occurs once per explicit action. A timeout must never replay it.
+                JSONObject response = client.post("/plaid/refresh", new JSONObject().put("plaid_item_id", itemId));
+                if (!(response.opt("success") instanceof Boolean)) throw new ApiException("The bank-refresh request could not be confirmed.");
+                BankRefreshStatus itemStatus = BankRefreshStatus.fromResponse(response);
+                status = BankRefreshStatus.combine(status, itemStatus);
+                if (itemStatus.isFailed()) return itemStatus;
+                if (!response.optBoolean("success") && !"unknown".equals(itemStatus.state)) {
+                    throw new ApiException(itemStatus.message.isEmpty() ? "USAA could not be asked for fresh data." : itemStatus.message);
+                }
+            }
+            if (progress != null) progress.accept(status);
+            // Balance fetches are separate live bank requests. Only refresh them once;
+            // subsequent checks import the available transaction stream.
+            for (int itemId : itemIds) syncPlaid(itemId, "balance");
+            long[] delays = {0, 5_000, 10_000, 20_000};
+            for (long delay : delays) {
+                if (delay > 0) pause.waitFor(delay);
+                status = null;
+                boolean importedChanges = false;
+                for (int itemId : itemIds) {
+                    JSONObject imported = syncPlaid(itemId, "transaction");
+                    status = BankRefreshStatus.combine(status, BankRefreshStatus.fromResponse(imported));
+                    importedChanges |= imported.optLong("inserted_transactions") > 0
+                            || imported.optLong("updated_transactions") > 0 || imported.optLong("removed_transactions") > 0;
+                }
+                if (progress != null) progress.accept(status);
+                if (status.isFailed() || (status.isChecked() && importedChanges)) return status;
+            }
+            return status;
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new ApiException("The import check stopped. Use Dashboard Sync to check available data; do not repeat the fresh request yet.", exception);
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("The fresh-data check could not finish. Use Dashboard Sync to check available data.", exception);
+        }
+    }
+
+    static JSONObject expectedBillUpdatePayload(String name, int amountCents, String dueOn, boolean paid,
+            Integer reserveFundId, boolean updateFundLink) throws org.json.JSONException {
+        JSONObject payload = new JSONObject().put("name", name).put("amount_cents", amountCents)
+                .put("due_on", dueOn).put("paid", paid);
+        if (updateFundLink) payload.put("reserve_fund_id", reserveFundId == null ? JSONObject.NULL : reserveFundId);
+        return payload;
     }
 
     public void deleteExpectedBill(int billId) throws ApiException {

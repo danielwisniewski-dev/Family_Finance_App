@@ -47,7 +47,7 @@ public final class TransactionLine {
                 JsonMoney.cents(json, "amount_cents"),
                 json.optString("occurred_on", ""),
                 json.optString("name", "Transaction"),
-                json.optString("merchant_name", ""),
+                json.isNull("merchant_name") ? "" : json.optString("merchant_name", ""),
                 json.optBoolean("pending"),
                 json.optString("category_hint", ""),
                 json.optBoolean("reviewed"),

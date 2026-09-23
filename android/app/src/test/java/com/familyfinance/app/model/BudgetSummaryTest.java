@@ -102,4 +102,26 @@ public final class BudgetSummaryTest {
         assertEquals(10000, summary.includedAccountBalanceCents);
         assertEquals(5000, summary.remainingToAssignCents);
     }
+
+    @Test
+    public void reservesAreOptionalOnOlderBackendAndNeverSubtractedOnThePhone() throws Exception {
+        assertNull(BudgetSummary.fromJson(budget()).reservedCashCents);
+        JSONObject json = budget().put("reserved_cash_cents", 12000).put("cash_after_bills_cents", -4000)
+                .put("reserve_issues", new org.json.JSONArray().put("Backing account needs attention"));
+        BudgetSummary summary = BudgetSummary.fromJson(json);
+        assertEquals(Integer.valueOf(12000), summary.reservedCashCents);
+        assertEquals(Integer.valueOf(-4000), summary.cashAfterBillsCents);
+        assertEquals(1, summary.reserveIssues.size());
+    }
+
+    @Test
+    public void linkedFundCategoryKeepsServerCarryoverInsteadOfMonthlyRemainder() throws Exception {
+        JSONObject category = new JSONObject().put("id", 1).put("name", "Fund")
+                .put("planned_cents", 10000).put("spent_cents", 20000).put("remaining_cents", 50000)
+                .put("reserve_fund_id", 7);
+        BudgetCategory parsed = BudgetCategory.fromJson(category);
+        assertEquals(Integer.valueOf(7), parsed.reserveFundId);
+        assertEquals(50000, parsed.remainingCents);
+        assertFalse(parsed.isOverspent());
+    }
 }

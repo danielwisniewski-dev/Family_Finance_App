@@ -10,6 +10,8 @@ The approved [warmer interface follow-up](ui-warmth.md), Android `0.6.2-warmth` 
 
 Preserve the live household/database, Plaid connection, and Android signing key. Supporting two or three extended-family households was discussed only as a future possibility; no implementation, extra connections, paid-plan upgrade, or broader onboarding is authorized by that discussion.
 
+The approved [provision funds milestone](provision-funds.md) adds persistent reserves for irregular expenses, explicit funding, itemized plans, and cash protection. The same release includes the [bank sync controls](bank-sync-controls.md): Dashboard Sync, an explicit fresh-bank-data request in Settings, and a distinct authorization reconnect action, plus transaction ordering and quiet review confirmation. Daniel authorized commit and deployment of the combined update September 23; deployment and household setup are pending.
+
 Build a private household finance accountability app for Daniel and Kara.
 
 The app should help the household make better spending decisions before money disappears by combining:

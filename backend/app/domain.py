@@ -36,9 +36,14 @@ class CategoryLine:
     planned_cents: int
     spent_cents: int
     archived: bool = False
+    reserve_fund_id: int | None = None
+    fund_balance_cents: int | None = None
+    contributed_cents: int = 0
 
     @property
     def remaining_cents(self) -> int:
+        if self.reserve_fund_id is not None:
+            return self.fund_balance_cents or 0
         return self.planned_cents - self.spent_cents
 
 
@@ -48,6 +53,7 @@ class ExpectedBill:
     amount_cents: int
     due_on: date
     paid: bool = False
+    reserve_fund_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +205,9 @@ class BudgetSummary:
     categories: tuple[CategoryLine, ...]
     as_of: date | None = None
     low_cushion: bool | None = None
+    reserved_cash_cents: int = 0
+    reserve_covered_bills_cents: int = 0
+    reserve_issues: tuple[str, ...] = ()
 
     @property
     def forecast_available(self) -> bool:
@@ -224,6 +233,9 @@ class SafeToSpendResult:
     budget_line_fits: bool
     required_phrase: str
     facts: tuple[str, ...]
+    reserved_cash_cents: int = 0
+    funded_purchase_cents: int = 0
+    reserve_covered_bills_cents: int = 0
 
 
 def available_income_cents(income_lines: Iterable[IncomeLine]) -> int:
@@ -249,6 +261,9 @@ def summarize_budget(
     paydays: Iterable[date],
     today: date,
     low_cushion_daily_cents: int = 5_000,
+    reserved_cash_cents: int = 0,
+    reserve_covered_bills_cents: int = 0,
+    reserve_issues: tuple[str, ...] = (),
 ) -> BudgetSummary:
     category_tuple = tuple(category for category in categories if not category.archived)
     planned_cents = sum(category.planned_cents for category in category_tuple)
@@ -259,7 +274,7 @@ def summarize_budget(
         sum_bills_before_payday(expected_bills, today, next_payday) if next_payday is not None else None
     )
     cash_after_bills = (
-        included_account_balance_cents - bills_before_payday if bills_before_payday is not None else None
+        included_account_balance_cents - reserved_cash_cents - bills_before_payday + reserve_covered_bills_cents if bills_before_payday is not None else None
     )
     return BudgetSummary(
         budget_month_id=budget_month_id,
@@ -273,6 +288,9 @@ def summarize_budget(
         bills_before_payday_cents=bills_before_payday,
         cash_after_bills_cents=cash_after_bills,
         categories=category_tuple,
+        reserved_cash_cents=reserved_cash_cents,
+        reserve_covered_bills_cents=reserve_covered_bills_cents,
+        reserve_issues=reserve_issues,
         as_of=today,
         low_cushion=(
             cash_after_bills // max(days_until_payday, 1) < low_cushion_daily_cents
@@ -291,6 +309,10 @@ def calculate_safe_to_spend(
     today: date,
     urgency: Urgency = "planned_want",
     low_cushion_daily_cents: int = 5_000,
+    reserved_cash_cents: int = 0,
+    funded_purchase_cents: int = 0,
+    reserve_covered_bills_cents: int = 0,
+    reserve_covered_bills_after_cents: int = 0,
 ) -> SafeToSpendResult:
     if purchase_amount_cents <= 0:
         raise ValueError("purchase_amount_cents must be positive")
@@ -300,8 +322,9 @@ def calculate_safe_to_spend(
     next_payday = find_next_payday(paydays, today)
     days_until_payday = max((next_payday - today).days, 0)
     bills_before_payday = sum_bills_before_payday(expected_bills, today, next_payday)
-    cash_after_bills_before_purchase = included_account_balance_cents - bills_before_payday
-    cash_after_purchase_and_bills = cash_after_bills_before_purchase - purchase_amount_cents
+    cash_after_bills_before_purchase = included_account_balance_cents - reserved_cash_cents - bills_before_payday + reserve_covered_bills_cents
+    cash_after_purchase_and_bills = (included_account_balance_cents - reserved_cash_cents + funded_purchase_cents
+                                     - bills_before_payday + reserve_covered_bills_after_cents - purchase_amount_cents)
     divisor_days = max(days_until_payday, 1)
     daily_cash_cushion = cash_after_purchase_and_bills // divisor_days
 
@@ -349,6 +372,9 @@ def calculate_safe_to_spend(
         budget_line_fits=budget_line_fits,
         required_phrase=phrase,
         facts=facts,
+        reserved_cash_cents=reserved_cash_cents,
+        funded_purchase_cents=funded_purchase_cents,
+        reserve_covered_bills_cents=reserve_covered_bills_cents,
     )
 
 
