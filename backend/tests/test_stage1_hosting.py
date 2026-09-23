@@ -146,6 +146,12 @@ class Stage1HostingTests(unittest.TestCase):
             self.repo.initialize()
 
     def test_versioned_upgrade_preserves_money_and_invalidates_legacy_sessions(self):
+        # Build the old fixture without provision tables; deleting version history
+        # from today's complete schema does not represent an unversioned database.
+        self.repo = BudgetRepository(self.directory / "unversioned.sqlite", self.settings)
+        with patch.object(migrations, "MIGRATIONS", migrations.MIGRATIONS[:3]):
+            self.repo.initialize()
+        self.app = Application(self.repo)
         auth = self.initialize()
         month = self.repo.create_budget_month(household_id=auth["household"]["id"], month="2026-09", included_account_balance_cents=123456)
         with self.repo.connect() as connection:
@@ -178,7 +184,8 @@ class Stage1HostingTests(unittest.TestCase):
     def test_offline_upgrade_encrypts_legacy_tokens_without_changing_original(self):
         source = self.directory / "legacy.sqlite"
         legacy = BudgetRepository(source)
-        legacy.initialize()
+        with patch.object(migrations, "MIGRATIONS", migrations.MIGRATIONS[:3]):
+            legacy.initialize()
         legacy.create_household("Synthetic old household")
         legacy.store_plaid_access_token("synthetic-old-ref", "synthetic-old-private-token")
         with legacy.connect() as connection:

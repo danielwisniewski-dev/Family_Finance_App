@@ -81,6 +81,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/health":
                 self.send_json({"ok": True})
                 return
+            if resource_path(parsed.path, "budget-months", "funds"):
+                auth = self.require_auth()
+                month_id = int(parsed.path.split("/")[2])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                self.send_json(self.repository.get_funds(month_id))
+                return
             if parsed.path == "/setup/status":
                 status = self.repository.setup_status(self.optional_auth())
                 status["setup_code_required"] = self.repository.settings.hosted
@@ -225,6 +231,52 @@ class ApiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = self.read_json()
+            if re.fullmatch(r"/budget-months/\d+/funds/setup", parsed.path):
+                auth = self.require_auth()
+                month_id = int(parsed.path.split("/")[2])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                account_id = require_int(payload, "backing_account_id")
+                self.repository.require_account_access(account_id, auth["household_id"])
+                replace_id = optional_int(payload, "replace_category_id")
+                if replace_id is not None:
+                    self.repository.require_category_access(replace_id, auth["household_id"])
+                raw_funds = payload.get("funds")
+                if not isinstance(raw_funds, list) or not 1 <= len(raw_funds) <= 100:
+                    raise ValueError("Provide between 1 and 100 funds")
+                specs = [fund_spec_fields(spec) for spec in raw_funds]
+                self.send_json(self.repository.setup_funds(
+                    budget_month_id=month_id, backing_account_id=account_id,
+                    replace_category_id=replace_id, funds=specs, actor_user_id=auth["user_id"],
+                ), status=HTTPStatus.CREATED)
+                return
+            if resource_path(parsed.path, "budget-months", "funds"):
+                auth = self.require_auth()
+                month_id = int(parsed.path.split("/")[2])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                account_id = require_int(payload, "backing_account_id")
+                self.repository.require_account_access(account_id, auth["household_id"])
+                self.send_json(self.repository.create_fund(
+                    budget_month_id=month_id, backing_account_id=account_id,
+                    actor_user_id=auth["user_id"], **fund_spec_fields(payload),
+                ), status=HTTPStatus.CREATED)
+                return
+            if resource_path(parsed.path, "funds", "entries") or resource_path(parsed.path, "funds", "transfer"):
+                auth = self.require_auth()
+                fund_id = int(parsed.path.split("/")[2])
+                month_id = require_int(payload, "budget_month_id")
+                self.repository.require_fund_access(fund_id, auth["household_id"])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                fields = dict(budget_month_id=month_id, amount_cents=require_int(payload, "amount_cents"),
+                    occurred_on=parse_date(payload["occurred_on"]), idempotency_key=payload.get("idempotency_key"),
+                    note=payload.get("note", ""), actor_user_id=auth["user_id"])
+                if parsed.path.endswith("/transfer"):
+                    target_id = require_int(payload, "target_fund_id")
+                    self.repository.require_fund_access(target_id, auth["household_id"])
+                    result = self.repository.transfer_funds(source_fund_id=fund_id, target_fund_id=target_id, **fields)
+                else:
+                    result = self.repository.add_fund_entry(fund_id=fund_id, kind=payload.get("kind"), **fields)
+                self.send_json(result)
+                return
             if resource_path(parsed.path, "transactions", "refund"):
                 auth = self.require_auth()
                 transaction_id = int(parsed.path.split("/")[2])
@@ -333,6 +385,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/expected-bills":
                 auth = self.require_auth()
                 self.repository.require_budget_month_access(require_int(payload, "budget_month_id"), auth["household_id"])
+                bill_fund_id = optional_int(payload, "reserve_fund_id")
+                if bill_fund_id is not None:
+                    self.repository.require_fund_access(bill_fund_id, auth["household_id"])
                 bill_id = self.repository.add_expected_bill(
                     budget_month_id=require_int(payload, "budget_month_id"),
                     name=payload["name"],
@@ -340,6 +395,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     due_on=parse_date(payload["due_on"]),
                     paid=boolean_field(payload, "paid", False),
                     actor_user_id=auth["user_id"],
+                    **({"reserve_fund_id": bill_fund_id} if "reserve_fund_id" in payload else {}),
                 )
                 self.send_json({"id": bill_id}, status=HTTPStatus.CREATED)
                 return
@@ -471,6 +527,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json(plaid_connection_result_to_dict(result), status=HTTPStatus.CREATED)
                 return
+            if parsed.path == "/plaid/refresh":
+                auth = self.require_auth()
+                plaid_item_id = require_int(payload, "plaid_item_id")
+                self.repository.require_plaid_item_access(plaid_item_id, auth["household_id"])
+                request_refresh = getattr(self.plaid_service, "request_fresh_data", None)
+                if not self.repository.settings.plaid_enabled or request_refresh is None:
+                    raise PlaidIntegrationError("Fresh bank requests are not enabled on this backend.")
+                self.send_json(request_refresh(plaid_item_id))
+                return
             if parsed.path == "/plaid/sync":
                 auth = self.require_auth()
                 sync_type = payload["sync_type"]
@@ -482,7 +547,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     outcome = self.plaid_service.sync_transactions(plaid_item_id)
                 else:
                     raise ValueError("sync_type must be 'balance' or 'transaction'")
-                self.send_json(plaid_sync_outcome_to_dict(outcome))
+                result = plaid_sync_outcome_to_dict(outcome)
+                from .bank_refresh import refresh_status
+                result["refresh"] = refresh_status(self.repository, plaid_item_id)
+                self.send_json(result)
                 return
             if parsed.path == "/merchant-category-rules":
                 auth = self.require_auth()
@@ -513,6 +581,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = self.read_json()
+            if resource_path(parsed.path, "funds"):
+                auth = self.require_auth()
+                fund_id = int(parsed.path.split("/")[2])
+                month_id = require_int(payload, "budget_month_id")
+                self.repository.require_fund_access(fund_id, auth["household_id"])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                fields = {key: payload[key] for key in ("name", "timing_note", "breakdown") if key in payload}
+                if "archived" in payload:
+                    fields["archived"] = boolean_field(payload, "archived", False)
+                for key in ("monthly_plan_cents", "annual_target_cents"):
+                    if key in payload:
+                        fields[key] = require_int(payload, key)
+                self.send_json(self.repository.update_fund(fund_id=fund_id, budget_month_id=month_id,
+                    actor_user_id=auth["user_id"], **fields))
+                return
             if parsed.path == "/settings/display-name":
                 auth = self.require_auth()
                 user = self.repository.update_user_display_name(
@@ -599,6 +682,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 auth = self.require_auth()
                 bill_id = int(parsed.path.split("/")[2])
                 self.repository.require_bill_access(bill_id, auth["household_id"])
+                bill_fund_id = optional_int(payload, "reserve_fund_id")
+                if bill_fund_id is not None:
+                    self.repository.require_fund_access(bill_fund_id, auth["household_id"])
                 self.repository.update_expected_bill(
                     bill_id=bill_id,
                     name=payload.get("name"),
@@ -606,6 +692,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     due_on=parse_date(payload["due_on"]) if payload.get("due_on") is not None else None,
                     paid=boolean_field(payload, "paid"),
                     actor_user_id=auth["user_id"],
+                    **({"reserve_fund_id": bill_fund_id} if "reserve_fund_id" in payload else {}),
                 )
                 self.send_json({"ok": True})
                 return
@@ -938,6 +1025,16 @@ def sanitize_api_error(message: str) -> str:
     if any(term in lowered for term in forbidden_terms):
         return "Request failed; sensitive details were redacted."
     return message
+
+
+def fund_spec_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Each fund must be an object")
+    return {"name": payload.get("name"),
+            "monthly_plan_cents": require_int(payload, "monthly_plan_cents"),
+            "annual_target_cents": require_int(payload, "annual_target_cents", default=0),
+            "timing_note": payload.get("timing_note", ""),
+            "breakdown": payload.get("breakdown", [])}
 
 
 def parse_date(value: str) -> date:

@@ -3,6 +3,7 @@ import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
+from .bank_refresh import status_for_row
 
 
 def recent(value, seconds):
@@ -24,9 +25,12 @@ def bank_status(repository, month_id):
         month = conn.execute("SELECT month FROM budget_months WHERE id=?", (month_id,)).fetchone()[0]
         rows = conn.execute("SELECT s.* FROM bank_sync_state s JOIN plaid_items i ON i.id=s.plaid_item_id WHERE i.household_id=?", (household,)).fetchall()
         txns = conn.execute("SELECT t.id,t.amount_cents,t.pending,t.ignored,t.reviewed,t.updated_at,EXISTS(SELECT 1 FROM transaction_category_assignments a WHERE a.transaction_id=t.id AND a.active=1) AS assigned FROM account_transactions t JOIN transaction_budget_months m ON m.transaction_id=t.id WHERE m.budget_month_id=? ORDER BY t.id", (month_id,)).fetchall()
-        plan = [tuple(r) for r in conn.execute("SELECT c.id,c.planned_cents,c.archived,g.archived FROM budget_categories c JOIN budget_groups g ON g.id=c.budget_group_id WHERE g.budget_month_id=? ORDER BY c.id", (month_id,))]
-        bills = [tuple(r) for r in conn.execute("SELECT e.id,e.amount_cents,e.due_on,e.paid FROM expected_bills e JOIN budget_months b ON b.id=e.budget_month_id WHERE b.household_id=? ORDER BY e.id", (household,))]
+        plan = [tuple(r) for r in conn.execute("SELECT c.id,c.planned_cents,c.archived,g.archived,c.reserve_fund_id FROM budget_categories c JOIN budget_groups g ON g.id=c.budget_group_id WHERE g.budget_month_id=? ORDER BY c.id", (month_id,))]
+        bills = [tuple(r) for r in conn.execute("SELECT e.id,e.amount_cents,e.due_on,e.paid,e.reserve_fund_id FROM expected_bills e JOIN budget_months b ON b.id=e.budget_month_id WHERE b.household_id=? ORDER BY e.id", (household,))]
         allocations = [tuple(r) for r in conn.execute("SELECT a.id,a.budget_category_id,a.amount_cents,a.active FROM transaction_category_assignments a JOIN transaction_budget_months m ON m.transaction_id=a.transaction_id WHERE m.budget_month_id=? ORDER BY a.id", (month_id,))]
+        from .funds import fund_rows
+        reserves = [(f["id"], f["backing_account_id"], f["balance_cents"], f["archived"], f["contributed_this_month_cents"])
+                    for f in fund_rows(conn, household, month_id)]
     accounts = repository.list_accounts(month_id)
     enabled = repository.settings.plaid_enabled
     issues = []
@@ -53,7 +57,8 @@ def bank_status(repository, month_id):
     # the reconciliation screen. It is not a token and conveys no account access.
     revision = hashlib.sha256(json.dumps({"month": month,
         "accounts": [(a.id, a.balance_cents, a.available_balance_cents, a.current_balance_cents, a.included_in_cash_reality) for a in accounts],
-        "transactions": [tuple(t) for t in txns], "plan": plan, "bills": bills, "allocations": allocations}, sort_keys=True).encode()).hexdigest()
+        "transactions": [tuple(t) for t in txns], "plan": plan, "bills": bills, "allocations": allocations,
+        "reserves": reserves}, sort_keys=True).encode()).hexdigest()
     reconciled = bool(rows) and all(r["reconciled_month"] == month and r["reconciled_at"] for r in rows)
     return {"enabled": enabled, "mode": "production" if enabled else "disabled" if repository.settings.hosted else "sandbox",
             "accounts": [asdict(account) for account in accounts],
@@ -65,6 +70,7 @@ def bank_status(repository, month_id):
             "transactions_checked_at": rows[0]["transactions_checked_at"] if rows else None,
             "transactions_updated_at": rows[0]["transactions_updated_at"] if rows else None,
             "history_complete": bool(rows and rows[0]["history_complete"]),
+            "refresh": status_for_row(rows[0] if rows else None),
             "reconciled_at": rows[0]["reconciled_at"] if rows else None}
 
 
