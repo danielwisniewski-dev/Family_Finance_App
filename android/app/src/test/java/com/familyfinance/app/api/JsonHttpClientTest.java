@@ -4,6 +4,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.json.JSONObject;
+import com.familyfinance.app.state.PendingFundAction;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -35,6 +36,7 @@ public final class JsonHttpClientTest {
     private final Map<String, String> requestHeaders = new ConcurrentHashMap<>();
     private final AtomicReference<Exception> serverError = new AtomicReference<>();
     private final List<String> requestOrder = Collections.synchronizedList(new ArrayList<>());
+    private final List<String> fundBodies = Collections.synchronizedList(new ArrayList<>());
 
     @Before
     public void startLocalServer() throws Exception {
@@ -72,6 +74,7 @@ public final class JsonHttpClientTest {
                         key += ":" + new JSONObject(new String(payload)).getInt("plaid_item_id");
                     }
                     requestOrder.add(key);
+                    if (path.startsWith("/funds/")) fundBodies.add(new String(payload));
                     requestHeaders.put(path, headers.toString());
                     Response response = responses.getOrDefault(key, responses.get(path));
                     Queue<Response> sequence = responseSequences.get(key);
@@ -108,6 +111,47 @@ public final class JsonHttpClientTest {
     }
 
     @Test
+    public void demoUsesSeparateRoutesAndTokenWhileRealClientRemainsUnchanged() throws Exception {
+        respond("/demo/start", 201, "{\"demo\":true,\"token\":\"synthetic-demo\"}");
+        respond("/demo/budget-months", 200, "{\"budget_months\":[]}");
+        respond("/demo/funds/4/entries", 201, "{}");
+        respond("/demo/exit", 200, "{}");
+        respond("/budget-months", 200, "{\"budget_months\":[]}");
+        FamilyFinanceApi real = new FamilyFinanceApi(baseUrl, "synthetic-real");
+        JSONObject started = real.startDemo();
+        FamilyFinanceApi demo = FamilyFinanceApi.demo(baseUrl, started.getString("token"));
+        demo.getBudgetMonths();
+        demo.applyFundAction(contribution());
+        demo.exitDemo();
+        real.getBudgetMonths();
+        assertEquals(Arrays.asList("/demo/start", "/demo/budget-months", "/demo/funds/4/entries", "/demo/exit", "/budget-months"), requestOrder);
+        assertTrue(requestHeaders.get("/demo/start").contains("Bearer synthetic-real"));
+        assertTrue(requestHeaders.get("/demo/funds/4/entries").contains("Bearer synthetic-demo"));
+        assertTrue(requestHeaders.get("/demo/exit").contains("Bearer synthetic-demo"));
+        assertTrue(requestHeaders.get("/budget-months").contains("Bearer synthetic-real"));
+    }
+
+    @Test
+    public void expiredDemoDoesNotFallBackToProductionRoute() throws Exception {
+        respond("/demo/budget-months", 401, "{\"code\":\"demo_session_expired\",\"message\":\"Demo expired\"}");
+        ApiException failure = assertThrows(ApiException.class,
+                () -> FamilyFinanceApi.demo(baseUrl, "synthetic-demo").getBudgetMonths());
+        assertEquals(401, failure.status);
+        assertEquals("demo_session_expired", failure.code);
+        assertEquals(Arrays.asList("/demo/budget-months"), requestOrder);
+    }
+
+    @Test
+    public void demoReconnectUsesOnlySyntheticBankEndpoints() throws Exception {
+        respond("/demo/plaid/link-token", 200, "{\"demo\":true,\"link_token\":\"demo-bank-link\"}");
+        respond("/demo/plaid/exchange-public-token", 200, "{\"accounts\":[]}");
+        FamilyFinanceApi demo = FamilyFinanceApi.demo(baseUrl, "synthetic-demo");
+        assertEquals("demo-bank-link", demo.createPlaidLinkToken());
+        demo.exchangePlaidPublicToken(1, "demo-bank-confirmed");
+        assertEquals(Arrays.asList("/demo/plaid/link-token", "/demo/plaid/exchange-public-token"), requestOrder);
+    }
+
+    @Test
     public void ordinaryBillEditPreservesItsExistingFundButExplicitUnlinkSendsNull() throws Exception {
         JSONObject unchanged = FamilyFinanceApi.expectedBillUpdatePayload("Annual bill", 10000, "2026-10-01", true, 7, false);
         assertFalse(unchanged.has("reserve_fund_id"));
@@ -131,6 +175,106 @@ public final class JsonHttpClientTest {
         assertEquals("Synthetic backend answer", spendingApi().syncAndCheckSafeToSpend(1, 3, 500).requiredPhrase);
         assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
                 "/plaid/sync:7:transaction", "/plaid/sync:8:balance", "/plaid/sync:8:transaction", "/safe-to-spend"), requestOrder);
+    }
+
+    @Test
+    public void spendingUsesTodaysBackendSyncDecisionEvenWhenReviewIsPending() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        respond("/budget-months/1/bank-status", 200,
+                "{\"enabled\":true,\"connection_id\":7,\"sync_required\":false,\"ready\":false}");
+        respond("/safe-to-spend", 400, "{\"message\":\"Review imported spending first\"}");
+        assertEquals("Review imported spending first", assertThrows(ApiException.class,
+                () -> api.syncAndCheckSafeToSpend(1, 3, 500)).getMessage());
+        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/safe-to-spend"), requestOrder);
+    }
+
+    @Test
+    public void malformedFreshnessFlagCannotSkipBankSync() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        respond("/budget-months/1/bank-status", 200,
+                "{\"enabled\":true,\"connection_id\":7,\"sync_required\":\"false\"}");
+        api.syncAndCheckSafeToSpend(1, 3, 500);
+        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
+                "/plaid/sync:7:transaction", "/safe-to-spend"), requestOrder);
+    }
+
+    private PendingFundAction contribution() throws Exception {
+        return PendingFundAction.create(4, false, new JSONObject().put("budget_month_id", 1)
+                .put("kind", "contribution").put("amount_cents", 500).put("occurred_on", "2026-09-30"));
+    }
+
+    private void fundNeedsSyncThenSucceeds() {
+        responseSequences.put("/funds/4/entries", new ConcurrentLinkedQueue<>(Arrays.asList(
+                new Response(400, "{\"code\":\"bank_sync_required\",\"message\":\"Sync today\"}", null),
+                new Response(201, "{}", null))));
+    }
+
+    @Test
+    public void contributionAndReplayUseBackendWithoutAnotherBankCall() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        respond("/funds/4/entries", 201, "{}");
+        PendingFundAction action = contribution();
+        api.applyFundAction(action);
+        api.applyFundAction(action);
+        assertEquals(Arrays.asList("/funds/4/entries", "/funds/4/entries"), requestOrder);
+        assertEquals(fundBodies.get(0), fundBodies.get(1));
+    }
+
+    @Test
+    public void staleContributionSyncsAutomaticallyAndRetriesTheIdenticalRequest() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        // Force a sync even when only an excluded fund backing account is stale.
+        respond("/budget-months/1/bank-status", 200,
+                "{\"enabled\":true,\"connection_id\":7,\"sync_required\":false}");
+        fundNeedsSyncThenSucceeds();
+        PendingFundAction action = contribution();
+        api.applyFundAction(action);
+        assertEquals(Arrays.asList("/funds/4/entries", "/budget-months/1/bank-status",
+                "/plaid/sync:7:balance", "/plaid/sync:7:transaction", "/funds/4/entries"), requestOrder);
+        assertEquals(fundBodies.get(0), fundBodies.get(1));
+        assertEquals(action.payload().getString("idempotency_key"),
+                new JSONObject(fundBodies.get(1)).getString("idempotency_key"));
+    }
+
+    @Test
+    public void failedSyncDoesNotRetryContributionOrLoseItsRequestKey() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        fundNeedsSyncThenSucceeds();
+        respond("/plaid/sync:7:balance", 200, "{\"success\":false,\"error_message\":\"Reconnect USAA\"}");
+        PendingFundAction action = contribution();
+        String saved = action.serialize();
+        assertEquals("Reconnect USAA", assertThrows(ApiException.class, () -> api.applyFundAction(action)).getMessage());
+        assertEquals(1, fundBodies.size());
+        assertEquals(saved, action.serialize());
+    }
+
+    @Test
+    public void contributionValidationDoesNotTriggerBankSync() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        respond("/funds/4/entries", 400, "{\"code\":\"validation_error\",\"message\":\"Not enough cash\"}");
+        assertThrows(ApiException.class, () -> api.applyFundAction(contribution()));
+        assertEquals(Arrays.asList("/funds/4/entries"), requestOrder);
+    }
+
+    @Test
+    public void contributionRetriesOnlyOnceIfBankStillNeedsAttention() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        respond("/funds/4/entries", 400, "{\"code\":\"bank_sync_required\",\"message\":\"History incomplete\"}");
+        assertThrows(ApiException.class, () -> api.applyFundAction(contribution()));
+        assertEquals(2, fundBodies.size());
+        assertEquals(fundBodies.get(0), fundBodies.get(1));
+    }
+
+    @Test
+    public void releaseAndMoveNeverRequireBankSync() throws Exception {
+        FamilyFinanceApi api = spendingApi();
+        respond("/funds/4/entries", 201, "{}");
+        respond("/funds/4/transfer", 201, "{}");
+        JSONObject payload = new JSONObject().put("budget_month_id", 1).put("kind", "release")
+                .put("amount_cents", 500).put("occurred_on", "2026-09-30");
+        api.applyFundAction(PendingFundAction.create(4, false, payload));
+        api.applyFundAction(PendingFundAction.create(4, true, payload.put("target_fund_id", 5)));
+        assertEquals(Arrays.asList("/funds/4/entries", "/funds/4/transfer"), requestOrder);
     }
 
     @Test

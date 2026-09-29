@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from .security import RateLimitError, RuntimeSettings
 from .dates import household_today
+from .demo_sessions import DemoSessionManager, demo_routes
 
 from .coach import (
     BudgetChangeSuggestionRequest,
@@ -75,6 +76,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.request.settimeout(REQUEST_TIMEOUT_SECONDS)
         super().setup()
 
+    @demo_routes
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
@@ -227,6 +229,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_exception(exc)
 
+    @demo_routes
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
@@ -577,6 +580,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_exception(exc)
 
+    @demo_routes
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
         try:
@@ -844,6 +848,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_exception(exc)
 
+    @demo_routes
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         try:
@@ -937,6 +942,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         return payload
 
     def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        if getattr(self, "is_demo", False):
+            payload = {**payload, "demo": True}
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -949,20 +956,22 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_error_json(self, status: HTTPStatus, message: str) -> None:
+    def send_error_json(self, status: HTTPStatus, message: str, *, code: str | None = None) -> None:
         self.send_json(
             {
                 "error": message,
                 "message": message,
-                "code": ERROR_CODES.get(status, "api_error"),
+                "code": code or ERROR_CODES.get(status, "api_error"),
                 "status": status.value,
             },
             status=status,
         )
 
     def send_exception(self, exc: Exception) -> None:
+        from .bank_data import BankSyncRequiredError
         status, message = error_response_for_exception(exc)
-        self.send_error_json(status, message)
+        self.send_error_json(status, message,
+                             code="bank_sync_required" if isinstance(exc, BankSyncRequiredError) else None)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -1172,7 +1181,14 @@ def build_server(db_path: Path, host: str, port: int) -> ThreadingHTTPServer:
     ConfiguredApiHandler.repository = repository
     ConfiguredApiHandler.plaid_service = build_plaid_service_from_env(repository)
     ConfiguredApiHandler.coach_service = build_coach_service_from_env()
-    return ThreadingHTTPServer((host, port), ConfiguredApiHandler)
+    ConfiguredApiHandler.demo_manager = DemoSessionManager()
+
+    class DemoAwareServer(ThreadingHTTPServer):
+        def server_close(self):
+            super().server_close()
+            ConfiguredApiHandler.demo_manager.close()
+
+    return DemoAwareServer((host, port), ConfiguredApiHandler)
 
 
 def main() -> None:
@@ -1184,7 +1200,10 @@ def main() -> None:
 
     server = build_server(Path(args.db), args.host, args.port)
     print(f"Serving on http://{args.host}:{args.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.Switch;
 
 import com.familyfinance.app.api.FamilyFinanceApi;
 import com.familyfinance.app.api.ApiException;
@@ -62,6 +63,8 @@ import com.familyfinance.app.state.LoginErrorMessages;
 import com.familyfinance.app.state.MoneyFormatter;
 import com.familyfinance.app.state.PendingFundAction;
 import com.familyfinance.app.state.SecureSessionStore;
+import com.familyfinance.app.state.DemoModeStore;
+import com.familyfinance.app.state.SessionGeneration;
 import com.familyfinance.app.state.SelectedCategoryAssigner;
 import com.familyfinance.app.state.TransactionReviewState;
 import com.familyfinance.app.ui.CelebrationOverlay;
@@ -79,6 +82,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.HashSet;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.time.LocalDate;
@@ -117,7 +122,12 @@ public final class MainActivity extends Activity {
     private static final int COLOR_SUCCESS_BG = 0xFFD7EBD9;
     private static final int COLOR_SUCCESS_TEXT = 0xFF155C35;
 
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService cleanupExecutor = Executors.newSingleThreadExecutor();
+    private final SessionGeneration sessionGeneration = new SessionGeneration();
+    private final ThreadLocal<RequestScope> requestScope = new ThreadLocal<>();
+    private DemoModeStore demoStore;
+    private boolean demoMode;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private LinearLayout root;
@@ -139,6 +149,7 @@ public final class MainActivity extends Activity {
     private List<NotificationEvent> notifications = new ArrayList<>();
     private int unreadNotificationCount;
     private PlaidHandler plaidHandler;
+    private long plaidGeneration;
     private JSONObject bankStatus = new JSONObject();
     private boolean repairingBank;
     private boolean reviewingQueue;
@@ -150,6 +161,7 @@ public final class MainActivity extends Activity {
     private boolean bankActionRunning;
     private final LinkResultHandler plaidResultHandler = new LinkResultHandler(
             linkSuccess -> {
+                if (demoMode || !sessionGeneration.accepts(plaidGeneration)) return Unit.INSTANCE;
                 if (repairingBank) {
                     repairingBank = false;
                     syncPlaidItems();
@@ -164,6 +176,7 @@ public final class MainActivity extends Activity {
                 return Unit.INSTANCE;
             },
             linkExit -> {
+                if (demoMode || !sessionGeneration.accepts(plaidGeneration)) return Unit.INSTANCE;
                 String message = linkExit.getError() == null ? "Plaid Link was cancelled."
                         : "Plaid Link could not finish. Retry or reconnect in Settings.";
                 showSettings();
@@ -178,11 +191,15 @@ public final class MainActivity extends Activity {
         headingFont = getResources().getFont(R.font.heading);
         repairingBank = savedInstanceState != null && savedInstanceState.getBoolean("repairingBank", false);
         if (!BuildConfig.DEBUG) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        demoStore = new DemoModeStore(this);
         loadPreferences();
-        if (savedConnectionReset) {
-            showLogin("The saved backend URL was invalid and has been reset. Check the connection and log in again.");
+        retryDemoCleanup();
+        if (demoMode && (authToken == null || authToken.isEmpty())) {
+            handleDemoExpired();
+        } else if (savedConnectionReset) {
+            showLogin("The saved connection was invalid and has been reset. Open First-time setup to check it, then log in.");
         } else if (authToken == null || authToken.isEmpty()) {
-            checkSetupThenShowLogin(null);
+            showLogin(null);
         } else {
             showLoading("Loading dashboard...");
             refreshData(this::showDashboard);
@@ -194,24 +211,79 @@ public final class MainActivity extends Activity {
         destroyed = true;
         mainHandler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
+        cleanupExecutor.shutdownNow();
         super.onDestroy();
     }
 
+    private static final class RequestScope {
+        final long generation;
+        final FamilyFinanceApi api;
+        final SharedPreferences preferences;
+        final int monthId;
+        RequestScope(long generation, FamilyFinanceApi api, SharedPreferences preferences, int monthId) {
+            this.generation = generation; this.api = api; this.preferences = preferences; this.monthId = monthId;
+        }
+    }
+
+    private void executeForSession(Runnable operation) {
+        RequestScope captured = new RequestScope(sessionGeneration.current(), api, preferences(), budgetMonthId);
+        executor.execute(() -> {
+            if (!sessionGeneration.accepts(captured.generation) || destroyed) return;
+            requestScope.set(captured);
+            try { operation.run(); }
+            finally { requestScope.remove(); }
+        });
+    }
+
+    private void advanceSession() {
+        sessionGeneration.advance();
+        executor.shutdownNow();
+        // A slow abandoned demo request must not hold the restored real UI in its queue.
+        executor = Executors.newSingleThreadExecutor();
+    }
+
+    private FamilyFinanceApi currentApi() {
+        RequestScope scope = requestScope.get();
+        return scope == null ? api : scope.api;
+    }
+
+    private int requestMonthId() {
+        RequestScope scope = requestScope.get();
+        return scope == null ? budgetMonthId : scope.monthId;
+    }
+
+    private SharedPreferences preferences() {
+        RequestScope scope = requestScope.get();
+        return scope != null ? scope.preferences : demoMode ? demoStore.preferences() : getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    private SecureSessionStore secureSession() {
+        return demoMode ? demoStore.session() : new SecureSessionStore(this);
+    }
+
     private void postIfActive(Runnable action) {
+        RequestScope scope = requestScope.get();
+        long captured = scope == null ? sessionGeneration.current() : scope.generation;
         mainHandler.post(() -> {
-            if (!destroyed && !isFinishing()) {
-                action.run();
-            }
+            if (!destroyed && !isFinishing() && sessionGeneration.accepts(captured)) action.run();
         });
     }
 
     @Override
     public void onBackPressed() {
-        if ("Family Finance".equals(currentScreen)) {
+        if (getString(R.string.app_name).equals(currentScreen)) {
             return;
         }
         if ("Assignment stopped".equals(currentScreen)) {
             refreshData(() -> showTransactions(true));
+            return;
+        }
+        if ("First-Time Setup".equals(currentScreen)) {
+            showLogin(null);
+            return;
+        }
+        if ("Create Household".equals(currentScreen)) {
+            showConnectionSetup(null);
             return;
         }
         if (authToken != null && !authToken.isEmpty() && !"Dashboard".equals(currentScreen)) {
@@ -246,13 +318,14 @@ public final class MainActivity extends Activity {
     }
 
     private void loadPreferences() {
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        demoMode = demoStore.isEnabled();
+        SharedPreferences prefs = preferences();
         try {
             baseUrl = ConnectionSettings.normalizeBaseUrl(prefs.getString("base_url", DEFAULT_BASE_URL), BuildConfig.DEBUG);
         } catch (IllegalArgumentException exception) {
             baseUrl = DEFAULT_BASE_URL;
             savedConnectionReset = true;
-            new SecureSessionStore(this).clear();
+            secureSession().clear();
             prefs.edit().putString("base_url", DEFAULT_BASE_URL)
                     .remove("auth_token").remove("current_user_id").remove("current_user_name")
                     .remove("household_id").remove("household_name").apply();
@@ -260,20 +333,28 @@ public final class MainActivity extends Activity {
         budgetMonthId = prefs.getInt("budget_month_id", DEFAULT_BUDGET_MONTH_ID);
         // Legacy plaintext tokens are deliberately discarded; a fresh login encrypts the new session.
         if (prefs.contains("auth_token")) prefs.edit().remove("auth_token").commit();
-        authToken = new SecureSessionStore(this).load(baseUrl);
+        authToken = secureSession().load(baseUrl);
         currentUserId = prefs.getInt("current_user_id", 0);
         householdId = prefs.getInt("household_id", 0);
         currentUserName = prefs.getString("current_user_name", "");
         householdName = prefs.getString("household_name", "");
-        api = new FamilyFinanceApi(baseUrl, authToken);
+        api = demoMode ? FamilyFinanceApi.demo(baseUrl, authToken) : new FamilyFinanceApi(baseUrl, authToken);
     }
 
     private void saveConnectionPreferences(String newBaseUrl, int newBudgetMonthId) {
+        RequestScope scope = requestScope.get();
+        if (scope != null) {
+            if (sessionGeneration.accepts(scope.generation)) {
+                scope.preferences.edit().putInt("budget_month_id", newBudgetMonthId).apply();
+                postIfActive(this::loadPreferences);
+            }
+            return;
+        }
         newBaseUrl = ConnectionSettings.normalizeBaseUrl(newBaseUrl, BuildConfig.DEBUG);
         if (ConnectionSettings.requiresNewSession(baseUrl, newBaseUrl)) {
             clearSession();
         }
-        getSharedPreferences(PREFS, MODE_PRIVATE)
+        preferences()
                 .edit()
                 .putString("base_url", newBaseUrl)
                 .putInt("budget_month_id", newBudgetMonthId)
@@ -282,11 +363,11 @@ public final class MainActivity extends Activity {
     }
 
     private boolean saveAuthSession(String token, JSONObject user, JSONObject household) {
-        if (!new SecureSessionStore(this).save(token, baseUrl)) {
+        if (!secureSession().save(token, baseUrl)) {
             showLogin("The phone could not securely save your session. Please try logging in again.");
             return false;
         }
-        getSharedPreferences(PREFS, MODE_PRIVATE)
+        preferences()
                 .edit()
                 .remove("auth_token")
                 .putInt("current_user_id", user.optInt("id"))
@@ -299,10 +380,11 @@ public final class MainActivity extends Activity {
     }
 
     private void logout() {
+        if (demoMode) { leaveDemoMode(); return; }
         FamilyFinanceApi previousApi = api;
         clearSession();
         showLoading("Signing out...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             String message = "Logged out.";
             try { previousApi.logout(); }
             catch (ApiException exception) {
@@ -314,8 +396,9 @@ public final class MainActivity extends Activity {
     }
 
     private void clearSession() {
-        new SecureSessionStore(this).clear();
-        getSharedPreferences(PREFS, MODE_PRIVATE)
+        advanceSession();
+        secureSession().clear();
+        preferences()
                 .edit()
                 .remove("auth_token")
                 .remove("current_user_id")
@@ -329,6 +412,9 @@ public final class MainActivity extends Activity {
 
     private void clearFinancialData() {
         provisionFunds = null;
+        bankStatus = new JSONObject();
+        fundActionRunning = false;
+        bankActionRunning = false;
         summary = null;
         budgetDetail = null;
         budgetMonths = new ArrayList<>();
@@ -346,9 +432,9 @@ public final class MainActivity extends Activity {
             showLogin("Log in to load your household data.");
             return;
         }
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                List<BudgetMonth> loadedBudgetMonths = api.getBudgetMonths();
+                List<BudgetMonth> loadedBudgetMonths = currentApi().getBudgetMonths();
                 if (loadedBudgetMonths.isEmpty()) {
                     postIfActive(() -> {
                         budgetMonths = loadedBudgetMonths;
@@ -365,14 +451,14 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 int selectedBudgetMonthId = selectBudgetMonthId(loadedBudgetMonths);
-                BudgetDetail loadedBudgetDetail = api.getBudgetDetail(selectedBudgetMonthId);
-                List<TransactionDetail> loadedTransactions = api.getTransactions(selectedBudgetMonthId);
-                List<TransactionDetail> loadedReviewQueue = api.getReviewQueue(selectedBudgetMonthId);
-                List<CashAccount> loadedAccounts = api.getAccounts(selectedBudgetMonthId);
-                JSONObject loadedBankStatus = api.getBankStatus(selectedBudgetMonthId);
-                List<MerchantRule> loadedMerchantRules = api.getMerchantRules();
-                List<NotificationEvent> loadedNotifications = api.getNotifications(selectedBudgetMonthId);
-                int loadedUnreadNotificationCount = api.getUnreadNotificationCount(selectedBudgetMonthId);
+                BudgetDetail loadedBudgetDetail = currentApi().getBudgetDetail(selectedBudgetMonthId);
+                List<TransactionDetail> loadedTransactions = currentApi().getTransactions(selectedBudgetMonthId);
+                List<TransactionDetail> loadedReviewQueue = currentApi().getReviewQueue(selectedBudgetMonthId);
+                List<CashAccount> loadedAccounts = currentApi().getAccounts(selectedBudgetMonthId);
+                JSONObject loadedBankStatus = currentApi().getBankStatus(selectedBudgetMonthId);
+                List<MerchantRule> loadedMerchantRules = currentApi().getMerchantRules();
+                List<NotificationEvent> loadedNotifications = currentApi().getNotifications(selectedBudgetMonthId);
+                int loadedUnreadNotificationCount = currentApi().getUnreadNotificationCount(selectedBudgetMonthId);
                 postIfActive(() -> {
                     budgetDetail = loadedBudgetDetail;
                     summary = loadedBudgetDetail.summary;
@@ -412,38 +498,75 @@ public final class MainActivity extends Activity {
         return months.get(0).id;
     }
 
-    private void checkSetupThenShowLogin(String message) {
-        showLoading("Checking setup status...");
-        executor.execute(() -> {
-            try {
-                SetupStatus status = new FamilyFinanceApi(baseUrl).getSetupStatus();
-                postIfActive(() -> {
-                    if (status.canInitialize) {
-                        showFirstRunSetup(message);
-                    } else {
-                        showLogin(message);
-                    }
-                });
-            } catch (Exception exception) {
-                postIfActive(() -> showLogin(
-                        "Backend is unreachable at " + baseUrl + ". Check the server URL and try again."
-                ));
-            }
-        });
-    }
-
-    private void showFirstRunSetup(String message) {
-        beginScreen("First-Run Setup");
+    private void showConnectionSetup(String message) {
+        beginScreen("First-Time Setup");
         if (message != null && !message.trim().isEmpty()) {
-            addStatusCard("Setup note", message.trim(), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+            addStatusCard("Setup status", message.trim(), COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK);
         }
-        addSection("Backend connection");
+        addBody("Most phones can use the saved connection. Enter different details here if they were provided to you.");
+        addSection("Connection details");
         EditText baseUrlInput = new EditText(this);
         baseUrlInput.setHint("Backend URL");
         baseUrlInput.setSingleLine(true);
         baseUrlInput.setText(baseUrl);
         root.addView(baseUrlInput);
 
+        EditText budgetMonthInput = new EditText(this);
+        budgetMonthInput.setHint("Budget month ID");
+        budgetMonthInput.setSingleLine(true);
+        budgetMonthInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        budgetMonthInput.setText(Integer.toString(budgetMonthId));
+        root.addView(budgetMonthInput);
+        addButton("Save and return to login", () -> {
+            if (saveSetupConnection(baseUrlInput, budgetMonthInput)) showLogin("Connection saved. Log in to continue.");
+        });
+
+        addSection("Household setup");
+        addBody("This check asks whether the server already has a household. It offers household creation only if the server is new; checking does not create or reset anything.");
+        addSecondaryButton("Save and check household setup", () -> {
+            if (saveSetupConnection(baseUrlInput, budgetMonthInput)) checkHouseholdSetup();
+        });
+        addSecondaryButton("Back to login", () -> showLogin(null));
+    }
+
+    private boolean saveSetupConnection(EditText baseUrlInput, EditText budgetMonthInput) {
+        try {
+            int monthId = ConnectionSettings.parseBudgetMonthId(budgetMonthInput.getText().toString());
+            saveConnectionPreferences(baseUrlInput.getText().toString(), monthId);
+            return true;
+        } catch (IllegalArgumentException exception) {
+            toast(exception.getMessage());
+            return false;
+        }
+    }
+
+    private void checkHouseholdSetup() {
+        String connectionUrl = baseUrl;
+        showLoading("Checking household setup...");
+        executeForSession(() -> {
+            try {
+                SetupStatus status = new FamilyFinanceApi(connectionUrl).getSetupStatus();
+                postIfActive(() -> {
+                    if (status.canInitialize) {
+                        showFirstRunSetup(null);
+                    } else if (status.initialized) {
+                        showConnectionSetup("This server already has a household. Return to login and use your existing account.");
+                    } else {
+                        showConnectionSetup("Household creation is unavailable on this server. Check its setup before continuing.");
+                    }
+                });
+            } catch (Exception exception) {
+                postIfActive(() -> showConnectionSetup("Couldn't check household setup. Check the connection details and try again."));
+            }
+        });
+    }
+
+    private void showFirstRunSetup(String message) {
+        beginScreen("Create Household");
+        if (message != null && !message.trim().isEmpty()) {
+            addStatusCard("Setup note", message.trim(), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+        }
+        addBody("This server is ready for its first household. Use the private setup details provided with the server.");
         addSection("Private household");
         EditText setupCodeInput = new EditText(this);
         setupCodeInput.setHint("Private setup code (provided with server setup)");
@@ -498,13 +621,7 @@ public final class MainActivity extends Activity {
         root.addView(karaPassword);
 
         addButton("Create private household", () -> {
-            String newBaseUrl;
-            try {
-                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString(), BuildConfig.DEBUG);
-            } catch (IllegalArgumentException exception) {
-                toast(exception.getMessage());
-                return;
-            }
+            String newBaseUrl = baseUrl;
             String householdName = householdInput.getText().toString().trim();
             String primaryUsername = danielUsername.getText().toString().trim();
             String primaryPassword = danielPassword.getText().toString();
@@ -525,7 +642,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             showLoading("Creating private household...");
-            executor.execute(() -> {
+            executeForSession(() -> {
                 try {
                     JSONArray users = new JSONArray();
                     users.put(setupUserJson(
@@ -555,7 +672,7 @@ public final class MainActivity extends Activity {
                 }
             });
         });
-        addButton("Back to login", () -> showLogin(null));
+        addSecondaryButton("Back to first-time setup", () -> showConnectionSetup(null));
     }
 
     private JSONObject setupUserJson(String name, String username, String email, String password) throws Exception {
@@ -574,21 +691,7 @@ public final class MainActivity extends Activity {
         if (message != null && !message.trim().isEmpty()) {
             addStatusCard("Connection note", message.trim(), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
         }
-        addSection("Backend connection");
-        EditText baseUrlInput = new EditText(this);
-        baseUrlInput.setHint("Backend URL");
-        baseUrlInput.setSingleLine(true);
-        baseUrlInput.setText(baseUrl);
-        root.addView(baseUrlInput);
-
-        EditText budgetMonthInput = new EditText(this);
-        budgetMonthInput.setHint("Budget month ID");
-        budgetMonthInput.setSingleLine(true);
-        budgetMonthInput.setInputType(InputType.TYPE_CLASS_NUMBER);
-        budgetMonthInput.setText(Integer.toString(budgetMonthId));
-        root.addView(budgetMonthInput);
-
-        addSection("Private household login");
+        addBody("Log in to your household.");
         EditText usernameInput = new EditText(this);
         usernameInput.setHint("Username or email");
         usernameInput.setSingleLine(true);
@@ -601,29 +704,21 @@ public final class MainActivity extends Activity {
         root.addView(passwordInput);
 
         addButton("Log in", () -> {
-            int parsedBudgetMonthId;
-            String newBaseUrl;
-            try {
-                parsedBudgetMonthId = ConnectionSettings.parseBudgetMonthId(budgetMonthInput.getText().toString());
-                newBaseUrl = ConnectionSettings.normalizeBaseUrl(baseUrlInput.getText().toString(), BuildConfig.DEBUG);
-            } catch (IllegalArgumentException exception) {
-                toast(exception.getMessage());
-                return;
-            }
+            int selectedBudgetMonthId = budgetMonthId;
+            String connectionUrl = baseUrl;
             String username = usernameInput.getText().toString().trim();
             String password = passwordInput.getText().toString();
             if (username.isEmpty() || password.isEmpty()) {
                 toast("Enter username/email and password.");
                 return;
             }
-            saveConnectionPreferences(newBaseUrl, parsedBudgetMonthId);
             showLoading("Logging in...");
-            executor.execute(() -> {
+            executeForSession(() -> {
                 try {
-                    FamilyFinanceApi loginApi = new FamilyFinanceApi(newBaseUrl);
+                    FamilyFinanceApi loginApi = new FamilyFinanceApi(connectionUrl);
                     JSONObject auth = loginApi.login(username, password);
                     postIfActive(() -> {
-                        saveConnectionPreferences(newBaseUrl, parsedBudgetMonthId);
+                        saveConnectionPreferences(connectionUrl, selectedBudgetMonthId);
                         if (!saveAuthSession(
                                 auth.optString("token"),
                                 auth.optJSONObject("user") == null ? new JSONObject() : auth.optJSONObject("user"),
@@ -633,19 +728,11 @@ public final class MainActivity extends Activity {
                         refreshData(this::showDashboard);
                     });
                 } catch (Exception exception) {
-                    postIfActive(() -> showLogin(LoginErrorMessages.fromException(exception, newBaseUrl)));
+                    postIfActive(() -> showLogin(LoginErrorMessages.fromException(exception)));
                 }
             });
         });
-        addButton("Check first-run setup", () -> {
-            try {
-                saveConnectionPreferences(baseUrlInput.getText().toString(), budgetMonthId);
-            } catch (IllegalArgumentException exception) {
-                toast(exception.getMessage());
-                return;
-            }
-            checkSetupThenShowLogin(null);
-        });
+        addSecondaryButton("First-time setup", () -> showConnectionSetup(null));
     }
 
     private void showDashboard() {
@@ -673,7 +760,7 @@ public final class MainActivity extends Activity {
         addFact("Budget", DashboardText.budgetMonth(summary.month) + " · "
                 + DashboardText.lastBankSync(bankStatus.optString("transactions_checked_at", ""),
                         bankStatus.optString("balance_checked_at", ""), ZoneId.systemDefault()));
-        if (BuildConfig.BANK_LINKING_ENABLED && bankStatus.optBoolean("enabled") && bankStatus.optBoolean("connected")) {
+        if ((demoMode || BuildConfig.BANK_LINKING_ENABLED) && bankStatus.optBoolean("enabled") && bankStatus.optBoolean("connected")) {
             addSecondaryButton("Sync", this::syncPlaidItems);
             addBody("Check balances and import available transactions.");
         }
@@ -771,8 +858,8 @@ public final class MainActivity extends Activity {
             runMutation(
                     "Creating starter budget...",
                     () -> {
-                        int newMonthId = api.createStarterBudget(payday);
-                        api.activateBudgetMonth(newMonthId);
+                        int newMonthId = currentApi().createStarterBudget(payday);
+                        currentApi().activateBudgetMonth(newMonthId);
                         saveConnectionPreferences(baseUrl, newMonthId);
                     },
                     () -> refreshData(this::showBudget)
@@ -787,7 +874,7 @@ public final class MainActivity extends Activity {
         addFact("Viewer", blankAsDash(currentUserName));
         addButton("Mark all read", () -> runMutation(
                 "Marking notifications read...",
-                () -> api.markAllNotificationsRead(budgetMonthId),
+                () -> currentApi().markAllNotificationsRead(budgetMonthId),
                 () -> refreshData(this::showNotifications)
         ));
         addSection("Accountability events");
@@ -873,7 +960,7 @@ public final class MainActivity extends Activity {
         } else addButton("Rename / fund category", () -> showCategoryEditor(category, category.budgetGroupId));
         if (category.reserveFundId == null) addDangerButton("Archive category", () -> runMutation(
                 "Archiving category...",
-                () -> api.updateCategory(category.id, category.name, category.plannedCents, true),
+                () -> currentApi().updateCategory(category.id, category.name, category.plannedCents, true),
                 () -> refreshData(this::showBudget)
         ));
 
@@ -898,9 +985,9 @@ public final class MainActivity extends Activity {
         }
         showLoading("Loading provision funds...");
         int requestedMonthId = budgetMonthId;
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                ProvisionFunds loaded = api.getProvisionFunds(requestedMonthId);
+                ProvisionFunds loaded = currentApi().getProvisionFunds(requestedMonthId);
                 postIfActive(() -> {
                     provisionFunds = loaded;
                     if (selectedFundId == null) renderFunds();
@@ -1083,8 +1170,8 @@ public final class MainActivity extends Activity {
                 if (fund == null) payload.put("backing_account_id", backingAccounts.get(accountChoice.getSelectedItemPosition() - 1).id);
                 else payload.put("budget_month_id", budgetMonthId);
                 runMutation("Saving fund plan...", () -> {
-                    if (fund == null) api.createProvisionFund(budgetMonthId, payload);
-                    else api.updateProvisionFund(fund.id, payload);
+                    if (fund == null) currentApi().createProvisionFund(budgetMonthId, payload);
+                    else currentApi().updateProvisionFund(fund.id, payload);
                 }, () -> refreshData(() -> showFunds(fund == null ? null : fund.id)));
             } catch (Exception exception) { toast(userFacingError(exception)); }
         });
@@ -1095,7 +1182,7 @@ public final class MainActivity extends Activity {
                         : "Existing history and saved money remain protected. This fund will no longer be available for new purchases or contributions.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton(fund.archived ? "Restore" : "Archive", (dialog, which) -> runMutation("Updating fund...",
-                        () -> api.updateProvisionFund(fund.id, new JSONObject().put("budget_month_id", budgetMonthId).put("archived", !fund.archived)),
+                        () -> currentApi().updateProvisionFund(fund.id, new JSONObject().put("budget_month_id", budgetMonthId).put("archived", !fund.archived)),
                         () -> refreshData(() -> showFunds(fund.id))))
                 .show());
     }
@@ -1139,6 +1226,10 @@ public final class MainActivity extends Activity {
         addBody(transfer ? "Move existing saved money to another purpose. This does not make a bank transfer."
                 : "release".equals(kind) ? "Return saved money to everyday cash. For a purchase, categorize its transaction instead."
                 : "Reserve cash already held in " + fund.backingAccountName + ". This does not make a bank transfer or record an expense.");
+        if ("contribution".equals(kind)) {
+            addBody("We'll sync if needed for today, then check available cash and recorded upcoming bills. You can review transactions and plan next month later.");
+            addBody("Unreviewed transactions can change fund balances when categorized. Bills not yet entered are not included in this check.");
+        }
         List<ProvisionFunds.Fund> destinations = new ArrayList<>();
         List<String> names = new ArrayList<>();
         names.add("Choose a destination fund...");
@@ -1167,7 +1258,7 @@ public final class MainActivity extends Activity {
                     payload.put("target_fund_id", destinations.get(destination.getSelectedItemPosition() - 1).id);
                 } else payload.put("kind", kind);
                 PendingFundAction action = PendingFundAction.create(fund.id, transfer, payload);
-                if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(pendingFundKey(), action.serialize()).commit()) {
+                if (!preferences().edit().putString(pendingFundKey(), action.serialize()).commit()) {
                     throw new IllegalArgumentException("Could not save this request safely. Please retry.");
                 }
                 executeFundAction(action);
@@ -1177,15 +1268,15 @@ public final class MainActivity extends Activity {
     }
 
     private String pendingFundKey() {
-        return "pending_fund_action:" + baseUrl + ":" + householdId + ":" + currentUserId;
+        return (demoMode ? demoStore.scope() + ":" : "") + "pending_fund_action:" + baseUrl + ":" + householdId + ":" + currentUserId;
     }
 
     private boolean hasPendingFundAction() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).contains(pendingFundKey());
+        return preferences().contains(pendingFundKey());
     }
 
     private boolean addPendingFundAction() {
-        String saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(pendingFundKey(), null);
+        String saved = preferences().getString(pendingFundKey(), null);
         if (saved == null) return false;
         addStatusCard("A fund request needs confirmation",
                 "A previous request may already have reached the server. Retry the same request to confirm its result safely before recording another movement.",
@@ -1207,10 +1298,10 @@ public final class MainActivity extends Activity {
         fundActionRunning = true;
         String storageKey = pendingFundKey();
         showLoading("Confirming fund movement...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                api.applyFundAction(action);
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(storageKey).commit();
+                currentApi().applyFundAction(action);
+                preferences().edit().remove(storageKey).commit();
                 postIfActive(() -> {
                     fundActionRunning = false;
                     toast("Fund movement confirmed.");
@@ -1221,7 +1312,7 @@ public final class MainActivity extends Activity {
                 boolean rejected = exception instanceof ApiException && ((ApiException) exception).status >= 400
                         && ((ApiException) exception).status < 500 && ((ApiException) exception).status != 401
                         && ((ApiException) exception).status != 408 && ((ApiException) exception).status != 429;
-                if (rejected) getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(storageKey).commit();
+                if (rejected) preferences().edit().remove(storageKey).commit();
                 postIfActive(() -> {
                     fundActionRunning = false;
                     if (handleExpiredSession(exception)) return;
@@ -1250,7 +1341,7 @@ public final class MainActivity extends Activity {
                     () -> runMutation(
                             "Switching budget month...",
                             () -> {
-                                api.activateBudgetMonth(month.id);
+                                currentApi().activateBudgetMonth(month.id);
                                 saveConnectionPreferences(baseUrl, month.id);
                             },
                             () -> refreshData(this::showBudget)
@@ -1266,8 +1357,8 @@ public final class MainActivity extends Activity {
             runMutation(
                     "Creating next month...",
                     () -> {
-                        int newMonthId = api.createBudgetMonth(householdId, nextMonth, budgetMonthId);
-                        api.activateBudgetMonth(newMonthId);
+                        int newMonthId = currentApi().createBudgetMonth(householdId, nextMonth, budgetMonthId);
+                        currentApi().activateBudgetMonth(newMonthId);
                         saveConnectionPreferences(baseUrl, newMonthId);
                     },
                     () -> refreshData(this::showBudget)
@@ -1293,9 +1384,9 @@ public final class MainActivity extends Activity {
                     "Saving group...",
                     () -> {
                         if (group == null) {
-                            api.createBudgetGroup(budgetMonthId, cleaned);
+                            currentApi().createBudgetGroup(budgetMonthId, cleaned);
                         } else {
-                            api.updateBudgetGroup(group.id, cleaned, false);
+                            currentApi().updateBudgetGroup(group.id, cleaned, false);
                         }
                     },
                     () -> refreshData(this::showBudget)
@@ -1337,9 +1428,9 @@ public final class MainActivity extends Activity {
                     "Saving category...",
                     () -> {
                         if (category == null) {
-                            api.createCategory(groupId, cleaned, plannedCents);
+                            currentApi().createCategory(groupId, cleaned, plannedCents);
                         } else {
-                            api.updateCategory(category.id, cleaned, plannedCents, false);
+                            currentApi().updateCategory(category.id, cleaned, plannedCents, false);
                         }
                     },
                     () -> refreshData(this::showBudget)
@@ -1366,7 +1457,7 @@ public final class MainActivity extends Activity {
                 addButton("Edit " + income.name, () -> showIncomeEditor(income));
                 addDangerButton("Remove " + income.name, () -> runMutation(
                         "Removing income...",
-                        () -> api.deleteIncome(income.id),
+                        () -> currentApi().deleteIncome(income.id),
                         () -> refreshData(this::showIncomePlanning)
                 ));
             }
@@ -1416,9 +1507,9 @@ public final class MainActivity extends Activity {
                     "Saving income...",
                     () -> {
                         if (income == null) {
-                            api.createIncome(budgetMonthId, cleaned, selectedKind, plannedCents, receivedCents);
+                            currentApi().createIncome(budgetMonthId, cleaned, selectedKind, plannedCents, receivedCents);
                         } else {
-                            api.updateIncome(income.id, cleaned, selectedKind, plannedCents, receivedCents);
+                            currentApi().updateIncome(income.id, cleaned, selectedKind, plannedCents, receivedCents);
                         }
                     },
                     () -> refreshData(this::showIncomePlanning)
@@ -1447,7 +1538,7 @@ public final class MainActivity extends Activity {
                 addButton("Edit " + bill.name, () -> showBillEditor(bill));
                 addDangerButton("Remove " + bill.name, () -> runMutation(
                         "Removing bill...",
-                        () -> api.deleteExpectedBill(bill.id),
+                        () -> currentApi().deleteExpectedBill(bill.id),
                         () -> refreshData(this::showBillsAndPaydays)
                 ));
             }
@@ -1462,7 +1553,7 @@ public final class MainActivity extends Activity {
                 addButton("Edit " + payday.paydayDate, () -> showPaydayEditor(payday));
                 addDangerButton("Remove " + payday.paydayDate, () -> runMutation(
                         "Removing payday...",
-                        () -> api.deletePayday(payday.id),
+                        () -> currentApi().deletePayday(payday.id),
                         () -> refreshData(this::showBillsAndPaydays)
                 ));
             }
@@ -1474,9 +1565,9 @@ public final class MainActivity extends Activity {
     private void showBillEditor(ExpectedBill bill) {
         if (summary == null || summary.reservedCashCents == null) { renderBillEditor(bill, null); return; }
         showLoading("Loading bill funding options...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                ProvisionFunds funds = api.getProvisionFunds(budgetMonthId);
+                ProvisionFunds funds = currentApi().getProvisionFunds(requestMonthId());
                 postIfActive(() -> renderBillEditor(bill, funds));
             } catch (Exception exception) {
                 postIfActive(() -> showError("Could not load bill funding options", exception));
@@ -1550,9 +1641,9 @@ public final class MainActivity extends Activity {
                     "Saving bill...",
                     () -> {
                         if (bill == null) {
-                            api.createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid, reserveFundId);
+                            currentApi().createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid, reserveFundId);
                         } else {
-                            api.updateExpectedBill(bill.id, cleaned, amountCents, due, isPaid, reserveFundId,
+                            currentApi().updateExpectedBill(bill.id, cleaned, amountCents, due, isPaid, reserveFundId,
                                     billFund != null && !Objects.equals(bill.reserveFundId, reserveFundId));
                         }
                     },
@@ -1579,9 +1670,9 @@ public final class MainActivity extends Activity {
                     "Saving payday...",
                     () -> {
                         if (payday == null) {
-                            api.createPayday(householdId, cleaned);
+                            currentApi().createPayday(householdId, cleaned);
                         } else {
-                            api.updatePayday(payday.id, cleaned);
+                            currentApi().updatePayday(payday.id, cleaned);
                         }
                     },
                     () -> refreshData(this::showBillsAndPaydays)
@@ -1733,10 +1824,18 @@ public final class MainActivity extends Activity {
 
     private void assignSelectedTransactions(List<TransactionDetail> selected, BudgetCategory category) {
         FamilyFinanceApi assignmentApi = api;
+        String markerKey = uncertainWritesKey();
+        String requestId = UUID.randomUUID().toString();
+        Set<String> pending = new HashSet<>(preferences().getStringSet(markerKey, new HashSet<>()));
+        pending.add(requestId);
+        if (!preferences().edit().putStringSet(markerKey, pending).commit()) {
+            toast("Could not safely record this update. Please retry.");
+            return;
+        }
         boolean hadPending = selected.stream().anyMatch(chosen -> reviewQueue.stream()
-                .anyMatch(pending -> pending.transaction.id == chosen.transaction.id));
+                .anyMatch(queued -> queued.transaction.id == chosen.transaction.id));
         showLoading("Assigning " + selected.size() + " transactions...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             SelectedCategoryAssigner.Result result = SelectedCategoryAssigner.assign(selected, category.id,
                     new SelectedCategoryAssigner.Gateway() {
                         private void ensureActive() throws ApiException {
@@ -1755,6 +1854,7 @@ public final class MainActivity extends Activity {
                             assignmentApi.assignCategory(id, categoryId, true);
                         }
                     });
+            if (result.error == null) clearWriteMarker(markerKey, requestId);
             postIfActive(() -> {
                 String saved = result.confirmed + " transaction" + (result.confirmed == 1 ? "" : "s")
                         + " assigned to " + category.name + " and reviewed.";
@@ -1784,9 +1884,9 @@ public final class MainActivity extends Activity {
 
     private void showTransactionDetail(int transactionId, Runnable afterRender) {
         showLoading("Loading transaction...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                TransactionDetail loaded = api.getTransaction(transactionId);
+                TransactionDetail loaded = currentApi().getTransaction(transactionId);
                 postIfActive(() -> {
                     renderTransactionDetail(loaded);
                     afterRender.run();
@@ -1815,7 +1915,7 @@ public final class MainActivity extends Activity {
             addBody("Unignore this transaction before assigning a category or splitting it.");
             addButton("Unignore transaction", () -> runMutation(
                     "Updating ignored state...",
-                    () -> api.setIgnored(detail.transaction.id, false, "Unignored in Android"),
+                    () -> currentApi().setIgnored(detail.transaction.id, false, "Unignored in Android"),
                     () -> afterTransactionSaved(detail.transaction.id)
             ));
             addNav();
@@ -1826,7 +1926,7 @@ public final class MainActivity extends Activity {
                     : detail.finalCategoryId != null ? "Confirm current category" : "Confirm incoming transaction";
             addButton(confirmLabel, () -> runMutation(
                     "Confirming transaction...",
-                    () -> api.markReviewed(detail.transaction.id, true),
+                    () -> currentApi().markReviewed(detail.transaction.id, true),
                     () -> afterTransactionSaved(detail.transaction.id, true)));
         }
         if (detail.isSplit()) {
@@ -1837,7 +1937,7 @@ public final class MainActivity extends Activity {
             addButton("Edit split", () -> showSplitEditor(detail));
             addDangerButton("Remove split", () -> runMutation(
                     "Removing split...",
-                    () -> api.removeSplit(detail.transaction.id),
+                    () -> currentApi().removeSplit(detail.transaction.id),
                     () -> afterTransactionSaved(detail.transaction.id)
             ));
         } else {
@@ -1856,8 +1956,8 @@ public final class MainActivity extends Activity {
             runMutation(
                     "Assigning category...",
                     () -> {
-                        if (detail.transaction.amountCents > 0) api.assignRefund(detail.transaction.id, category.id);
-                        else api.assignCategory(detail.transaction.id, category.id, true);
+                        if (detail.transaction.amountCents > 0) currentApi().assignRefund(detail.transaction.id, category.id);
+                        else currentApi().assignCategory(detail.transaction.id, category.id, true);
                     },
                     () -> afterTransactionSaved(detail.transaction.id, true)
             );
@@ -1865,18 +1965,18 @@ public final class MainActivity extends Activity {
         if (detail.finalCategoryId != null || detail.isSplit()) {
             addDangerButton("Remove category assignment", () -> runMutation(
                     "Removing category...",
-                    () -> api.removeCategory(detail.transaction.id),
+                    () -> currentApi().removeCategory(detail.transaction.id),
                     () -> afterTransactionSaved(detail.transaction.id)
             ));
         }
         addDangerButton(detail.transaction.ignored ? "Unignore transaction" : "Ignore/exclude transaction", () -> runMutation(
                 "Updating ignored state...",
-                () -> api.setIgnored(detail.transaction.id, !detail.transaction.ignored, "Marked in Android MVP"),
+                () -> currentApi().setIgnored(detail.transaction.id, !detail.transaction.ignored, "Marked in Android MVP"),
                 () -> afterTransactionSaved(detail.transaction.id)
         ));
         addButton("Mark as transfer (exclude from budget)", () -> runMutation(
                 "Marking transfer...",
-                () -> api.setIgnored(detail.transaction.id, true, "Transfer confirmed by household"),
+                () -> currentApi().setIgnored(detail.transaction.id, true, "Transfer confirmed by household"),
                 () -> afterTransactionSaved(detail.transaction.id)));
         addBody("A transfer affects the bank balance but is excluded from category spending. Apply incoming money as a refund only when it reverses spending; record pay in the income plan.");
         addMerchantRuleControls(detail);
@@ -1960,7 +2060,7 @@ public final class MainActivity extends Activity {
             }
             runMutation(
                     "Saving split...",
-                    () -> api.splitTransaction(detail.transaction.id, splits, true),
+                    () -> currentApi().splitTransaction(detail.transaction.id, splits, true),
                     () -> afterTransactionSaved(detail.transaction.id, true)
             );
         });
@@ -2067,7 +2167,7 @@ public final class MainActivity extends Activity {
             addBody("Existing rule: " + matchingRule.merchantMatchText + " -> " + matchingRule.categoryName);
             addDangerButton("Archive matching rule", () -> runMutation(
                     "Archiving merchant rule...",
-                    () -> api.archiveMerchantRule(matchingRule.id),
+                    () -> currentApi().archiveMerchantRule(matchingRule.id),
                     () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
             ));
             return;
@@ -2088,7 +2188,7 @@ public final class MainActivity extends Activity {
             boolean includeExisting = applyExisting.isChecked();
             runMutation(
                     "Creating merchant rule...",
-                    () -> api.createMerchantRuleFromTransaction(detail.transaction.id, category.id, includeExisting),
+                    () -> currentApi().createMerchantRuleFromTransaction(detail.transaction.id, category.id, includeExisting),
                     () -> refreshData(() -> showTransactionDetail(detail.transaction.id))
             );
         });
@@ -2107,9 +2207,9 @@ public final class MainActivity extends Activity {
 
     private void showMerchantRules() {
         showLoading("Loading merchant rules...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                List<MerchantRule> loaded = api.getMerchantRules();
+                List<MerchantRule> loaded = currentApi().getMerchantRules();
                 postIfActive(() -> {
                     merchantRules = loaded;
                     renderMerchantRules(false);
@@ -2192,7 +2292,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             runMutation("Saving merchant rule...",
-                    () -> api.updateMerchantRule(rule.id, text, selected.id), this::showMerchantRules);
+                    () -> currentApi().updateMerchantRule(rule.id, text, selected.id), this::showMerchantRules);
         });
         addSecondaryButton("Cancel", this::showMerchantRules);
     }
@@ -2204,7 +2304,7 @@ public final class MainActivity extends Activity {
                         + "\"? Past transactions and their categories will stay unchanged.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Delete", (dialog, which) -> runMutation("Deleting merchant rule...",
-                        () -> api.archiveMerchantRule(rule.id), this::showMerchantRules))
+                        () -> currentApi().archiveMerchantRule(rule.id), this::showMerchantRules))
                 .show();
     }
 
@@ -2285,7 +2385,7 @@ public final class MainActivity extends Activity {
         }
         addStatusCard(
                 "Ask before spending",
-                "Choose the category and amount. We'll sync your connected bank before checking your budget and upcoming bills.",
+                "Choose the category and amount. We'll use today's bank sync, syncing if needed, then check your budget and upcoming bills.",
                 COLOR_SURFACE_ALT,
                 COLOR_PRIMARY_DARK
         );
@@ -2325,10 +2425,10 @@ public final class MainActivity extends Activity {
     }
 
     private void checkSafeToSpend(int categoryId, int cents, String purpose) {
-        showLoading("Syncing bank data and checking safe to spend...");
+        showLoading("Checking safe to spend; syncing bank data if needed...");
         FamilyFinanceApi requestApi = api;
         int monthId = budgetMonthId;
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
                 SafeToSpendResult result = requestApi.syncAndCheckSafeToSpend(monthId, categoryId, cents);
                 postIfActive(() -> refreshData(() -> renderSafeToSpendResult(result, purpose)));
@@ -2377,11 +2477,11 @@ public final class MainActivity extends Activity {
             return;
         }
         showLoading("Loading settings...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                JSONObject accountSettings = api.getAccountSettings();
-                AppDiagnostics diagnostics = api.getDiagnostics();
-                JSONObject loadedBankStatus = budgetMonthId > 0 ? api.getBankStatus(budgetMonthId) : new JSONObject();
+                JSONObject accountSettings = currentApi().getAccountSettings();
+                AppDiagnostics diagnostics = currentApi().getDiagnostics();
+                JSONObject loadedBankStatus = budgetMonthId > 0 ? currentApi().getBankStatus(requestMonthId()) : new JSONObject();
                 List<CashAccount> loadedBankAccounts = new ArrayList<>();
                 JSONArray accountArray = loadedBankStatus.optJSONArray("accounts");
                 if (accountArray != null) {
@@ -2404,12 +2504,125 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void addDemoSetting() {
+        addSection("Demo mode");
+        Switch toggle = new Switch(this);
+        toggle.setText("Use dummy account data");
+        toggle.setChecked(demoMode);
+        toggle.setOnCheckedChangeListener((button, enabled) -> {
+            if (enabled) startDemoMode();
+            else leaveDemoMode();
+        });
+        root.addView(toggle);
+        addBody("Demo changes are cleared when you leave demo mode. Your real household stays separate.");
+    }
+
+    private void startDemoMode() {
+        if (!demoMode && !preferences().getStringSet(uncertainWritesKey(), new HashSet<>()).isEmpty()) {
+            showSettings();
+            toast("Check the previous account update before starting a demo.");
+            return;
+        }
+        if (!demoMode && hasPendingFundAction()) {
+            showLoading("Loading the fund request that needs confirmation...");
+            refreshData(() -> {
+                showFunds();
+                toast("Confirm your pending fund request before starting a demo.");
+            });
+            return;
+        }
+        if (demoMode) demoStore.leave();
+        advanceSession();
+        clearFinancialData();
+        loadPreferences();
+        if (authToken == null || authToken.isEmpty()) {
+            showLogin("Log in to your real account before starting a private demo.");
+            return;
+        }
+        String origin = baseUrl;
+        showLoading("Preparing a fresh fictional household...");
+        executeForSession(() -> {
+            try {
+                JSONObject started = currentApi().startDemo();
+                postIfActive(() -> {
+                    if (!demoStore.enter(started, origin)) {
+                        cleanupExecutor.execute(() -> {
+                            try { FamilyFinanceApi.demo(origin, started.optString("token")).exitDemo(); }
+                            catch (Exception ignored) { /* Server expiry still bounds the discarded session. */ }
+                        });
+                        showError("Could not save demo session", new IllegalStateException("Please try starting demo mode again."));
+                        return;
+                    }
+                    advanceSession();
+                    clearFinancialData();
+                    loadPreferences();
+                    showLoading("Loading demo data...");
+                    refreshData(this::showDashboard);
+                    retryDemoCleanup();
+                });
+            } catch (Exception exception) {
+                postIfActive(() -> showError("Could not start demo mode", exception));
+            }
+        });
+    }
+
+    private void leaveDemoMode() {
+        if (!demoMode) return;
+        // Exit is local immediately, even offline or while a demo request is finishing.
+        // The old task keeps its own API and preferences; its UI callbacks are fenced.
+        advanceSession();
+        demoStore.leave();
+        clearFinancialData();
+        loadPreferences();
+        retryDemoCleanup();
+        if (authToken == null || authToken.isEmpty()) {
+            showLogin("Demo ended and its changes were discarded. Log in to your real account.");
+        } else {
+            showLoading("Demo ended. Loading your real household...");
+            refreshData(this::showDashboard);
+        }
+    }
+
+    private void handleDemoExpired() {
+        advanceSession();
+        clearFinancialData();
+        beginScreen("Demo session ended");
+        addBody("This temporary demo expired or the server restarted. Start a fresh demo to continue with new sample data.");
+        addButton("Start a fresh demo", this::startDemoMode);
+        addSecondaryButton("Return to my real account", this::leaveDemoMode);
+    }
+
+    private void retryDemoCleanup() {
+        List<DemoModeStore.Cleanup> abandoned = demoStore.pendingCleanup();
+        if (abandoned.isEmpty()) return;
+        cleanupExecutor.execute(() -> {
+            for (DemoModeStore.Cleanup item : abandoned) {
+                boolean finished = item.token.isEmpty() || item.origin.isEmpty();
+                if (!finished) {
+                    try { FamilyFinanceApi.demo(item.origin, item.token).exitDemo(); finished = true; }
+                    catch (ApiException exception) { finished = exception.status == 401 || exception.status == 404; }
+                }
+                if (finished) mainHandler.post(() -> demoStore.cleanupFinished(item.scope));
+            }
+        });
+    }
+
     private void renderSettings(JSONObject accountSettings, AppDiagnostics diagnostics, String errorMessage) {
         beginScreen("Accounts / Settings");
+        addDemoSetting();
+        String uncertainKey = uncertainWritesKey();
+        if (!demoMode && !preferences().getStringSet(uncertainKey, new HashSet<>()).isEmpty()) {
+            addWarning("An account update lost its response. Check the affected budget, transactions or settings before entering demo mode; the change may already have been saved.");
+            if (accountSettings != null) addSecondaryButton("I've checked the saved account changes", () -> {
+                preferences().edit().remove(uncertainKey).commit();
+                renderSettings(accountSettings, diagnostics, errorMessage);
+            });
+        }
         addCelebrationSetting();
         if (errorMessage != null && !errorMessage.trim().isEmpty()) {
             addWarning("Could not load diagnostics: " + errorMessage);
         }
+        if (!demoMode) {
         addSection("Backend connection");
         EditText baseUrlInput = new EditText(this);
         baseUrlInput.setHint("Backend URL");
@@ -2466,6 +2679,7 @@ public final class MainActivity extends Activity {
             showLoading("Reloading...");
             refreshData(this::showDashboard);
         });
+        }
         addButton("Refresh diagnostics", this::showSettings);
 
         addSection("Account");
@@ -2487,14 +2701,15 @@ public final class MainActivity extends Activity {
             }
             runMutation(
                     "Updating display name...",
-                    () -> api.updateDisplayName(displayName),
+                    () -> currentApi().updateDisplayName(displayName),
                     () -> {
                         currentUserName = displayName;
-                        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("current_user_name", displayName).apply();
+                        preferences().edit().putString("current_user_name", displayName).apply();
                         showSettings();
                     }
             );
         });
+        if (!demoMode) {
         EditText currentPasswordInput = new EditText(this);
         currentPasswordInput.setHint("Current password");
         currentPasswordInput.setSingleLine(true);
@@ -2518,7 +2733,7 @@ public final class MainActivity extends Activity {
             }
             runMutation(
                     "Changing password...",
-                    () -> api.changePassword(currentPassword, newPassword),
+                    () -> currentApi().changePassword(currentPassword, newPassword),
                     () -> {
                         clearSession();
                         showLogin("Password changed. Log in again with your new password.");
@@ -2526,34 +2741,37 @@ public final class MainActivity extends Activity {
             );
         });
         addDangerButton("Log out", this::logout);
+        } else {
+            addBody("Password and server settings belong to your real account. Leave demo mode to manage them.");
+        }
 
-        addSection("USAA bank connection");
-        if (BuildConfig.BANK_LINKING_ENABLED && bankStatus.optBoolean("enabled")) {
-            addButton(bankStatus.optBoolean("connected") ? "Reconnect USAA" : "Connect USAA with Plaid", this::preparePlaidLink);
+        addSection(demoMode ? "Demo bank connection" : "USAA bank connection");
+        if ((demoMode || BuildConfig.BANK_LINKING_ENABLED) && bankStatus.optBoolean("enabled")) {
+            addButton(demoMode ? "Reconnect demo bank" : bankStatus.optBoolean("connected") ? "Reconnect USAA" : "Connect USAA with Plaid", this::preparePlaidLink);
             if (bankStatus.optBoolean("connected")) {
                 addButton("Request fresh bank data", this::requestFreshBankData);
-                addBody("Ask USAA through Plaid for a newer bank update, then import what becomes available. It may take a minute or longer.");
+                addBody(demoMode ? "Request an update from the simulated bank and import available fictional transactions." : "Ask USAA through Plaid for a newer bank update, then import what becomes available. It may take a minute or longer.");
                 JSONObject refresh = bankStatus.optJSONObject("refresh");
                 if (refresh != null) {
                     if (!refresh.isNull("requested_at")) addFact("Fresh data requested (UTC)", refresh.optString("requested_at"));
                     if (!refresh.optString("message").isEmpty()) addBody(refresh.optString("message"));
                     int retrySeconds = refresh.optInt("retry_after_seconds");
                     if (retrySeconds > 0) addBody("Another fresh request can be made in about " + retrySeconds
-                            + " seconds. Dashboard Sync remains available while USAA updates.");
+                            + (demoMode ? " seconds. Sync remains available while the demo bank updates." : " seconds. Dashboard Sync remains available while USAA updates."));
                 }
             }
             addFact("Balances checked (UTC)", bankStatus.optString("balance_checked_at", "Not checked"));
             addFact("Transactions downloaded (UTC)", bankStatus.optString("transactions_checked_at", "Not downloaded"));
             addFact("Bank transaction update", bankStatus.optString("transactions_updated_at", "Unavailable"));
             addFact("History complete", bankStatus.optBoolean("history_complete") ? "Yes" : "Waiting for bank history");
-            addBody("Reconnect renews or repairs USAA authorization. Dashboard Sync checks balances and imports transactions Plaid already has. Refresh household data reads saved app data.");
+            addBody(demoMode ? "Reconnect repairs the simulated connection. Sync imports fictional bank activity using the normal bank pipeline." : "Reconnect renews or repairs USAA authorization. Dashboard Sync checks balances and imports transactions Plaid already has. Refresh household data reads saved app data.");
             JSONArray issues = bankStatus.optJSONArray("issues");
             if (issues != null) for (int i=0; i<issues.length(); i++) addWarning(issues.optString(i));
-            addBody("Before confirming, compare each included account's available and current balances and recent posted/pending transactions with USAA. Review transfers, refunds, duplicate manual entries, and bills already paid. Bank data does not automatically mark bills paid or record income in your plan.");
+            addBody(demoMode ? "Review the fictional balances and transactions, transfers, refunds and bills before confirming this demo month." : "Before confirming, compare each included account's available and current balances and recent posted/pending transactions with USAA. Review transfers, refunds, duplicate manual entries, and bills already paid. Bank data does not automatically mark bills paid or record income in your plan.");
             if (bankStatus.optBoolean("can_reconcile")) {
-                addButton("I compared USAA and confirmed this month's data", () -> runMutation(
+                addButton(demoMode ? "I reviewed and confirmed this demo month" : "I compared USAA and confirmed this month's data", () -> runMutation(
                         "Saving bank reconciliation...",
-                        () -> api.reconcileBank(budgetMonthId, bankStatus.optString("revision")),
+                        () -> currentApi().reconcileBank(budgetMonthId, bankStatus.optString("revision")),
                         () -> refreshData(this::showSettings)));
             }
             addFact("Reconciled this month", bankStatus.optBoolean("reconciled") ? "Yes" : "No");
@@ -2577,7 +2795,7 @@ public final class MainActivity extends Activity {
                         account.includedInCashReality ? "Exclude " + account.name : "Include " + account.name,
                         () -> runMutation(
                                 "Updating account inclusion...",
-                                () -> api.setAccountIncluded(account.id, !account.includedInCashReality),
+                                () -> currentApi().setAccountIncluded(account.id, !account.includedInCashReality),
                                 () -> refreshData(this::showSettings)
                         )
                 );
@@ -2587,11 +2805,18 @@ public final class MainActivity extends Activity {
     }
 
     private void preparePlaidLink() {
+        if (demoMode) {
+            runMutation("Reconnecting demo bank...", () -> {
+                currentApi().createPlaidLinkToken();
+                currentApi().exchangePlaidPublicToken(requestMonthId(), "demo-bank-confirmed");
+            }, () -> refreshData(this::showSettings));
+            return;
+        }
         repairingBank = bankStatus.optBoolean("connected");
         showLoading("Preparing USAA connection...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                String linkToken = api.createPlaidLinkToken();
+                String linkToken = currentApi().createPlaidLinkToken();
                 if (linkToken == null || linkToken.trim().isEmpty()) {
                     throw new IllegalStateException("Backend did not return a Plaid link token.");
                 }
@@ -2603,6 +2828,8 @@ public final class MainActivity extends Activity {
     }
 
     private void openPlaidLink(String linkToken) {
+        if (demoMode) return;
+        plaidGeneration = sessionGeneration.current();
         try {
             plaidHandler = Plaid.create(
                     getApplication(),
@@ -2618,9 +2845,9 @@ public final class MainActivity extends Activity {
 
     private void exchangePlaidPublicToken(String publicToken) {
         showLoading("Connecting Plaid account...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                api.exchangePlaidPublicToken(budgetMonthId, publicToken);
+                currentApi().exchangePlaidPublicToken(budgetMonthId, publicToken);
                 postIfActive(() -> refreshData(this::showSettings));
             } catch (Exception exception) {
                 postIfActive(() -> showError("Plaid public token exchange failed", exception));
@@ -2632,9 +2859,9 @@ public final class MainActivity extends Activity {
         if (bankActionRunning) return;
         bankActionRunning = true;
         showLoading("Importing available bank data...");
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
-                api.syncAvailableBankData(budgetMonthId);
+                currentApi().syncAvailableBankData(requestMonthId());
                 postIfActive(() -> {
                     bankActionRunning = false;
                     refreshData(this::showDashboard);
@@ -2642,7 +2869,7 @@ public final class MainActivity extends Activity {
             } catch (Exception exception) {
                 postIfActive(() -> {
                     bankActionRunning = false;
-                    showError("Plaid sync failed", exception);
+                    showError("Bank sync failed", exception);
                 });
             }
         });
@@ -2651,11 +2878,11 @@ public final class MainActivity extends Activity {
     private void requestFreshBankData() {
         if (bankActionRunning) return;
         bankActionRunning = true;
-        showLoading("Asking USAA for a newer bank update. This may take a minute...");
-        executor.execute(() -> {
+        showLoading(demoMode ? "Requesting a simulated bank update..." : "Asking USAA for a newer bank update. This may take a minute...");
+        executeForSession(() -> {
             try {
-                BankRefreshStatus result = api.requestFreshBankData(budgetMonthId, status -> postIfActive(() ->
-                        showLoading("Importing available changes and checking again shortly. USAA transactions can take time to reach Plaid...")));
+                BankRefreshStatus result = currentApi().requestFreshBankData(requestMonthId(), status -> postIfActive(() ->
+                        showLoading(demoMode ? "Importing fictional bank changes..." : "Importing available changes and checking again shortly. USAA transactions can take time to reach Plaid...")));
                 postIfActive(() -> {
                     bankActionRunning = false;
                     refreshData(() -> showFreshBankResult(result));
@@ -2666,7 +2893,7 @@ public final class MainActivity extends Activity {
                     if (handleExpiredSession(exception)) return;
                     beginScreen("Fresh Bank Data");
                     addStatusCard("The fresh-data check could not finish", userFacingError(exception), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
-                    addBody("A request may already have reached USAA. Dashboard Sync can check available data without sending another fresh request.");
+                    addBody(demoMode ? "A request may already have reached the simulated bank. Sync can check available data." : "A request may already have reached USAA. Dashboard Sync can check available data without sending another fresh request.");
                     addButton("Sync on dashboard", this::syncPlaidItems);
                     addSecondaryButton("Accounts / Settings", this::showSettings);
                 });
@@ -2677,11 +2904,12 @@ public final class MainActivity extends Activity {
     private void showFreshBankResult(BankRefreshStatus result) {
         beginScreen("Fresh Bank Data");
         String title = result.isChecked() ? "Available data imported"
-                : result.isFailed() ? "Fresh request needs attention" : "USAA may still be updating";
+                : result.isFailed() ? "Fresh request needs attention" : demoMode ? "Demo bank update pending" : "USAA may still be updating";
         String detail = result.isChecked()
                 ? "Imported the latest transactions Plaid has made available. New USAA transactions can still take time to appear."
                 : result.isFailed() ? result.message
                 : "Available data has been imported. Fresh USAA transactions may still be on their way. Sync again in about a minute if transactions are missing.";
+        if (demoMode && !result.isFailed()) detail = result.isChecked() ? "Imported available fictional bank activity." : "The simulated bank update is pending. Sync again to check available data.";
         addStatusCard(title, detail, result.isFailed() ? COLOR_WARNING_BG : COLOR_SURFACE_ALT,
                 result.isFailed() ? COLOR_WARNING_TEXT : COLOR_PRIMARY_DARK);
         if (!result.message.isEmpty() && !result.isFailed()) addBody(result.message);
@@ -2765,22 +2993,47 @@ public final class MainActivity extends Activity {
         if (!notification.isRead()) {
             addButton("Mark read", () -> runMutation(
                     "Marking notification read...",
-                    () -> api.markNotificationRead(notification.id),
+                    () -> currentApi().markNotificationRead(notification.id),
                     () -> refreshData(this::showNotifications)
             ));
         }
     }
 
     private void runMutation(String loadingMessage, ThrowingRunnable operation, Runnable onSuccess) {
+        String markerKey = uncertainWritesKey();
+        String requestId = UUID.randomUUID().toString();
+        Set<String> pending = new HashSet<>(preferences().getStringSet(markerKey, new HashSet<>()));
+        pending.add(requestId);
+        if (!preferences().edit().putStringSet(markerKey, pending).commit()) {
+            toast("Could not safely record this update. Please retry.");
+            return;
+        }
         showLoading(loadingMessage);
-        executor.execute(() -> {
+        executeForSession(() -> {
             try {
                 operation.run();
+                clearWriteMarker(markerKey, requestId);
                 postIfActive(onSuccess);
             } catch (Exception exception) {
+                if (exception instanceof ApiException) {
+                    int status = ((ApiException) exception).status;
+                    if (status >= 400 && status < 500 && status != 401 && status != 408 && status != 429) {
+                        clearWriteMarker(markerKey, requestId);
+                    }
+                }
                 postIfActive(() -> showError("Update failed", exception));
             }
         });
+    }
+
+    private String uncertainWritesKey() {
+        return "unconfirmed_account_updates:" + baseUrl + ":" + householdId + ":" + currentUserId;
+    }
+
+    private void clearWriteMarker(String key, String requestId) {
+        Set<String> pending = new HashSet<>(preferences().getStringSet(key, new HashSet<>()));
+        pending.remove(requestId);
+        preferences().edit().putStringSet(key, pending).commit();
     }
 
     private void beginScreen(String title) {
@@ -2792,19 +3045,49 @@ public final class MainActivity extends Activity {
                 keyboard.hideSoftInputFromWindow(focus.getWindowToken(), 0);
             }
         }
-        ScrollView scrollView = new ScrollView(this);
-        scrollView.setFillViewport(true);
-        scrollView.setOnApplyWindowInsetsListener((view, insets) -> {
+        LinearLayout frame = new LinearLayout(this);
+        frame.setOrientation(LinearLayout.VERTICAL);
+        frame.setOnApplyWindowInsetsListener((view, insets) -> {
             view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
                     insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
             return insets;
         });
-        scrollView.setBackgroundColor(COLOR_BACKGROUND);
+        frame.setBackgroundColor(COLOR_BACKGROUND);
+        if (demoMode) {
+            LinearLayout banner = new LinearLayout(this);
+            banner.setOrientation(LinearLayout.HORIZONTAL);
+            banner.setGravity(Gravity.CENTER_VERTICAL);
+            banner.setPadding(dp(18), dp(4), dp(12), dp(4));
+            banner.setBackgroundColor(COLOR_GOLD_BG);
+            TextView label = displayText("DEMO DATA", 16, COLOR_GOLD_TEXT, LABEL_FONT);
+            label.setContentDescription("Demo data. All account data is fictional.");
+            banner.addView(label, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+            Button exit = new Button(this);
+            exit.setText("Exit demo");
+            exit.setAllCaps(false);
+            exit.setTypeface(LABEL_FONT);
+            exit.setTextSize(14);
+            exit.setTextColor(COLOR_PRIMARY_DARK);
+            exit.setMinHeight(dp(48));
+            exit.setMinimumHeight(dp(48));
+            exit.setPadding(dp(16), dp(8), dp(16), dp(8));
+            exit.setStateListAnimator(null);
+            exit.setElevation(0);
+            exit.setBackgroundTintList(null);
+            exit.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33246449),
+                    rounded(COLOR_SURFACE_ALT, COLOR_BORDER, 12), null));
+            exit.setOnClickListener(view -> leaveDemoMode());
+            banner.addView(exit);
+            frame.addView(banner);
+        }
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setFillViewport(true);
         root = new StyledLinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(18), dp(22), dp(18), dp(24));
         scrollView.addView(root);
-        setContentView(scrollView);
+        frame.addView(scrollView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        setContentView(frame);
         TextView heading = new TextView(this);
         heading.setText(title);
         heading.setTextColor(COLOR_PRIMARY_DARK);
@@ -2816,7 +3099,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showLoading(String message) {
-        beginScreen("Family Finance");
+        beginScreen(getString(R.string.app_name));
         ProgressBar progress = new ProgressBar(this);
         progress.setIndeterminateTintList(ColorStateList.valueOf(COLOR_PRIMARY));
         progress.setContentDescription(message);
@@ -3316,6 +3599,7 @@ public final class MainActivity extends Activity {
 
     private boolean handleExpiredSession(Exception exception) {
         if (exception instanceof ApiException && ((ApiException) exception).status == 401) {
+            if (demoMode) { handleDemoExpired(); return true; }
             clearSession();
             showLogin("Your session expired. Log in again to load your household data.");
             return true;
@@ -3362,7 +3646,7 @@ public final class MainActivity extends Activity {
         String scope = baseUrl + ":" + householdId + ":" + currentUserId + ":";
         lastDateKey = scope + lastDateKey;
         streakKey = scope + streakKey;
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        SharedPreferences prefs = preferences();
         String today = LocalDate.now().toString();
         String lastDate = prefs.getString(lastDateKey, "");
         int currentStreak = prefs.getInt(streakKey, 0);
@@ -3386,7 +3670,7 @@ public final class MainActivity extends Activity {
     private CheckInStreak recordBudgetCheckInStreak(LocalDate today) {
         // Keep the existing scope and keys so an app update preserves each person's streak.
         String scope = baseUrl + ":" + householdId + ":" + currentUserId + ":";
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        SharedPreferences prefs = preferences();
         String previousDate = prefs.getString(scope + PREF_LAST_BUDGET_CHECK_DATE, "");
         int previousDays = prefs.getInt(scope + PREF_BUDGET_CHECK_STREAK, 0);
         int previousBest = prefs.getInt(scope + PREF_BEST_BUDGET_CHECK_STREAK, 0);
@@ -3412,7 +3696,7 @@ public final class MainActivity extends Activity {
 
     private void celebrate(String message, boolean milestone) {
         toast(message);
-        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(celebrationPreferenceKey(), true)) {
+        if (preferences().getBoolean(celebrationPreferenceKey(), true)) {
             CelebrationOverlay.show(this, milestone);
         }
     }
@@ -3429,7 +3713,7 @@ public final class MainActivity extends Activity {
         addSection("Make it yours");
         CheckBox animations = new CheckBox(this);
         animations.setText("Celebrate my progress");
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        SharedPreferences prefs = preferences();
         String key = celebrationPreferenceKey();
         animations.setChecked(prefs.getBoolean(key, true));
         animations.setOnCheckedChangeListener((button, enabled) -> prefs.edit().putBoolean(key, enabled).apply());

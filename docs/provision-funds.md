@@ -1,6 +1,8 @@
 # Provision funds
 
-This milestone adds named funds beneath Combined Monthly Provision for irregular household expenses. The combined `codex/provision-funds` release includes [bank sync controls and transaction review improvements](bank-sync-controls.md). Daniel authorized commit and deployment September 23; backend deployment and household setup are pending.
+This milestone adds named funds beneath Combined Monthly Provision for irregular household expenses. The combined `codex/provision-funds` release includes [bank sync controls and transaction review improvements](bank-sync-controls.md). Daniel authorized commit and deployment September 23; backend deployment and household setup completed that day. [PR #22](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/22) is now merged into `main` at `d5e524a`; the deployed baseline uses schema 5. The ignored operational handoff retains the dated preservation evidence.
+
+The later [Ledger update](ledger-daily-sync.md), authorized for rollout September 29 with deployment verification pending, removes next-month planning, completed transaction review and monthly reconciliation as contribution prerequisites. It uses same-day bank data, keeps cash/reserve/recorded-bill protection, and syncs automatically when a contribution needs current data.
 
 ## Household workflow
 
@@ -37,7 +39,9 @@ Schema 4 adds fund records and history without reseeding the household, changing
 
 Before commit approval, verify targeted fund accounting and authenticated route tests, the full backend suite, Android unit tests and debug build, and a practical synthetic flow through contribution, purchase, carryover and protected cash. Include schema upgrade preservation, cross-household denial, duplicate requests, bank corrections, refunds, split transactions, excluded backing and funded upcoming bills.
 
-Production deployment and household setup follow review. Preserve the existing service, database, recovery key, Plaid Item and Android signing identity; use the running service's verified recovery key for a fresh backup, as documented in `stage-2-usaa-plaid.md` and the ignored operational handoff. Do not use the known-different SSH key environment blindly.
+The Ledger update also includes [in-app Demo mode](demo-mode-plan.md). Its funded fictional funds must use real contribution entries and the shared accounting, rather than injected balances. Any fund/schema/rule change must update the demo seed as needed and verify contribution/retry, release/move, purchase/refund and protected cash through the normal demo APIs. Confirm leaving/reentering discards edits and that no real fund or account is touched; use the feature-parity checklist in the demo document. Earlier milestone results below do not establish demo-mode acceptance.
+
+Production deployment and the one-time household setup completed September 23; do not repeat setup for later releases. Preserve the existing service, database, recovery key, Plaid Item and Android signing identity; use the running service's verified recovery key for a fresh backup, as documented in `stage-2-usaa-plaid.md` and the ignored operational handoff. Do not use the known-different SSH key environment blindly.
 
 ## Local verification, September 23, 2026
 

@@ -55,7 +55,7 @@ class LivePlaidClient(PlaidSandboxClient):
             raise PlaidIntegrationError("Bank response could not be read. Retry later.", "PLAID_RESPONSE_ERROR") from None
 
     def link_token(self, household_id, access_token=None):
-        payload = {"client_name": "Family Finance", "country_codes": ["US"], "language": "en",
+        payload = {"client_name": "Ledger", "country_codes": ["US"], "language": "en",
                    "user": {"client_user_id": f"household-{household_id}"},
                    "android_package_name": self.ANDROID_PACKAGE_NAME}
         if access_token:

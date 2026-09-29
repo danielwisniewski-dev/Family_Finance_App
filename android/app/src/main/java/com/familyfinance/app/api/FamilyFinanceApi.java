@@ -35,6 +35,18 @@ public final class FamilyFinanceApi {
         this(new JsonHttpClient(baseUrl, bearerToken));
     }
 
+    public static FamilyFinanceApi demo(String baseUrl, String demoToken) {
+        return new FamilyFinanceApi(new JsonHttpClient(baseUrl, demoToken, true));
+    }
+
+    public JSONObject startDemo() throws ApiException {
+        return client.post("/demo/start", new JSONObject());
+    }
+
+    public void exitDemo() throws ApiException {
+        client.post("/exit", new JSONObject());
+    }
+
     FamilyFinanceApi(JsonHttpClient client) {
         this.client = client;
     }
@@ -136,7 +148,20 @@ public final class FamilyFinanceApi {
     }
 
     public void applyFundAction(PendingFundAction action) throws Exception {
-        client.post("/funds/" + action.fundId + (action.transfer ? "/transfer" : "/entries"), action.payload());
+        String path = "/funds/" + action.fundId + (action.transfer ? "/transfer" : "/entries");
+        JSONObject payload = action.payload();
+        try {
+            // Post first so a previously applied request can replay even after
+            // midnight or a bank outage, without requiring another bank call.
+            client.post(path, payload);
+        } catch (ApiException exception) {
+            if (action.transfer || !"contribution".equals(payload.optString("kind"))
+                    || exception.status != 400 || !"bank_sync_required".equals(exception.code)) throw exception;
+            syncBankIfNeeded(payload.getInt("budget_month_id"), true);
+            // This explicit rejection made no financial change. Keep the same
+            // request key, retry once, and let the backend recheck available cash.
+            client.post(path, payload);
+        }
     }
 
     public List<BudgetMonth> getBudgetMonths() throws ApiException {
@@ -670,6 +695,11 @@ public final class FamilyFinanceApi {
     public SafeToSpendResult syncAndCheckSafeToSpend(
             int budgetMonthId, int categoryId, int purchaseAmountCents
     ) throws ApiException {
+        syncBankIfNeeded(budgetMonthId, false);
+        return safeToSpend(budgetMonthId, categoryId, purchaseAmountCents);
+    }
+
+    private void syncBankIfNeeded(int budgetMonthId, boolean force) throws ApiException {
         // Read current connection state instead of relying on the dashboard's cached snapshot.
         JSONObject status = getBankStatus(budgetMonthId);
         if (!(status.opt("enabled") instanceof Boolean)) {
@@ -687,14 +717,15 @@ public final class FamilyFinanceApi {
                     }
                 }
             }
-            if (itemIds.isEmpty()) throw new ApiException("Connect USAA in Accounts / Settings before checking safe to spend.");
+            if (itemIds.isEmpty()) throw new ApiException("Connect USAA in Accounts / Settings before using bank cash.");
+            // The backend owns the household calendar and freshness policy.
+            // Older backends without this flag retain the existing sync behavior.
+            if (!force && Boolean.FALSE.equals(status.opt("sync_required"))) return;
             for (int itemId : itemIds) {
                 syncPlaid(itemId, "balance");
                 syncPlaid(itemId, "transaction");
             }
         }
-        // The backend still enforces review, reconciliation, freshness, and all spending rules.
-        return safeToSpend(budgetMonthId, categoryId, purchaseAmountCents);
     }
 
     public void markNotificationRead(int notificationId) throws ApiException {
