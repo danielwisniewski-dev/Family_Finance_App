@@ -4,6 +4,24 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from .bank_refresh import status_for_row
+from .dates import household_date_at
+
+
+class BankSyncRequiredError(ValueError):
+    """A contribution was not applied and may be retried after a bank sync."""
+
+
+def synced_today(value, *, now=None):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return stamp <= now and household_date_at(stamp) == household_date_at(now)
+    except (ValueError, TypeError, OverflowError):
+        return False
 
 
 def recent(value, seconds):
@@ -35,21 +53,27 @@ def bank_status(repository, month_id):
     enabled = repository.settings.plaid_enabled
     issues = []
     if enabled and not rows:
-        issues.append("Connect USAA before using safe-to-spend.")
+        issues.append("Connect your bank before using safe-to-spend.")
     if enabled and not any(a.plaid_item_id and a.included_in_cash_reality for a in accounts):
-        issues.append("Choose which USAA accounts fund household spending.")
+        issues.append("Choose which bank accounts fund household spending.")
     if enabled and any(not a.plaid_item_id and a.included_in_cash_reality for a in accounts):
-        issues.append("Exclude manually entered accounts that duplicate your USAA cash.")
+        issues.append("Exclude manually entered accounts that duplicate your connected bank cash.")
+    sync_issues = []
+    now = datetime.now(timezone.utc)
     for row in rows:
-        if row["balance_error"] or not recent(row["balance_checked_at"], 900):
-            issues.append("Sync bank balances; the last successful check must be within 15 minutes.")
-        if (row["transaction_error"] or not recent(row["transactions_checked_at"], 900)
+        if row["balance_error"] or not synced_today(row["balance_checked_at"], now=now):
+            sync_issues.append("Sync bank balances; a successful check from today is required.")
+        if (row["transaction_error"] or not synced_today(row["transactions_checked_at"], now=now)
                 or not recent(row["transactions_updated_at"], 86400) or not row["history_complete"]):
-            issues.append("Sync transactions and wait for complete history. Bank transaction data must be less than 24 hours old.")
+            sync_issues.append("Sync transactions today and wait for complete history. Bank transaction data must be less than 24 hours old.")
     for a in accounts:
         if a.plaid_item_id and a.included_in_cash_reality:
-            if a.available_balance_cents is None or not recent(a.last_balance_synced_at, 900):
-                issues.append("An included account lacks a recent available balance. Check USAA and retry.")
+            if a.available_balance_cents is None or not synced_today(a.last_balance_synced_at, now=now):
+                sync_issues.append("An included account lacks an available balance checked today. Sync your bank and retry.")
+    issues.extend(sync_issues)
+    # Earmarking existing cash does not require a completed review queue or the
+    # spending-check reconciliation. Available cash and recorded bills still apply.
+    funding_issues = list(dict.fromkeys(issues))
     unreviewed = sum(not t["ignored"] and t["amount_cents"] < 0 and (not t["reviewed"] or not t["assigned"]) for t in txns)
     if enabled and unreviewed:
         issues.append("Review imported spending, transfers, and possible manual duplicates before using safe-to-spend.")
@@ -66,6 +90,8 @@ def bank_status(repository, month_id):
             "connection_id": rows[0]["plaid_item_id"] if rows else None,
             "ready": enabled and not issues and reconciled, "reconciled": reconciled,
             "revision": revision, "issues": list(dict.fromkeys(issues)), "unreviewed_spending": unreviewed,
+            "sync_required": enabled and (not rows or bool(sync_issues)),
+            "funding_issues": funding_issues,
             "balance_checked_at": rows[0]["balance_checked_at"] if rows else None,
             "transactions_checked_at": rows[0]["transactions_checked_at"] if rows else None,
             "transactions_updated_at": rows[0]["transactions_updated_at"] if rows else None,
@@ -75,13 +101,13 @@ def bank_status(repository, month_id):
 
 
 def reconcile_bank(repository, month_id, revision):
-    # The HTTP user has explicitly compared USAA with the displayed account balances,
+    # The HTTP user has explicitly compared their bank with the displayed account balances,
     # transaction dates/amounts, transfers/refunds and upcoming bills.
     with repository.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         status = bank_status(repository, month_id)
         if not status["can_reconcile"] or status["revision"] != revision:
-            raise ValueError("Bank data changed or needs attention. Refresh and compare USAA again.")
+            raise ValueError("Bank data changed or needs attention. Refresh and compare your bank again.")
         conn.execute("UPDATE bank_sync_state SET reconciled_at=CURRENT_TIMESTAMP, reconciled_month=(SELECT month FROM budget_months WHERE id=?) WHERE plaid_item_id IN (SELECT id FROM plaid_items WHERE household_id=?)",
                      (month_id, repository.household_id_for_budget_month(month_id)))
     return bank_status(repository, month_id)
@@ -103,4 +129,14 @@ def require_bank_ready(repository, month_id, today):
     if month != today.strftime("%Y-%m"):
         raise ValueError("Use the current budget month for safe-to-spend with live balances.")
     if not status["ready"]:
-        raise ValueError(status["issues"][0] if status["issues"] else "Compare USAA balances and transactions, then confirm reconciliation in Settings.")
+        raise ValueError(status["issues"][0] if status["issues"] else "Compare bank balances and transactions, then confirm reconciliation in Settings.")
+
+
+def require_funding_bank_ready(repository, month_id):
+    """Require usable bank cash without requiring next month's spending plan."""
+    if not repository.settings.plaid_enabled:
+        return
+    status = bank_status(repository, month_id)
+    if status["funding_issues"]:
+        error = BankSyncRequiredError if status["sync_required"] and status["connected"] else ValueError
+        raise error(status["funding_issues"][0])

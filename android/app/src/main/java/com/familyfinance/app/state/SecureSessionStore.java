@@ -11,9 +11,17 @@ import javax.crypto.SecretKey;
 public final class SecureSessionStore {
     private static final String ALIAS = "family-finance-session-v1";
     private final SharedPreferences preferences;
+    private final String scope;
 
     public SecureSessionStore(Context context) {
-        preferences = context.getSharedPreferences("secure_session", Context.MODE_PRIVATE);
+        this(context, "real");
+    }
+
+    public SecureSessionStore(Context context, String scope) {
+        if (!scope.matches("[A-Za-z0-9_-]+")) throw new IllegalArgumentException("Invalid session scope");
+        this.scope = scope;
+        preferences = context.getSharedPreferences("real".equals(scope) ? "secure_session" : "secure_session_" + scope,
+                Context.MODE_PRIVATE);
     }
 
     private SecretKey key() throws Exception {
@@ -31,7 +39,7 @@ public final class SecureSessionStore {
 
     public boolean save(String token, String origin) {
         try {
-            return preferences.edit().putString("token", SessionCipher.encrypt(key(), token, origin)).commit();
+            return preferences.edit().putString("token", SessionCipher.encrypt(key(), token, boundOrigin(origin))).commit();
         } catch (Exception exception) {
             clear();
             return false;
@@ -41,11 +49,16 @@ public final class SecureSessionStore {
     public String load(String origin) {
         String sealed = preferences.getString("token", "");
         if (sealed.isEmpty()) return "";
-        try { return SessionCipher.decrypt(key(), sealed, origin); }
+        try { return SessionCipher.decrypt(key(), sealed, boundOrigin(origin)); }
         catch (Exception exception) { clear(); return ""; }
     }
 
     public void clear() {
         preferences.edit().clear().commit();
+    }
+
+    private String boundOrigin(String origin) {
+        // Preserve existing real sessions; demo ciphertext is additionally bound to its unique scope.
+        return "real".equals(scope) ? origin : origin + "|" + scope;
     }
 }

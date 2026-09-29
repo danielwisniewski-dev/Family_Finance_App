@@ -2,7 +2,9 @@
 
 ## Purpose
 
-Current release: [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md), merged in PR #19 and deployed September 12, 2026. Native USAA linking and the user's bank-data comparison passed; Daniel reported the app working well on September 17. Earlier milestone descriptions below remain historical background; the Stage 2 record distinguishes completed checks from acceptance checks not yet individually recorded.
+The September 29 release is [Ledger branding and daily bank sync](ledger-daily-sync.md): the chosen gold L coin icon, the name Ledger, and simpler Provision Funds contributions. Contributions no longer require next month's budget, completed transaction review, or monthly reconciliation. Same-day sync replaces the 15-minute download limit for contributions and spending checks; the spending check's category, review, reconciliation and cross-month bill requirements remain. The login screen now has a separate first-time setup page for connection details and the explained household setup check. Daniel also authorized [in-app Demo mode](demo-mode-plan.md) in this same update: the normal app with fictional data, a persistent banner, working synthetic bank actions, and automatic discard on exit. He authorized committing/publishing the branch, backend deployment and signed APK delivery September 29. Implementation commit `96ce24f438a16d668775bc02209139dc545ca8bd` is deployed with the existing household and bank connection preserved. The signed code-7 APK is verified and ready to install; physical-phone installation remains unverified. PR #23 is open and unmerged, with merge requiring separate approval. The feature/release notes distinguish deployed-runtime synthetic checks from the still-unverified household login/demo switch.
+
+The bank integration baseline is [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md), merged in PR #19 and deployed September 12, 2026. Native USAA linking and the user's bank-data comparison passed; Daniel reported the app working well on September 17. The deployed application baseline before Ledger is the September 23 Provision Funds release described below. Earlier milestone descriptions remain historical background; the Stage 2 record distinguishes completed checks from acceptance checks not yet individually recorded.
 
 The [September interface update](interface-tweaks.md), Android `0.6.1-interface` / code 4, was merged in PR #20 and its backend deployed September 17. It improves the dashboard/streak, transaction review and multi-select, merchant-rule management, notification noise, and automatic bank sync before spending checks. Physical phone acceptance remains unobserved; backend financial checks are preserved.
 
@@ -10,7 +12,7 @@ The approved [warmer interface follow-up](ui-warmth.md), Android `0.6.2-warmth` 
 
 Preserve the live household/database, Plaid connection, and Android signing key. Supporting two or three extended-family households was discussed only as a future possibility; no implementation, extra connections, paid-plan upgrade, or broader onboarding is authorized by that discussion.
 
-The approved [provision funds milestone](provision-funds.md) adds persistent reserves for irregular expenses, explicit funding, itemized plans, and cash protection. The same release includes the [bank sync controls](bank-sync-controls.md): Dashboard Sync, an explicit fresh-bank-data request in Settings, and a distinct authorization reconnect action, plus transaction ordering and quiet review confirmation. Daniel authorized commit and deployment of the combined update September 23; deployment and household setup are pending.
+The [provision funds milestone](provision-funds.md) adds persistent reserves for irregular expenses, explicit funding, itemized plans, and cash protection. The same release includes the [bank sync controls](bank-sync-controls.md): Dashboard Sync, an explicit fresh-bank-data request in Settings, and a distinct authorization reconnect action, plus transaction ordering and quiet review confirmation. Daniel authorized commit and deployment of the combined update September 23; backend deployment and household setup completed that day, preserving the existing household and bank connection. PR #22 is merged into `main` at `d5e524a`. The deployed schema is 5; physical phone installation remains unverified.
 
 Build a private household finance accountability app for Daniel and Kara.
 
@@ -141,6 +143,14 @@ Use this separation:
 - AI agent = advisor/explanation layer, not the owner of budget truth
 
 The AI agent must not invent balances, change budgets silently, or directly own the financial logic.
+
+### Demo mode is part of feature maintenance
+
+Demo mode uses the existing service with a separate disposable database and synthetic bank/mock coach context per authenticated demo session. It shares the real financial domain logic and screens. It must never read or modify the real household's financial data, accept a real token on a demo data route, send a demo token to a real data route, or call live bank/AI providers. Application routing is the isolation boundary; no separate hosted service or paid-plan upgrade is authorized.
+
+The ready-to-use fictional household includes current-date budgets, cash accounts, funded Provision Funds, bills/paydays, transactions and history. Users navigate normally: no scenario selector or reset button. The persistent **DEMO DATA** banner identifies every demo screen. Leaving demo mode discards that session; reentry seeds a fresh household and restores ordinary prerequisites, rather than bypassing them.
+
+Every change to a supported workflow, API/schema, financial rule, provider contract or date/session handling must consider and verify demo parity. Update the seed and synthetic provider alongside the real implementation, keep isolation tests, and use the [maintenance checklist](demo-mode-plan.md#feature-parity-and-maintenance-checklist) in release review. A feature is not complete if its dummy data or normal controls no longer work. Synthetic acceptance supplements, and does not replace, live bank reconciliation.
 
 ---
 
@@ -517,4 +527,5 @@ For each Codex task:
 - Do not build later milestones early.
 - Preserve security/privacy boundaries.
 - Keep deterministic financial logic tested.
+- Keep Demo mode's fictional data, synthetic provider, normal workflows and isolation tests compatible with the same change; follow `demo-mode-plan.md`.
 - Run the full test suite before committing.

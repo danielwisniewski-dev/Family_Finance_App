@@ -1,4 +1,6 @@
-# Family Finance Accountability App
+# Ledger — Household Finance
+
+Android `0.7.1-ledger` / code 7 names the app **Ledger** and adds the selected gold L coin icon. Its backend was deployed September 29 at `96ce24f438a16d668775bc02209139dc545ca8bd`, with the existing household, schema 5, recovery key and bank connection preserved. [PR #23](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/23) is open and unmerged; merge requires separate approval. [Ledger release notes](docs/ledger-daily-sync.md) cover same-day bank sync, streamlined Provision Funds contributions, simpler login and [Demo mode](docs/demo-mode-plan.md). The signed `work/releases/ledger-0.7.1.apk` is verified with the original certificate and ready to install as an update, preserving app data. The artifact lives in the original project workspace, not the separate documentation closeout worktree. Physical-phone installation and a household login/demo switch against the deployed service remain unverified.
 
 The private Android beta is deployed on Render with the Stage 2 USAA/Plaid integration. PR #19 was merged and deployed on September 12, 2026; Daniel confirmed native USAA linking and matching bank data. On September 17 he reported that the app is working well. See [the Stage 2 runbook and acceptance record](docs/stage-2-usaa-plaid.md) for verified results and checks not yet individually recorded.
 
@@ -8,7 +10,7 @@ The previous interface update is Android `0.6.1-interface`, code 4. PR #20 was m
 
 Android `0.6.2-warmth` / code 5 adds warmer colors, distinct typography, household illustrations, confirmed-action celebrations, a tappable notifications card, attention for negative category balances only, and compact budget/sync text. Daniel approved GitHub publication and signed phone delivery September 19. The signed APK is `work/releases/family-finance-0.6.2-warmth.apk`, using the original signing certificate and existing HTTPS backend. See [release notes, installation, and verification](docs/ui-warmth.md). Install it as an update over the existing app; it requires no backend deployment, data migration, or bank reconnection. Physical phone installation has not yet been verified.
 
-Android `0.7.0-provision` / code 6 adds [provision funds](docs/provision-funds.md), [separate USAA sync controls](docs/bank-sync-controls.md), newest-first transactions, and a quieter review queue with categorized items first. Daniel authorized commit and deployment September 23. The signed update uses the original certificate and existing HTTPS backend; backend deployment and household setup are pending. Install `work/releases/family-finance-0.7.0-provision.apk` as an update after backend deployment, preserving the existing app data.
+Android `0.7.0-provision` / code 6 adds [provision funds](docs/provision-funds.md), [separate USAA sync controls](docs/bank-sync-controls.md), newest-first transactions, and a quieter review queue with categorized items first. Daniel authorized commit and deployment September 23; backend deployment and household setup completed that day. [PR #22](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/22) is merged into `main` at `d5e524a`. The signed update uses the original certificate and existing HTTPS backend; `work/releases/family-finance-0.7.0-provision.apk` remains the prior update artifact. Physical phone installation has not been independently observed.
 
 The milestone descriptions below document how the app was built. Preserve the existing hosted household/database, bank connection, and Android signing key when making changes. Broader household access remains deferred.
 
@@ -174,7 +176,7 @@ Do not commit real passwords. The demo credentials below are local-only values f
 
 Stage 1 adds ordered, transactional SQLite migrations with a version ledger. The known local MVP schema is the baseline; upgrades reject future versions and inconsistent history. Hosted startup creates an encrypted recovery archive before upgrading an existing database.
 
-The hosted beta already has an initialized household and a schema 3 database. Never reset or reseed it. For an offline local import, use the copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
+The hosted beta already has an initialized household and a schema 5 database, verified after the September 23 Provision Funds/bank-sync release. Never reset or reseed it. The Ledger update requires no schema change. For an offline local import, use the copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
 
 Deferred by design:
 
@@ -241,6 +243,8 @@ Android manual category assignment sends `reviewed: true`. New selections start 
 
 ## Run Tests
 
+Demo mode is part of normal maintenance. When changing a feature, schema, provider contract or financial rule, update its fictional seed/provider as needed and verify the same workflow in real and demo mode. Use the [demo parity checklist](docs/demo-mode-plan.md#feature-parity-and-maintenance-checklist); do not substitute client-side calculations or relax backend checks to make a demo pass. Release smoke coverage includes switching modes, synthetic Sync, Spending Check, Provision Funds, fresh data after leaving/reentering, and isolation from real data/providers.
+
 Install the backend dependencies from `requirements.txt` into the Python environment used for tests; the hosted HTTP tests require Waitress. A missing test dependency is not a reason to skip those tests.
 
 Use Python from your PATH:
@@ -295,7 +299,7 @@ For a fresh local database, start the API with a new local SQLite path:
 python -m backend.app.api --db work\family_finance.sqlite --host 127.0.0.1 --port 8080
 ```
 
-In Android, open the app with backend URL `http://10.0.2.2:8080`, tap `Check first-run setup`, create the private household and local users, then log in. After login, create the starter budget month if no budget month exists. This setup flow is for the private local MVP only; it is not public signup or production identity management.
+In Android, open **First-time setup**, save backend URL `http://10.0.2.2:8080` and the intended budget month ID, then tap **Save and check household setup**. An initialized server directs you to login; a new server offers private household creation. The check itself creates or resets nothing. After creating the private household/users and logging in, create the starter budget month if needed. Hosted setup retains its private setup code and authorization requirements; this is not public signup or production identity management.
 
 ## Plaid Sandbox Setup
 
@@ -341,7 +345,15 @@ $headers = @{ Authorization = "Bearer $($auth.token)" }
 Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/summary -Headers $headers
 ```
 
-## Run Demo Seed
+## In-app Demo mode
+
+After logging into the real account, use **Accounts / Settings → Demo mode**. A fresh fictional household opens in the normal app, with a persistent **DEMO DATA** banner. Funded budgets, Provision Funds, accounts and transactions are ready to explore. Sync uses a synthetic bank; Spending Check and other financial actions use the same backend rules as real mode. There is no scenario selector or separate reset control.
+
+Demo changes remain within that session. Switching Demo mode off discards them and restores the real account's saved session and selected month; the next entry creates fresh data. The first version needs internet access. Expired sessions or a backend restart cannot resume discarded demo data. See the [lifecycle, maintenance contract and verification record](docs/demo-mode-plan.md).
+
+The same hosted service handles isolated disposable demo databases. No additional service, paid provider calls or hosting upgrade is part of this change; confirm the existing service's capacity before rollout. No real household data is copied into demo mode. This is separate from the older local CLI seed below, which remains useful for isolated development.
+
+## Run Local Development Demo Seed
 
 The demo seed creates `work/demo_family_finance.sqlite` with safe synthetic data dated relative to today. It refuses to overwrite an existing file. Use `--db work/another_demo.sqlite` for another demo, and start the API with that same path. An optional `--today YYYY-MM-DD` makes a demonstration reproducible.
 
@@ -382,7 +394,7 @@ C:\Users\Daniel\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\
 
 The seed prints the demo database path and budget month ID. Android defaults to budget month ID `1`, which matches a freshly created demo database.
 
-## Run Demo API
+## Run Local Development Demo API
 
 After seeding, run the backend against the demo database:
 
@@ -415,8 +427,8 @@ Open Android Studio, then:
 2. Start a Pixel 8 emulator.
 3. Make sure the backend API is still running on Windows at `http://127.0.0.1:8080`.
 4. Run the `app` configuration.
-5. On the emulator login screen, keep the backend URL set to `http://10.0.2.2:8080`.
-6. Keep budget month ID set to `1` for the demo seed.
+5. On the emulator login screen, open **First-time setup** and set the backend URL to `http://10.0.2.2:8080`.
+6. Set budget month ID to `1` for the local development seed, then save and return to login.
 7. Log in with `daniel` / `daniel-local-demo-only` or `kara` / `kara-local-demo-only`.
 
 Android emulators use `10.0.2.2` to reach the host machine loopback address. Use `http://10.0.2.2:8080` in the app, not `http://127.0.0.1:8080`, because `127.0.0.1` inside the emulator points to the emulator itself.
@@ -449,13 +461,15 @@ It creates a temporary synthetic household, uses mock providers, exercises autho
 
 ## MVP Smoke Test
 
-With the demo API running and the Pixel 8 emulator open, verify:
+This older CLI seed validates local development. Also run the [in-app demo acceptance flow](docs/demo-mode-plan.md#release-acceptance-flow) for releases; a local seed alone does not verify mode switching, token/provider isolation or automatic discard.
+
+With the local development demo API running and the Pixel 8 emulator open, verify:
 
 - Login succeeds with local-only Daniel or Kara demo credentials.
 - Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
 - Dashboard starts with the check-in streak, personal best, and daily encouragement. Its compact month/sync line and cash-cushion heading use backend data; the Transaction Review card opens the queue.
 - Monthly budget shows polished backend groups/categories and supports budget month switching/copy-forward, category add/edit/archive, and funding edits.
-- Safe to spend syncs the enabled connected bank before requesting the backend result and required phrase. Failed sync stops calculation; review and explicit reconciliation gates remain. A manual demo without bank linking needs no sync.
+- Safe to spend reuses a successful sync from the current household day or syncs the enabled connected bank when required before requesting the backend result and required phrase. Failed sync stops calculation; review and explicit reconciliation gates remain. A local manual fixture without bank linking needs no sync.
 - Transaction Review shows empty or non-empty state from backend data, plus local-only queue progress/cleared messaging. Category choices start blank and are alphabetical. Select transactions assigns only the selected eligible rows and reports partial completion if a save fails.
 - Tapping a transaction opens transaction detail when demo transactions exist.
 - Transaction detail can assign and review a category in one save, split a transaction, confirm an existing assignment when needed, create a merchant rule, and ignore/unignore a transaction. Merchant rules opens an alphabetical list with Edit/Delete; those actions preserve past transaction categories.
@@ -548,7 +562,7 @@ $env:OPENAI_MODEL = "gpt-4o-mini"
 $env:OPENAI_TIMEOUT_SECONDS = "10"
 ```
 
-`OPENAI_API_KEY` is required only when `COACH_PROVIDER=openai`. Never commit `.env` files or real keys. Real OpenAI API use may incur cost, so keep `COACH_PROVIDER=mock` for tests and demos unless you intentionally opt in locally.
+`OPENAI_API_KEY` is required only when `COACH_PROVIDER=openai`. Never commit `.env` files or real keys. Real OpenAI API use may incur cost; keep tests and local demo fixtures on `COACH_PROVIDER=mock`. Any intentional live-provider development is separate from in-app Demo mode, which always injects the mock coach regardless of the real service's provider setting.
 
 The OpenAI provider is a direct backend provider abstraction for short coach calls. It does not use the Agents SDK, does not expose provider internals to Android, does not access Plaid, and does not mutate budget, category, or transaction data.
 

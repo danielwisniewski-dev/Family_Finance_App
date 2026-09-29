@@ -344,10 +344,10 @@ class FundRepositoryMixin:
                         raise ValueError("Cannot set aside money in an archived fund or a month without its budget line")
                     if connection.execute("SELECT g.archived FROM budget_groups g JOIN budget_categories c ON c.budget_group_id=g.id WHERE c.id=?", (fund["category_id"],)).fetchone()[0]:
                         raise ValueError("Cannot set aside money in an archived budget group")
-                    from .bank_data import require_bank_ready, recent
-                    require_bank_ready(self, budget_month_id, household_today())
-                    if fund["plaid_item_id"] and self.settings.plaid_enabled and (fund["available_balance_cents"] is None or not recent(fund["last_balance_synced_at"], 900)):
-                        raise ValueError("Sync the provision backing account before setting aside money")
+                    from .bank_data import require_funding_bank_ready, synced_today, BankSyncRequiredError
+                    require_funding_bank_ready(self, budget_month_id)
+                    if fund["plaid_item_id"] and self.settings.plaid_enabled and (fund["available_balance_cents"] is None or not synced_today(fund["last_balance_synced_at"])):
+                        raise BankSyncRequiredError("Sync the provision backing account today before setting aside money")
                     if not context["next_payday"]:
                         raise ValueError("Add an upcoming payday before setting aside money")
                     prospective = cash_context(connection, household, budget_month_id, household_today(), balance_adjustments={fund_id: amount_cents})

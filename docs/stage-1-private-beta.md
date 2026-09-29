@@ -1,6 +1,8 @@
 # Stage 1 private beta
 
-Historical Stage 1 runbook. For the deployed USAA integration and latest Android release, see [Stage 2](stage-2-usaa-plaid.md) and [the warmer interface update](ui-warmth.md). Version numbers and rollout status below describe Stage 1. Existing signed phone installations must be updated in place using the original signing key; the historical debug-install instructions below do not apply to them.
+Historical Stage 1 runbook. For the deployed USAA integration, September 23 application baseline and September 29 rollout, see [Stage 2](stage-2-usaa-plaid.md), [Provision Funds](provision-funds.md) and [Ledger](ledger-daily-sync.md). Version numbers and rollout status below describe Stage 1. Existing signed phone installations must be updated in place using the original signing key; the historical debug-install instructions below do not apply to them.
+
+The later [Ledger release](ledger-daily-sync.md), deployed September 29 with a verified signed APK ready to install, adds [in-app Demo mode](demo-mode-plan.md) on the same hosted service with disposable session databases. Its data is not a household backup and must not replace/reseed `FF_DB_PATH`. Preserve real recovery archives and keys. The September 29 headroom/recovery preflight and deployment preservation checks passed; no additional service or plan upgrade was made. Demo sessions expire on backend restart; test mode/token isolation as part of subsequent auth/hosting changes. Historical Stage 1 test results below do not verify that addition.
 
 Stage 1 prepares secure hosting and Android installation for Daniel and Kara. It does **not** enable live financial imports. USAA linking, sync freshness, account/month rollover, transfer/refund treatment, and reconciliation remain stage 2 launch requirements. Do not treat a fresh stage 1 database as a complete picture of household cash.
 

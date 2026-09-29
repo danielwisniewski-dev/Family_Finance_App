@@ -17,14 +17,20 @@ import java.nio.charset.StandardCharsets;
 public final class JsonHttpClient {
     private final String baseUrl;
     private final String bearerToken;
+    private final boolean demo;
 
     public JsonHttpClient(String baseUrl) {
         this(baseUrl, null);
     }
 
     public JsonHttpClient(String baseUrl, String bearerToken) {
+        this(baseUrl, bearerToken, false);
+    }
+
+    public JsonHttpClient(String baseUrl, String bearerToken, boolean demo) {
         this.baseUrl = ConnectionSettings.normalizeBaseUrl(baseUrl, BuildConfig.DEBUG);
         this.bearerToken = bearerToken == null ? "" : bearerToken.trim();
+        this.demo = demo;
     }
 
     public JSONObject get(String path) throws ApiException {
@@ -46,7 +52,7 @@ public final class JsonHttpClient {
     private JSONObject request(String method, String path, JSONObject payload) throws ApiException {
         HttpURLConnection connection = null;
         try {
-            URL url = new URL(baseUrl + path);
+            URL url = new URL(baseUrl + (demo ? "/demo" : "") + path);
             connection = (HttpURLConnection) url.openConnection();
             connection.setInstanceFollowRedirects(false);
             connection.setRequestMethod(method);

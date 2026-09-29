@@ -8,6 +8,17 @@ The backend is the source of truth for money, budget, account, transaction, and 
 
 For broader product direction, read `docs/project-plan.md`.
 
+## Demo Mode Parity
+
+Demo mode is a maintained app feature, not a disposable showcase. Read `docs/demo-mode-plan.md` when changing a user-facing feature, API contract, financial rule, bank-provider contract, schema, authentication/session handling, or date/month behavior.
+
+- Real and demo mode must use the same screens, API behavior and backend financial domain logic. Do not hard-code Android balances, bypass readiness checks, or add a separate demo implementation of financial calculations.
+- Update the relative-date fictional seed and synthetic bank provider when new required fields, workflows or rules would make the sample household incomplete. Keep budgets and Provision Funds funded through real domain operations, with usable transactions and current dates.
+- Preserve the persistent **DEMO DATA** banner, automatic discard when leaving demo mode, and fresh sample data on reentry. There is no scenario selector or Reset demo button.
+- Keep each demo session's database, token, cached data, selected month and pending financial requests separate from real mode and other demo sessions. Demo routes must never use real Plaid/OpenAI providers or copy private household data.
+- For affected features, verify the normal workflow in both modes and update the feature-parity checklist/tests in `docs/demo-mode-plan.md`. A new feature is incomplete if it works only with the real household. Explicitly document an inherently production-only administration action and its clear demo explanation instead of silently calling production.
+- Include real → demo → real → fresh demo, synthetic Sync, Spending Check and a Provision Funds action in release smoke coverage. Verify unchanged real financial data, rejected cross-environment tokens, and no live provider calls. Record any unverified checks as pending; passing a synthetic test does not establish live bank correctness.
+
 ## Repository Layout
 
 - `backend/` — Python backend, domain logic, SQLite persistence, API routes, tests
@@ -130,6 +141,7 @@ Before commit approval, run final verification once by default:
 * Android unit tests
 * Android `assembleDebug`
 * practical smoke test for the milestone’s main user flow, when feasible
+* affected demo-mode parity and isolation checks, including seed compatibility with the current schema and financial rules
 * `git status`
 * `git diff --stat`
 * `git diff --check`

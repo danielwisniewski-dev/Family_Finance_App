@@ -1,6 +1,6 @@
 # Bank sync controls
 
-Part of the provision funds release authorized for commit and deployment September 23; rollout is pending.
+Part of the Provision Funds release deployed September 23, with the existing household and bank connection preserved. PR #22 is merged into `main` at `d5e524a`. Physical-phone installation remains unverified; the deployment and preservation record is in the ignored `work/provision-release-handoff.md`.
 
 | Location | Action | Behavior |
 | --- | --- | --- |
@@ -8,9 +8,11 @@ Part of the provision funds release authorized for commit and deployment Septemb
 | Accounts / Settings | Request fresh bank data | Explicitly asks Plaid to retrieve newer USAA transactions, then imports the available changes. |
 | Accounts / Settings | Reconnect USAA | Opens Plaid Link in update mode to renew or repair the existing bank authorization. |
 
-The existing Refresh household data action reads saved app data. Automatic checks before safe-to-spend continue to use normal balance/transaction sync. They never request Transactions Refresh.
+The existing Refresh household data action reads saved app data. The [Ledger update](ledger-daily-sync.md), deployed September 29 with a verified signed APK ready to install, reuses a successful balance/transaction sync from the current household calendar day for safe-to-spend and Provision Funds contributions. Automatic syncs use normal balance/transaction sync only, never Transactions Refresh. Manual Dashboard Sync still runs when requested.
 
 All normal Sync entry points return to Dashboard after the import and screen-data reload succeed, including the follow-up sync after Reconnect USAA and the Sync shortcut on the fresh-data result.
+
+The Ledger release adds [in-app Demo mode](demo-mode-plan.md). Its same bank controls use an isolated synthetic provider and fictional accounts; they never call Plaid, consume a real connection or open real bank authorization. Keep provider-interface changes compatible with this synthetic implementation. Verify ordinary Sync/fresh-data/reconnect behavior, current timestamps, repeated-sync deduplication and normal review/reconciliation requirements using the demo acceptance flow. Do not use a demo flag to relax real bank readiness rules or report synthetic checks as live USAA verification.
 
 ## Transaction display and review
 

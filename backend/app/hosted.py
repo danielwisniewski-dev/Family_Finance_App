@@ -11,14 +11,16 @@ from .api import ApiHandler, MAX_REQUEST_BODY_BYTES
 from .backup import BackupScheduler, create_backup, restore_backup
 from .coach import build_coach_service_from_env
 from .db import BudgetRepository
+from .demo_sessions import DemoSessionManager
 from .plaid import build_plaid_service_from_env
 from .security import RuntimeSettings
 
 
 class WsgiHandler(ApiHandler):
     """Reuse the tested routes; Waitress owns HTTP parsing, limits, and concurrency."""
-    def __init__(self, environ, repository, plaid_service, coach_service):
+    def __init__(self, environ, repository, plaid_service, coach_service, demo_manager=None):
         self.repository, self.plaid_service, self.coach_service = repository, plaid_service, coach_service
+        self.demo_manager = demo_manager
         self.path = environ.get("PATH_INFO", "/")
         if environ.get("QUERY_STRING"):
             self.path += "?" + environ["QUERY_STRING"]
@@ -52,9 +54,10 @@ class Application:
         self.backups = backups
         self.plaid = build_plaid_service_from_env(repository)
         self.coach = build_coach_service_from_env()
+        self.demo_manager = DemoSessionManager()
 
     def __call__(self, environ, start_response):
-        handler = WsgiHandler(environ, self.repository, self.plaid, self.coach)
+        handler = WsgiHandler(environ, self.repository, self.plaid, self.coach, self.demo_manager)
         try:
             if environ.get("REQUEST_METHOD") == "GET" and environ.get("PATH_INFO") == "/ready":
                 with self.repository.connect() as connection:
@@ -111,6 +114,7 @@ def main():
               expose_tracebacks=False, clear_untrusted_proxy_headers=True, ident="FamilyFinance")
     finally:
         application.backups.stop_event.set()
+        application.demo_manager.close()
 
 
 if __name__ == "__main__":

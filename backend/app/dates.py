@@ -7,3 +7,9 @@ from zoneinfo import ZoneInfo
 def household_today() -> date:
     name = os.environ.get("FF_TIMEZONE", "America/New_York" if os.environ.get("FF_MODE") == "hosted" else "")
     return datetime.now(ZoneInfo(name)).date() if name else date.today()
+
+
+def household_date_at(stamp: datetime) -> date:
+    """Convert an aware timestamp using the same calendar as household_today."""
+    name = os.environ.get("FF_TIMEZONE", "America/New_York" if os.environ.get("FF_MODE") == "hosted" else "")
+    return stamp.astimezone(ZoneInfo(name)).date() if name else stamp.astimezone().date()

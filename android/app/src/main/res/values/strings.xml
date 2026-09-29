@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Ledger</string>
+    <color name="launcher_background">#193E29</color>
+</resources>
