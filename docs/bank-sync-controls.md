@@ -8,7 +8,7 @@ Part of the Provision Funds release deployed September 23, with the existing hou
 | Accounts / Settings | Request fresh bank data | Explicitly asks Plaid to retrieve newer USAA transactions, then imports the available changes. |
 | Accounts / Settings | Reconnect USAA | Opens Plaid Link in update mode to renew or repair the existing bank authorization. |
 
-The existing Refresh household data action reads saved app data. The [Ledger update](ledger-daily-sync.md), authorized for rollout September 29 with deployment verification pending, reuses a successful balance/transaction sync from the current household calendar day for safe-to-spend and Provision Funds contributions. Automatic syncs use normal balance/transaction sync only, never Transactions Refresh. Manual Dashboard Sync still runs when requested.
+The existing Refresh household data action reads saved app data. The [Ledger update](ledger-daily-sync.md), deployed September 29 with a verified signed APK ready to install, reuses a successful balance/transaction sync from the current household calendar day for safe-to-spend and Provision Funds contributions. Automatic syncs use normal balance/transaction sync only, never Transactions Refresh. Manual Dashboard Sync still runs when requested.
 
 All normal Sync entry points return to Dashboard after the import and screen-data reload succeed, including the follow-up sync after Reconnect USAA and the Sync shortcut on the fresh-data result.
 

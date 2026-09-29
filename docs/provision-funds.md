@@ -2,7 +2,7 @@
 
 This milestone adds named funds beneath Combined Monthly Provision for irregular household expenses. The combined `codex/provision-funds` release includes [bank sync controls and transaction review improvements](bank-sync-controls.md). Daniel authorized commit and deployment September 23; backend deployment and household setup completed that day. [PR #22](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/22) is now merged into `main` at `d5e524a`; the deployed baseline uses schema 5. The ignored operational handoff retains the dated preservation evidence.
 
-The later [Ledger update](ledger-daily-sync.md), authorized for rollout September 29 with deployment verification pending, removes next-month planning, completed transaction review and monthly reconciliation as contribution prerequisites. It uses same-day bank data, keeps cash/reserve/recorded-bill protection, and syncs automatically when a contribution needs current data.
+The later [Ledger update](ledger-daily-sync.md), deployed September 29 with a verified signed APK ready to install, removes next-month planning, completed transaction review and monthly reconciliation as contribution prerequisites. It uses same-day bank data, keeps cash/reserve/recorded-bill protection, and syncs automatically when a contribution needs current data.
 
 ## Household workflow
 
