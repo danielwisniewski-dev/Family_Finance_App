@@ -380,14 +380,15 @@ class LiveClientTests(unittest.TestCase):
             auth=repo.authenticate_local_user("one","synthetic-password-one")
             with repo.connect() as conn:
                 tables=[r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='schema_migrations'")]
+                columns={t:[r[1] for r in conn.execute('PRAGMA table_info("'+t+'")')] for t in tables}
                 before={t:[tuple(r) for r in conn.execute('SELECT * FROM "'+t+'" ORDER BY rowid')] for t in tables}
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],2)
             archive=create_backup(path,Path(directory)/"before.ffbackup",settings.encryption_key)
             restore_backup(archive,Path(directory)/"verified.sqlite",settings.encryption_key)
             repo.initialize()
             with repo.connect() as conn:
-                after={t:[tuple(r) for r in conn.execute('SELECT * FROM "'+t+'" ORDER BY rowid')] for t in tables}
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],3)
+                after={t:[tuple(r) for r in conn.execute('SELECT '+','.join('"'+c+'"' for c in columns[t])+' FROM "'+t+'" ORDER BY rowid')] for t in tables}
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],migrations.LATEST_VERSION)
             self.assertEqual(before,after)
             self.assertIsNotNone(repo.auth_context_for_token(auth["token"]))
             self.assertEqual(repo.get_summary(month,date(2026,9,12)).included_account_balance_cents,12345)

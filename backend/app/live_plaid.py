@@ -10,6 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 from .db import account_to_dict
+from .bank_refresh import BankRefreshMixin, mark_refresh_checked
 from .plaid import (DatabasePlaidTokenStore, PlaidConnectionService, PlaidConnectionResult,
                     PlaidIntegrationError, PlaidLinkToken, PlaidSandboxClient, PlaidSyncOutcome,
                     PlaidTransactionSync, account_from_plaid_json, transaction_from_plaid_json)
@@ -30,7 +31,7 @@ class LivePlaidClient(PlaidSandboxClient):
                                            "secret": self.settings.secret, **payload}).encode(),
                           headers={"Content-Type": "application/json", "Plaid-Version": "2020-09-14"}, method="POST")
         try:
-            with build_opener(NoRedirects()).open(request, timeout=35) as response:
+            with build_opener(NoRedirects()).open(request, timeout=90 if path == "/transactions/refresh" else 35) as response:
                 return json.loads(response.read().decode())
         except HTTPError as exc:
             code = "PLAID_REQUEST_FAILED"
@@ -38,11 +39,16 @@ class LivePlaidClient(PlaidSandboxClient):
                 candidate = json.loads(exc.read()).get("error_code")
                 if candidate in {"ITEM_LOGIN_REQUIRED", "ITEM_LOCKED", "ITEM_NOT_SUPPORTED",
                                  "INSTITUTION_DOWN", "INSTITUTION_NOT_RESPONDING", "PRODUCT_NOT_READY",
-                                 "SYNC_UPDATES_DURING_PAGINATION", "RATE_LIMIT_EXCEEDED"}:
+                                 "SYNC_UPDATES_DURING_PAGINATION", "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION",
+                                 "RATE_LIMIT_EXCEEDED", "TRANSACTIONS_REFRESH_LIMIT", "PRODUCT_NOT_ENABLED",
+                                 "INVALID_PRODUCT", "USER_PERMISSION_REVOKED", "ADDITIONAL_CONSENT_REQUIRED"}:
                     code = candidate
             except (ValueError, TypeError, AttributeError):
                 pass
-            raise PlaidIntegrationError("Bank request failed. Retry or reconnect in Settings.", code) from None
+            message = ("USAA authorization needs attention. Reconnect USAA in Settings."
+                       if code in {"ITEM_LOGIN_REQUIRED", "ITEM_LOCKED", "USER_PERMISSION_REVOKED", "ADDITIONAL_CONSENT_REQUIRED"}
+                       else "Bank request failed. Try again later.")
+            raise PlaidIntegrationError(message, code) from None
         except (URLError, TimeoutError, OSError):
             raise PlaidIntegrationError("Bank connection could not be reached. Retry later.", "PLAID_NETWORK_ERROR") from None
         except (ValueError, TypeError, KeyError):
@@ -103,11 +109,11 @@ class LivePlaidClient(PlaidSandboxClient):
                         raise PlaidIntegrationError("Bank sync could not finish. Retry later.", "PLAID_RESPONSE_ERROR")
                 raise PlaidIntegrationError("Bank sync could not finish. Retry later.", "PLAID_RESPONSE_ERROR")
             except PlaidIntegrationError as exc:
-                if exc.code != "SYNC_UPDATES_DURING_PAGINATION" or attempt == 2:
+                if exc.code not in {"SYNC_UPDATES_DURING_PAGINATION", "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION"} or attempt == 2:
                     raise
 
 
-class LivePlaidService(PlaidConnectionService):
+class LivePlaidService(BankRefreshMixin, PlaidConnectionService):
     def __init__(self, repository, client=None):
         super().__init__(repository, client or LivePlaidClient(), DatabasePlaidTokenStore(repository))
         if not repository.settings.hosted or not repository.settings.plaid_enabled or not repository.settings.token_box():
@@ -193,27 +199,31 @@ class LivePlaidService(PlaidConnectionService):
                 known = {a.plaid_account_id for a in self.repository.list_accounts_for_item(plaid_item_id)}
                 if any(a.plaid_account_id not in known for a in snapshots):
                     raise PlaidIntegrationError("Sync balances first to discover new accounts.", "ACCOUNTS_UNAVAILABLE")
-                result, complete = self.client.sync_transactions(token, item.sync_cursor)
+                # Observe the bank update BEFORE downloading changes; a timestamp
+                # that advances during the download cannot prove we imported it.
                 status = self.client._request("/item/get", {"access_token": token})
                 if (status.get("item") or {}).get("error"):
                     raise PlaidIntegrationError("Reconnect USAA in Settings.", "ITEM_LOGIN_REQUIRED")
                 updated = ((status.get("status") or {}).get("transactions") or {}).get("last_successful_update")
                 if updated:
                     datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                result, complete = self.client.sync_transactions(token, item.sync_cursor)
                 counts = self.repository.apply_plaid_transaction_sync(
                     plaid_item_id=plaid_item_id, expected_cursor=item.sync_cursor, next_cursor=result.next_cursor,
                     transactions=(asdict(t) for t in result.transactions + result.modified_transactions),
                     removed_transaction_ids=result.removed_transaction_ids)
                 with self.repository.connect() as conn:
                     conn.execute("UPDATE bank_sync_state SET transactions_checked_at=CURRENT_TIMESTAMP, transactions_updated_at=?, history_complete=?, transaction_error=0 WHERE plaid_item_id=?", (updated, int(complete), plaid_item_id))
+                    mark_refresh_checked(conn, plaid_item_id, updated, complete)
                 return PlaidSyncOutcome(True, "transaction", **counts)
             except Exception as exc:
                 return self._failure(plaid_item_id, "transaction", exc)
 
     def _failure(self, item_id, kind, exc):
         code = exc.code if isinstance(exc, PlaidIntegrationError) else "PLAID_SYNC_INVALID"
-        message = ("Reconnect USAA in Settings, then sync again." if code == "ITEM_LOGIN_REQUIRED"
-                   else "Bank sync did not finish. Retry or reconnect in Settings; saved data was retained.")
+        message = ("Reconnect USAA in Settings, then sync again."
+                   if code in {"ITEM_LOGIN_REQUIRED", "ITEM_LOCKED", "USER_PERMISSION_REVOKED", "ADDITIONAL_CONSENT_REQUIRED"}
+                   else "Bank sync did not finish. Try Sync again later; saved data was retained.")
         with self.repository.connect() as conn:
             column = "balance_error" if kind == "balance" else "transaction_error"
             conn.execute(f"UPDATE bank_sync_state SET {column}=1 WHERE plaid_item_id=?", (item_id,))

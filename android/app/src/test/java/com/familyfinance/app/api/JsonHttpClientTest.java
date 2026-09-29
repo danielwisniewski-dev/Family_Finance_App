@@ -21,6 +21,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.junit.Assert.*;
 
@@ -29,6 +31,7 @@ public final class JsonHttpClientTest {
     private ExecutorService worker;
     private String baseUrl;
     private final Map<String, Response> responses = new ConcurrentHashMap<>();
+    private final Map<String, Queue<Response>> responseSequences = new ConcurrentHashMap<>();
     private final Map<String, String> requestHeaders = new ConcurrentHashMap<>();
     private final AtomicReference<Exception> serverError = new AtomicReference<>();
     private final List<String> requestOrder = Collections.synchronizedList(new ArrayList<>());
@@ -65,10 +68,14 @@ public final class JsonHttpClientTest {
                     if ("/plaid/sync".equals(path)) {
                         JSONObject json = new JSONObject(new String(payload));
                         key += ":" + json.getInt("plaid_item_id") + ":" + json.getString("sync_type");
+                    } else if ("/plaid/refresh".equals(path)) {
+                        key += ":" + new JSONObject(new String(payload)).getInt("plaid_item_id");
                     }
                     requestOrder.add(key);
                     requestHeaders.put(path, headers.toString());
                     Response response = responses.getOrDefault(key, responses.get(path));
+                    Queue<Response> sequence = responseSequences.get(key);
+                    if (sequence != null && !sequence.isEmpty()) response = sequence.remove();
                     if (response == null) {
                         response = new Response(404, "{}", null);
                     }
@@ -100,6 +107,15 @@ public final class JsonHttpClientTest {
         responses.put(path, new Response(status, body, null));
     }
 
+    @Test
+    public void ordinaryBillEditPreservesItsExistingFundButExplicitUnlinkSendsNull() throws Exception {
+        JSONObject unchanged = FamilyFinanceApi.expectedBillUpdatePayload("Annual bill", 10000, "2026-10-01", true, 7, false);
+        assertFalse(unchanged.has("reserve_fund_id"));
+        JSONObject unlink = FamilyFinanceApi.expectedBillUpdatePayload("Annual bill", 10000, "2026-10-01", true, null, true);
+        assertTrue(unlink.has("reserve_fund_id"));
+        assertTrue(unlink.isNull("reserve_fund_id"));
+    }
+
     private FamilyFinanceApi spendingApi() {
         respond("/budget-months/1/bank-status", 200,
                 "{\"enabled\":true,\"connection_id\":7,\"accounts\":[{\"plaid_item_id\":7},{\"plaid_item_id\":7},{\"plaid_item_id\":8}]}");
@@ -115,6 +131,93 @@ public final class JsonHttpClientTest {
         assertEquals("Synthetic backend answer", spendingApi().syncAndCheckSafeToSpend(1, 3, 500).requiredPhrase);
         assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
                 "/plaid/sync:7:transaction", "/plaid/sync:8:balance", "/plaid/sync:8:transaction", "/safe-to-spend"), requestOrder);
+    }
+
+    @Test
+    public void dashboardSyncOnlyImportsAvailableDataAndDeduplicatesConnections() throws Exception {
+        spendingApi().syncAvailableBankData(1);
+        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
+                "/plaid/sync:7:transaction", "/plaid/sync:8:balance", "/plaid/sync:8:transaction",
+                "/budget-months/1/bank-status"), requestOrder);
+        assertFalse(requestOrder.stream().anyMatch(path -> path.startsWith("/plaid/refresh")));
+    }
+
+    private String refreshResponse(String state, int inserted) {
+        return "{\"success\":true,\"request_sent\":true,\"inserted_transactions\":" + inserted
+                + ",\"updated_transactions\":0,\"removed_transactions\":0,\"refresh\":{\"state\":\"" + state
+                + "\",\"message\":\"Synthetic progress\",\"retry_after_seconds\":30,\"can_request\":false}}";
+    }
+
+    private FamilyFinanceApi refreshApi() {
+        respond("/budget-months/1/bank-status", 200,
+                "{\"enabled\":true,\"connection_id\":7,\"accounts\":[{\"plaid_item_id\":7},{\"plaid_item_id\":7}]}");
+        respond("/plaid/refresh", 200, refreshResponse("pending", 0));
+        respond("/plaid/sync:7:balance", 200, "{\"success\":true}");
+        respond("/plaid/sync:7:transaction", 200, refreshResponse("pending", 0));
+        return new FamilyFinanceApi(new JsonHttpClient(baseUrl, "synthetic-test-session"));
+    }
+
+    @Test
+    public void freshRequestPollsImportsOnlyWithBoundedWaits() throws Exception {
+        List<Long> waits = new ArrayList<>();
+        List<String> states = new ArrayList<>();
+        assertEquals("pending", refreshApi().requestFreshBankData(1, state -> states.add(state.state), waits::add).state);
+        assertEquals(Arrays.asList(5000L, 10000L, 20000L), waits);
+        assertEquals(1, Collections.frequency(requestOrder, "/plaid/refresh:7"));
+        assertEquals(4, Collections.frequency(requestOrder, "/plaid/sync:7:transaction"));
+        assertEquals(1, Collections.frequency(requestOrder, "/plaid/sync:7:balance"));
+        assertFalse(states.contains("checked"));
+    }
+
+    @Test
+    public void emptyCheckedImportStillWaitsForStreamToCatchUp() throws Exception {
+        FamilyFinanceApi api = refreshApi();
+        Queue<Response> sequence = new ConcurrentLinkedQueue<>();
+        sequence.add(new Response(200, refreshResponse("checked", 0), null));
+        sequence.add(new Response(200, refreshResponse("checked", 3), null));
+        responseSequences.put("/plaid/sync:7:transaction", sequence);
+        List<Long> waits = new ArrayList<>();
+        assertTrue(api.requestFreshBankData(1, null, waits::add).isChecked());
+        assertEquals(Arrays.asList(5000L), waits);
+        assertEquals(1, Collections.frequency(requestOrder, "/plaid/refresh:7"));
+        assertEquals(2, Collections.frequency(requestOrder, "/plaid/sync:7:transaction"));
+    }
+
+    @Test
+    public void checkedButEmptyImportsAreBoundedAndNeverRepeatBankRequest() throws Exception {
+        FamilyFinanceApi api = refreshApi();
+        respond("/plaid/sync:7:transaction", 200, refreshResponse("checked", 0));
+        List<Long> waits = new ArrayList<>();
+        assertTrue(api.requestFreshBankData(1, null, waits::add).isChecked());
+        assertEquals(3, waits.size());
+        assertEquals(1, Collections.frequency(requestOrder, "/plaid/refresh:7"));
+        assertEquals(4, Collections.frequency(requestOrder, "/plaid/sync:7:transaction"));
+        assertEquals(1, Collections.frequency(requestOrder, "/plaid/sync:7:balance"));
+    }
+
+    @Test
+    public void ambiguousBankRequestImportsWithoutResendingRequest() throws Exception {
+        FamilyFinanceApi api = refreshApi();
+        respond("/plaid/refresh", 200, refreshResponse("unknown", 0).replace("\"success\":true", "\"success\":false"));
+        respond("/plaid/sync:7:transaction", 200, refreshResponse("checked", 2));
+        assertTrue(api.requestFreshBankData(1, null, delay -> fail("No wait needed after imported changes")).isChecked());
+        assertEquals(1, Collections.frequency(requestOrder, "/plaid/refresh:7"));
+    }
+
+    @Test
+    public void failedRefreshResponseIsNotRetriedOrCalledAnImportSuccess() throws Exception {
+        FamilyFinanceApi api = refreshApi();
+        respond("/plaid/refresh", 200, refreshResponse("failed", 0).replace("\"success\":true", "\"success\":false"));
+        assertTrue(api.requestFreshBankData(1, null, delay -> fail("No wait after denial")).isFailed());
+        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/refresh:7"), requestOrder);
+    }
+
+    @Test
+    public void malformedOrLostRefreshResponseNeverReplaysRefreshPost() {
+        FamilyFinanceApi api = refreshApi();
+        respond("/plaid/refresh", 200, "not-json");
+        assertThrows(ApiException.class, () -> api.requestFreshBankData(1, null, delay -> fail("No replay after ambiguous response")));
+        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/refresh:7"), requestOrder);
     }
 
     @Test

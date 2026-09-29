@@ -11,6 +11,7 @@ public final class BudgetCategory {
     public final int remainingCents;
     public final boolean archived;
     public final int displayOrder;
+    public final Integer reserveFundId;
 
     public BudgetCategory(
             int id,
@@ -22,6 +23,11 @@ public final class BudgetCategory {
             boolean archived,
             int displayOrder
     ) {
+        this(id, budgetGroupId, name, plannedCents, spentCents, remainingCents, archived, displayOrder, null);
+    }
+
+    private BudgetCategory(int id, int budgetGroupId, String name, int plannedCents,
+            int spentCents, int remainingCents, boolean archived, int displayOrder, Integer reserveFundId) {
         this.id = id;
         this.budgetGroupId = budgetGroupId;
         this.name = name;
@@ -30,6 +36,7 @@ public final class BudgetCategory {
         this.remainingCents = remainingCents;
         this.archived = archived;
         this.displayOrder = displayOrder;
+        this.reserveFundId = reserveFundId;
     }
 
     public BudgetCategory(
@@ -52,7 +59,8 @@ public final class BudgetCategory {
                 JsonMoney.cents(json, "spent_cents"),
                 JsonMoney.cents(json, "remaining_cents"),
                 json.optBoolean("archived"),
-                json.optInt("display_order")
+                json.optInt("display_order"),
+                json.isNull("reserve_fund_id") ? null : json.optInt("reserve_fund_id")
         );
     }
 

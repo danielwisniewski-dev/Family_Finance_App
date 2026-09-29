@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-LATEST_VERSION = 3
+LATEST_VERSION = 5
 
 
 def add_column(connection, table, column, definition):
@@ -65,8 +65,44 @@ def live_bank_data(connection):
         amount_cents INTEGER NOT NULL CHECK(amount_cents > 0))""")
 
 
+def provision_funds(connection):
+    connection.execute("""CREATE TABLE reserve_funds (
+        id INTEGER PRIMARY KEY, household_id INTEGER NOT NULL REFERENCES households(id),
+        name TEXT NOT NULL, backing_account_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+        annual_target_cents INTEGER NOT NULL DEFAULT 0 CHECK(annual_target_cents >= 0),
+        timing_note TEXT NOT NULL DEFAULT '', breakdown_json TEXT NOT NULL DEFAULT '[]',
+        archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(household_id,name))""")
+    add_column(connection, "budget_categories", "reserve_fund_id", "INTEGER REFERENCES reserve_funds(id)")
+    add_column(connection, "expected_bills", "reserve_fund_id", "INTEGER REFERENCES reserve_funds(id)")
+    connection.execute("CREATE INDEX reserve_category_link ON budget_categories(reserve_fund_id)")
+    connection.execute("""CREATE TABLE reserve_operations (
+        id INTEGER PRIMARY KEY, household_id INTEGER NOT NULL REFERENCES households(id),
+        idempotency_key TEXT NOT NULL, payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(household_id,idempotency_key))""")
+    connection.execute("""CREATE TABLE reserve_entries (
+        id INTEGER PRIMARY KEY, fund_id INTEGER NOT NULL REFERENCES reserve_funds(id),
+        operation_id INTEGER NOT NULL REFERENCES reserve_operations(id),
+        budget_month_id INTEGER NOT NULL REFERENCES budget_months(id),
+        kind TEXT NOT NULL CHECK(kind IN ('contribution','release','transfer_in','transfer_out')),
+        amount_cents INTEGER NOT NULL CHECK(amount_cents != 0), occurred_on TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '', actor_user_id INTEGER REFERENCES users(id),
+        counterpart_fund_id INTEGER REFERENCES reserve_funds(id),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+    connection.execute("CREATE INDEX reserve_entries_fund ON reserve_entries(fund_id)")
+
+
+def bank_refresh_requests(connection):
+    for column, definition in [("refresh_requested_at", "TEXT"), ("refresh_next_allowed_at", "TEXT"), ("refresh_baseline_updated_at", "TEXT"),
+            ("refresh_checked_at", "TEXT"), ("refresh_state", "TEXT NOT NULL DEFAULT 'idle'"),
+            ("refresh_error_code", "TEXT")]:
+        add_column(connection, "bank_sync_state", column, definition)
+
+
 MIGRATIONS = [(1, "local_mvp_baseline", baseline), (2, "expiring_sessions_and_throttling", private_sessions),
-              (3, "live_bank_sync_and_months", live_bank_data)]
+              (3, "live_bank_sync_and_months", live_bank_data), (4, "persistent_provision_funds", provision_funds),
+              (5, "explicit_bank_refresh_requests", bank_refresh_requests)]
 
 
 def migrate(connection: sqlite3.Connection) -> None:

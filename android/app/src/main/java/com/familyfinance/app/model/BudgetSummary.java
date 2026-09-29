@@ -23,6 +23,8 @@ public final class BudgetSummary {
     public final Boolean lowCushion;
     public final String asOf;
     public final List<BudgetCategory> categories;
+    public final Integer reservedCashCents;
+    public final List<String> reserveIssues;
 
     public BudgetSummary(
             int budgetMonthId,
@@ -40,14 +42,14 @@ public final class BudgetSummary {
     ) {
         this(budgetMonthId, month, includedAccountBalanceCents, plannedIncomeTotalCents,
                 assignedTotalCents, remainingToAssignCents, totalSpentCents, billsBeforePaydayCents,
-                cashAfterBillsCents, daysUntilPayday, nextPayday, categories, true, null, "");
+                cashAfterBillsCents, daysUntilPayday, nextPayday, categories, true, null, "", null, Collections.emptyList());
     }
 
     private BudgetSummary(int budgetMonthId, String month, int includedAccountBalanceCents,
             int plannedIncomeTotalCents, int assignedTotalCents, int remainingToAssignCents,
             int totalSpentCents, Integer billsBeforePaydayCents, Integer cashAfterBillsCents,
             Integer daysUntilPayday, String nextPayday, List<BudgetCategory> categories,
-            boolean forecastAvailable, Boolean lowCushion, String asOf) {
+            boolean forecastAvailable, Boolean lowCushion, String asOf, Integer reservedCashCents, List<String> reserveIssues) {
         this.budgetMonthId = budgetMonthId;
         this.month = month;
         this.includedAccountBalanceCents = includedAccountBalanceCents;
@@ -63,6 +65,8 @@ public final class BudgetSummary {
         this.lowCushion = lowCushion;
         this.asOf = asOf;
         this.categories = Collections.unmodifiableList(new ArrayList<>(categories));
+        this.reservedCashCents = reservedCashCents;
+        this.reserveIssues = Collections.unmodifiableList(new ArrayList<>(reserveIssues));
     }
 
     public BudgetSummary(
@@ -100,6 +104,9 @@ public final class BudgetSummary {
             }
         }
         boolean forecastAvailable = json.optBoolean("forecast_available", !json.isNull("next_payday"));
+        ArrayList<String> reserveIssues = new ArrayList<>();
+        JSONArray issues = json.optJSONArray("reserve_issues");
+        if (issues != null) for (int i = 0; i < issues.length(); i++) reserveIssues.add(issues.optString(i));
         return new BudgetSummary(
                 json.optInt("budget_month_id"),
                 json.optString("month", "Unknown month"),
@@ -115,7 +122,9 @@ public final class BudgetSummary {
                 categories,
                 forecastAvailable,
                 json.opt("low_cushion") instanceof Boolean ? json.optBoolean("low_cushion") : null,
-                json.optString("as_of", "")
+                json.optString("as_of", ""),
+                json.isNull("reserved_cash_cents") ? null : JsonMoney.cents(json, "reserved_cash_cents"),
+                reserveIssues
         );
     }
 

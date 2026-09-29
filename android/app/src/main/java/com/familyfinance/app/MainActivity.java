@@ -46,6 +46,8 @@ import com.familyfinance.app.model.MerchantRule;
 import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.Payday;
 import com.familyfinance.app.model.PlannedIncome;
+import com.familyfinance.app.model.ProvisionFunds;
+import com.familyfinance.app.model.BankRefreshStatus;
 import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionAssignment;
@@ -58,6 +60,7 @@ import com.familyfinance.app.state.DashboardText;
 import com.familyfinance.app.state.EncouragementMessages;
 import com.familyfinance.app.state.LoginErrorMessages;
 import com.familyfinance.app.state.MoneyFormatter;
+import com.familyfinance.app.state.PendingFundAction;
 import com.familyfinance.app.state.SecureSessionStore;
 import com.familyfinance.app.state.SelectedCategoryAssigner;
 import com.familyfinance.app.state.TransactionReviewState;
@@ -74,6 +77,7 @@ import org.json.JSONObject;
 import java.util.LinkedHashSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -141,11 +145,14 @@ public final class MainActivity extends Activity {
     private String currentScreen = "";
     private volatile boolean destroyed;
     private boolean savedConnectionReset;
+    private ProvisionFunds provisionFunds;
+    private boolean fundActionRunning;
+    private boolean bankActionRunning;
     private final LinkResultHandler plaidResultHandler = new LinkResultHandler(
             linkSuccess -> {
                 if (repairingBank) {
                     repairingBank = false;
-                    syncPlaidItems("all");
+                    syncPlaidItems();
                     return Unit.INSTANCE;
                 }
                 String publicToken = linkSuccess.getPublicToken();
@@ -214,6 +221,10 @@ public final class MainActivity extends Activity {
                 showTransactions(reviewingQueue);
             } else if ("Transaction Detail".equals(currentScreen) || "Select transactions".equals(currentScreen)) {
                 showTransactions(reviewingQueue);
+            } else if ("Fund Detail".equals(currentScreen) || "Edit Fund".equals(currentScreen)
+                    || "Add Fund".equals(currentScreen) || "Set Aside Money".equals(currentScreen)
+                    || "Release Money".equals(currentScreen) || "Move Between Funds".equals(currentScreen)) {
+                showFunds();
             } else {
                 showDashboard();
             }
@@ -317,6 +328,7 @@ public final class MainActivity extends Activity {
     }
 
     private void clearFinancialData() {
+        provisionFunds = null;
         summary = null;
         budgetDetail = null;
         budgetMonths = new ArrayList<>();
@@ -368,8 +380,8 @@ public final class MainActivity extends Activity {
                     if (selectedBudgetMonthId != budgetMonthId) {
                         saveConnectionPreferences(baseUrl, selectedBudgetMonthId);
                     }
-                    transactions = loadedTransactions;
-                    reviewQueue = loadedReviewQueue;
+                    transactions = TransactionReviewState.newestFirst(loadedTransactions);
+                    reviewQueue = TransactionReviewState.reviewOrder(loadedReviewQueue);
                     accounts = loadedAccounts;
                     bankStatus = loadedBankStatus;
                     merchantRules = loadedMerchantRules;
@@ -661,25 +673,41 @@ public final class MainActivity extends Activity {
         addFact("Budget", DashboardText.budgetMonth(summary.month) + " · "
                 + DashboardText.lastBankSync(bankStatus.optString("transactions_checked_at", ""),
                         bankStatus.optString("balance_checked_at", ""), ZoneId.systemDefault()));
+        if (BuildConfig.BANK_LINKING_ENABLED && bankStatus.optBoolean("enabled") && bankStatus.optBoolean("connected")) {
+            addSecondaryButton("Sync", this::syncPlaidItems);
+            addBody("Check balances and import available transactions.");
+        }
         if (summary.forecastAvailable) {
             boolean lowCushion = summary.hasLowCushion();
-            String cushionTitle = lowCushion ? "Cash cushion is tight"
+            boolean reserveNeedsAttention = !summary.reserveIssues.isEmpty();
+            String cushionTitle = reserveNeedsAttention ? "Provision funds need attention" : lowCushion ? "Cash cushion is tight"
                     : Boolean.FALSE.equals(summary.lowCushion) ? "Cushion looks steady" : "Cash after upcoming bills";
             addHeroCard(
                     cushionTitle,
                     MoneyFormatter.dollars(summary.cashAfterBillsCents),
-                    "Left after upcoming bills. About " + summary.daysUntilPayday + " day"
+                    (reserveNeedsAttention ? "Cash estimate needs review. " : "")
+                            + (summary.reservedCashCents == null ? "Left after upcoming bills. About "
+                            : "Left after upcoming bills and provision reserves. About ") + summary.daysUntilPayday + " day"
                             + (summary.daysUntilPayday == 1 ? "" : "s")
                             + " until payday. Included balance is "
                             + MoneyFormatter.dollars(summary.includedAccountBalanceCents)
                             + ".",
-                    lowCushion ? COLOR_WARNING_BG : COLOR_SURFACE_ALT,
-                    lowCushion ? COLOR_WARNING_TEXT : COLOR_PRIMARY_DARK
+                    lowCushion || reserveNeedsAttention ? COLOR_WARNING_BG : COLOR_SURFACE_ALT,
+                    lowCushion || reserveNeedsAttention ? COLOR_WARNING_TEXT : COLOR_PRIMARY_DARK
             );
         } else {
             addHeroCard("Included account balance", MoneyFormatter.dollars(summary.includedAccountBalanceCents),
                     "Cash after bills is unavailable until you add an upcoming payday.");
             addButton("Add a payday", () -> showPaydayEditor(null));
+        }
+        if (summary.reservedCashCents != null) {
+            LinearLayout reserveCard = addMetricCard("Reserved for irregular expenses  \u203A",
+                    MoneyFormatter.dollars(summary.reservedCashCents),
+                    summary.forecastAvailable ? "Already protected in the cash cushion above. Plans become reserves only when you set money aside."
+                            : "This portion of your included account balance is reserved. Add a payday to see your cash cushion.");
+            makeCardAction(reserveCard, "Reserved for irregular expenses. "
+                    + MoneyFormatter.dollars(summary.reservedCashCents) + ". Open provision funds.", this::showFunds);
+            for (String issue : summary.reserveIssues) addWarning(issue);
         }
         addButton("Check safe to spend", this::showSafeToSpend);
         if (reviewQueue.isEmpty()) {
@@ -799,6 +827,7 @@ public final class MainActivity extends Activity {
         addFact("Assigned / spent", MoneyFormatter.dollars(summary.assignedTotalCents)
                 + " / " + MoneyFormatter.dollars(summary.totalSpentCents));
         addSecondaryButton("Switch / create budget month", this::showBudgetMonths);
+        addButton("Combined Monthly Provision", this::showFunds);
 
         addSection("Budget groups");
         if (budgetDetail.groups.isEmpty()) {
@@ -835,11 +864,14 @@ public final class MainActivity extends Activity {
             return;
         }
         addMetric("Category", category.name);
-        addMetric("Planned", MoneyFormatter.dollars(category.plannedCents));
+        addMetric(category.reserveFundId == null ? "Planned" : "Monthly contribution plan", MoneyFormatter.dollars(category.plannedCents));
         addMetric("Spent", MoneyFormatter.dollars(category.spentCents));
-        addMetric("Remaining", MoneyFormatter.dollars(category.remainingCents));
-        addButton("Rename / fund category", () -> showCategoryEditor(category, category.budgetGroupId));
-        addDangerButton("Archive category", () -> runMutation(
+        addMetric(category.reserveFundId == null ? "Remaining" : "Saved balance", MoneyFormatter.dollars(category.remainingCents));
+        if (category.reserveFundId != null) {
+            addBody("The saved balance carries forward. Planning a contribution does not set money aside.");
+            addButton("Manage provision fund", () -> showFunds(category.reserveFundId));
+        } else addButton("Rename / fund category", () -> showCategoryEditor(category, category.budgetGroupId));
+        if (category.reserveFundId == null) addDangerButton("Archive category", () -> runMutation(
                 "Archiving category...",
                 () -> api.updateCategory(category.id, category.name, category.plannedCents, true),
                 () -> refreshData(this::showBudget)
@@ -855,6 +887,352 @@ public final class MainActivity extends Activity {
             }
         }
         addNav();
+    }
+
+    private void showFunds() { showFunds(null); }
+
+    private void showFunds(Integer selectedFundId) {
+        if (summary == null) {
+            showBudget();
+            return;
+        }
+        showLoading("Loading provision funds...");
+        int requestedMonthId = budgetMonthId;
+        executor.execute(() -> {
+            try {
+                ProvisionFunds loaded = api.getProvisionFunds(requestedMonthId);
+                postIfActive(() -> {
+                    provisionFunds = loaded;
+                    if (selectedFundId == null) renderFunds();
+                    else renderFund(selectedFundId);
+                });
+            } catch (Exception exception) {
+                postIfActive(() -> {
+                    if (handleExpiredSession(exception)) return;
+                    beginScreen("Provision Funds");
+                    String message = exception instanceof ApiException && ((ApiException) exception).status == 404
+                            ? "Provision funds are not available on this backend yet. Your regular budget is still available."
+                            : userFacingError(exception);
+                    addStatusCard("Funds could not be loaded", message, COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+                    addButton("Retry funds", () -> showFunds(selectedFundId));
+                    addSecondaryButton("Back to monthly budget", this::showBudget);
+                });
+            }
+        });
+    }
+
+    private void renderFunds() {
+        beginScreen("Provision Funds");
+        addHeroCard("Combined Monthly Provision", MoneyFormatter.dollars(provisionFunds.totalBalanceCents),
+                "Saved for irregular expenses. Balances carry forward; the money stays in your bank account.");
+        addFact("Budget month", DashboardText.budgetMonth(provisionFunds.month));
+        addMetric("Planned contributions", MoneyFormatter.dollars(provisionFunds.totalPlannedCents));
+        addMetric("Actually set aside this month", MoneyFormatter.dollars(provisionFunds.totalContributedCents));
+        addMetric("Still to set aside", MoneyFormatter.dollars(provisionFunds.totalShortfallCents));
+        addMetric("Spent this month", MoneyFormatter.dollars(provisionFunds.totalSpentCents));
+        addBody("Assign purchases and refunds to the fund's budget category. A purchase uses its saved balance automatically.");
+        addBody("Set-aside totals include releases back to everyday cash. Moves between funds are listed in fund activity.");
+        for (String issue : provisionFunds.issues) addWarning(issue);
+        addPendingFundAction();
+        addSection("Your funds");
+        if (provisionFunds.funds.isEmpty()) {
+            addStatusCard("Give future expenses a place", "Add a fund with a monthly plan. Each fund starts with no money saved.",
+                    COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK);
+        }
+        for (ProvisionFunds.Fund fund : provisionFunds.funds) {
+            LinearLayout card = addMetricCard(fund.name + (fund.archived ? " (archived)" : "") + "  \u203A", MoneyFormatter.dollars(fund.balanceCents),
+                    "Saved · Set aside " + MoneyFormatter.dollars(fund.contributedThisMonthCents)
+                            + " / planned " + MoneyFormatter.dollars(fund.monthlyPlanCents) + " this month\n"
+                            + "Still to set aside " + MoneyFormatter.dollars(fund.monthlyShortfallCents)
+                            + " · Spent " + MoneyFormatter.dollars(fund.spentThisMonthCents));
+            makeCardAction(card, fund.name + ". Saved " + MoneyFormatter.dollars(fund.balanceCents)
+                    + ". Open fund details.", () -> renderFund(fund.id));
+        }
+        addButton("Add a provision fund", () -> showFundEditor(null));
+        addSecondaryButton("Back to monthly budget", this::showBudget);
+        addNav();
+    }
+
+    private void renderFund(int fundId) {
+        ProvisionFunds.Fund fund = provisionFunds == null ? null : provisionFunds.find(fundId);
+        if (fund == null) { renderFunds(); return; }
+        beginScreen("Fund Detail");
+        addHeroCard(fund.name, MoneyFormatter.dollars(fund.balanceCents),
+                "Saved balance · Held in " + fund.backingAccountName);
+        addFact("Budget month", DashboardText.budgetMonth(provisionFunds.month));
+        addMetric("Planned contribution", MoneyFormatter.dollars(fund.monthlyPlanCents));
+        addMetric("Actually set aside", MoneyFormatter.dollars(fund.contributedThisMonthCents));
+        addMetric("Still to set aside", MoneyFormatter.dollars(fund.monthlyShortfallCents));
+        addMetric("Spent this month", MoneyFormatter.dollars(fund.spentThisMonthCents));
+        for (String issue : provisionFunds.issues) addWarning(issue);
+        if (fund.categoryId == null) addWarning("This fund has no category in the selected month. Edit its fund plan to add this month's contribution plan before assigning purchases.");
+        boolean pending = addPendingFundAction();
+        if (!pending) {
+            if (!fund.archived && fund.categoryId != null) addButton("Set aside money", () -> showFundAction(fund, "contribution"));
+            addSecondaryButton("Move between funds", () -> showFundAction(fund, "transfer"));
+            addSecondaryButton("Release money", () -> showFundAction(fund, "release"));
+        }
+        addBody("Set aside earmarks cash already in your account. Release returns a reserve to everyday cash. To record an expense, categorize its transaction instead.");
+        addSection("The plan");
+        addFact("Annual allowance", MoneyFormatter.dollars(fund.annualTargetCents));
+        if (!fund.timingNote.isEmpty()) addFact("Timing", fund.timingNote);
+        for (ProvisionFunds.Component item : fund.breakdown) {
+            addFact(item.name, MoneyFormatter.dollars(item.annualCents)
+                    + (item.timingNote.isEmpty() ? "" : " · " + item.timingNote));
+        }
+        addSecondaryButton("Edit fund plan", () -> showFundEditor(fund));
+        addSection("Fund activity");
+        if (fund.entries.isEmpty()) addBody("No fund activity yet.");
+        for (ProvisionFunds.Entry entry : fund.entries) {
+            String title;
+            switch (entry.kind) {
+                case "contribution": title = "Set aside"; break;
+                case "release": title = "Released"; break;
+                case "transfer_in": title = "Moved in"; break;
+                case "transfer_out": title = "Moved out"; break;
+                case "expense": title = "Purchase"; break;
+                case "refund": title = "Refund"; break;
+                default: title = entry.kind.replace('_', ' ');
+            }
+            addMetricCard(title, MoneyFormatter.dollars(entry.amountCents), entry.occurredOn
+                    + (entry.actorName.isEmpty() ? "" : " · " + entry.actorName)
+                    + (entry.counterpartName.isEmpty() ? "" : " · " + entry.counterpartName)
+                    + (entry.note.isEmpty() ? "" : "\n" + entry.note));
+        }
+        addSection("Purchases and refunds this month");
+        List<TransactionDetail> purchases = fund.categoryId == null ? new ArrayList<>()
+                : BudgetScreenState.transactionsForCategory(fund.categoryId, transactions);
+        if (purchases.isEmpty()) addBody("No transactions assigned to this fund in the loaded month.");
+        for (TransactionDetail purchase : purchases) addTransactionButton(purchase);
+        addSecondaryButton("All provision funds", this::showFunds);
+    }
+
+    private EditText fundTextInput(String label, String value, boolean multiline) {
+        EditText input = new EditText(this);
+        input.setHint(label);
+        input.setText(value);
+        input.setSingleLine(!multiline);
+        root.addView(input);
+        return input;
+    }
+
+    private Spinner fundChoices(String label, List<String> choices, int selection) {
+        addBody(label);
+        Spinner spinner = new Spinner(this);
+        spinner.setContentDescription(label);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, choices);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        spinner.setSelection(selection);
+        root.addView(spinner);
+        return spinner;
+    }
+
+    private void showFundEditor(ProvisionFunds.Fund fund) {
+        beginScreen(fund == null ? "Add Fund" : "Edit Fund");
+        addBody("Monthly plans assign part of your budget. Only Set aside money creates a saved balance. New funds start at $0.");
+        EditText name = fundTextInput("Fund name", fund == null ? "" : fund.name, false);
+        ArrayList<CashAccount> backingAccounts = new ArrayList<>();
+        ArrayList<String> labels = new ArrayList<>();
+        labels.add("Choose the account holding the money...");
+        for (CashAccount account : accounts) {
+            if (account.includedInCashReality) {
+                backingAccounts.add(account);
+                labels.add(account.name + (account.mask.isEmpty() ? "" : " · " + account.mask));
+            }
+        }
+        Spinner accountChoice = fund == null ? fundChoices("Backing account", labels, 0) : null;
+        if (fund != null) addFact("Backing account", fund.backingAccountName);
+        EditText monthly = moneyInput("Monthly contribution plan", fund == null ? 0 : fund.monthlyPlanCents);
+        boolean editMonthlyPlan = fund == null || !fund.archived;
+        monthly.setEnabled(editMonthlyPlan);
+        if (!editMonthlyPlan) addBody("Restore the fund before changing its monthly contribution plan.");
+        else if (fund != null && fund.categoryId == null) addBody("Saving adds this fund's contribution plan to the selected budget month.");
+        EditText annual = moneyInput("Annual allowance (optional)", fund == null ? 0 : fund.annualTargetCents);
+        EditText timing = fundTextInput("Timing or renewal notes (optional)", fund == null ? "" : fund.timingNote, true);
+        addSection("Annual items (optional)");
+        addBody("Use this breakdown for subscriptions or other items included in the fund's allowance.");
+        LinearLayout components = new LinearLayout(this);
+        components.setOrientation(LinearLayout.VERTICAL);
+        root.addView(components);
+        List<EditText[]> componentInputs = new ArrayList<>();
+        if (fund != null) {
+            for (ProvisionFunds.Component item : fund.breakdown) addFundComponentInputs(components, componentInputs, item);
+        }
+        addSecondaryButton("Add annual item", () -> addFundComponentInputs(components, componentInputs, null));
+        addButton(fund == null ? "Create fund" : "Save plan", () -> {
+            try {
+                String cleaned = name.getText().toString().trim();
+                if (cleaned.isEmpty()) throw new IllegalArgumentException("Enter a fund name.");
+                if (fund == null && accountChoice.getSelectedItemPosition() == 0) {
+                    throw new IllegalArgumentException("Choose the account holding this money.");
+                }
+                int monthlyCents = optionalFundMoney(monthly);
+                int annualCents = optionalFundMoney(annual);
+                JSONArray breakdown = new JSONArray();
+                for (EditText[] row : componentInputs) {
+                    String itemName = row[0].getText().toString().trim();
+                    if (itemName.isEmpty()) throw new IllegalArgumentException("Name each annual item, or remove the empty item.");
+                    breakdown.put(new JSONObject().put("name", itemName).put("annual_cents", optionalFundMoney(row[1]))
+                            .put("timing_note", row[2].getText().toString().trim()));
+                }
+                JSONObject payload = new JSONObject().put("name", cleaned).put("monthly_plan_cents", monthlyCents)
+                        .put("annual_target_cents", annualCents).put("timing_note", timing.getText().toString().trim())
+                        .put("breakdown", breakdown);
+                if (!editMonthlyPlan) payload.remove("monthly_plan_cents");
+                if (fund == null) payload.put("backing_account_id", backingAccounts.get(accountChoice.getSelectedItemPosition() - 1).id);
+                else payload.put("budget_month_id", budgetMonthId);
+                runMutation("Saving fund plan...", () -> {
+                    if (fund == null) api.createProvisionFund(budgetMonthId, payload);
+                    else api.updateProvisionFund(fund.id, payload);
+                }, () -> refreshData(() -> showFunds(fund == null ? null : fund.id)));
+            } catch (Exception exception) { toast(userFacingError(exception)); }
+        });
+        addSecondaryButton("Cancel", () -> { if (fund == null) renderFunds(); else renderFund(fund.id); });
+        if (fund != null) addSecondaryButton(fund.archived ? "Restore fund" : "Archive fund", () -> new AlertDialog.Builder(this)
+                .setTitle(fund.archived ? "Restore this fund?" : "Archive this fund?")
+                .setMessage(fund.archived ? "The fund will be available for new contributions and purchases again."
+                        : "Existing history and saved money remain protected. This fund will no longer be available for new purchases or contributions.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton(fund.archived ? "Restore" : "Archive", (dialog, which) -> runMutation("Updating fund...",
+                        () -> api.updateProvisionFund(fund.id, new JSONObject().put("budget_month_id", budgetMonthId).put("archived", !fund.archived)),
+                        () -> refreshData(() -> showFunds(fund.id))))
+                .show());
+    }
+
+    private int optionalFundMoney(EditText input) {
+        String raw = input.getText().toString().trim();
+        int value = raw.isEmpty() ? 0 : MoneyFormatter.parseDollarAmountToCents(raw);
+        if (value < 0) throw new IllegalArgumentException("Amounts cannot be negative.");
+        return value;
+    }
+
+    private void addFundComponentInputs(LinearLayout container, List<EditText[]> inputs, ProvisionFunds.Component item) {
+        LinearLayout card = cardLayout(COLOR_SURFACE, COLOR_BORDER);
+        EditText name = new EditText(this);
+        name.setHint("Annual item name");
+        name.setText(item == null ? "" : item.name);
+        card.addView(name);
+        EditText amount = new EditText(this);
+        amount.setHint("Annual amount");
+        amount.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        amount.setText(item == null ? "" : MoneyFormatter.dollarsWithoutSymbol(item.annualCents));
+        card.addView(amount);
+        EditText timing = new EditText(this);
+        timing.setHint("Timing or renewal date (optional)");
+        timing.setText(item == null ? "" : item.timingNote);
+        card.addView(timing);
+        EditText[] fields = {name, amount, timing};
+        inputs.add(fields);
+        Button remove = new Button(this);
+        remove.setText("Remove item");
+        remove.setOnClickListener(view -> { inputs.remove(fields); container.removeView(card); });
+        card.addView(remove);
+        container.addView(card);
+    }
+
+    private void showFundAction(ProvisionFunds.Fund fund, String kind) {
+        boolean transfer = "transfer".equals(kind);
+        String title = transfer ? "Move Between Funds" : "release".equals(kind) ? "Release Money" : "Set Aside Money";
+        beginScreen(title);
+        addMetric(fund.name + " saved", MoneyFormatter.dollars(fund.balanceCents));
+        addBody(transfer ? "Move existing saved money to another purpose. This does not make a bank transfer."
+                : "release".equals(kind) ? "Return saved money to everyday cash. For a purchase, categorize its transaction instead."
+                : "Reserve cash already held in " + fund.backingAccountName + ". This does not make a bank transfer or record an expense.");
+        List<ProvisionFunds.Fund> destinations = new ArrayList<>();
+        List<String> names = new ArrayList<>();
+        names.add("Choose a destination fund...");
+        if (transfer) for (ProvisionFunds.Fund candidate : provisionFunds.funds) {
+            if (candidate.id != fund.id && candidate.backingAccountId == fund.backingAccountId
+                    && !candidate.archived && candidate.categoryId != null) {
+                destinations.add(candidate);
+                names.add(candidate.name);
+            }
+        }
+        Spinner destination = transfer ? fundChoices("Move to", names, 0) : null;
+        EditText amount = moneyInput("Amount", 0);
+        EditText date = fundTextInput("Date YYYY-MM-DD", LocalDate.now().toString(), false);
+        EditText note = fundTextInput("Note (optional)", "", true);
+        addButton(transfer ? "Confirm move" : "release".equals(kind) ? "Confirm release" : "Confirm set aside", () -> {
+            if (fundActionRunning || hasPendingFundAction()) { toast("Resolve the pending fund request first."); return; }
+            try {
+                int cents = optionalFundMoney(amount);
+                if (cents <= 0) throw new IllegalArgumentException("Enter an amount greater than zero.");
+                String occurredOn = date.getText().toString().trim();
+                if (!isIsoDate(occurredOn)) throw new IllegalArgumentException("Use YYYY-MM-DD for the date.");
+                JSONObject payload = new JSONObject().put("budget_month_id", budgetMonthId).put("amount_cents", cents)
+                        .put("occurred_on", occurredOn).put("note", note.getText().toString().trim());
+                if (transfer) {
+                    if (destination.getSelectedItemPosition() == 0) throw new IllegalArgumentException("Choose a destination fund.");
+                    payload.put("target_fund_id", destinations.get(destination.getSelectedItemPosition() - 1).id);
+                } else payload.put("kind", kind);
+                PendingFundAction action = PendingFundAction.create(fund.id, transfer, payload);
+                if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(pendingFundKey(), action.serialize()).commit()) {
+                    throw new IllegalArgumentException("Could not save this request safely. Please retry.");
+                }
+                executeFundAction(action);
+            } catch (Exception exception) { toast(userFacingError(exception)); }
+        });
+        addSecondaryButton("Cancel", () -> renderFund(fund.id));
+    }
+
+    private String pendingFundKey() {
+        return "pending_fund_action:" + baseUrl + ":" + householdId + ":" + currentUserId;
+    }
+
+    private boolean hasPendingFundAction() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).contains(pendingFundKey());
+    }
+
+    private boolean addPendingFundAction() {
+        String saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(pendingFundKey(), null);
+        if (saved == null) return false;
+        addStatusCard("A fund request needs confirmation",
+                "A previous request may already have reached the server. Retry the same request to confirm its result safely before recording another movement.",
+                COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+        try {
+            PendingFundAction pending = PendingFundAction.restore(saved);
+            JSONObject payload = pending.payload();
+            addFact("Pending request", (pending.transfer ? "Move" : payload.optString("kind")) + " · "
+                    + MoneyFormatter.dollars(payload.getInt("amount_cents")) + " · " + payload.optString("occurred_on"));
+            addButton("Retry the same request", () -> executeFundAction(pending));
+        } catch (Exception exception) {
+            addWarning("The saved request cannot be read. Check fund history before making another contribution.");
+        }
+        return true;
+    }
+
+    private void executeFundAction(PendingFundAction action) {
+        if (fundActionRunning) return;
+        fundActionRunning = true;
+        String storageKey = pendingFundKey();
+        showLoading("Confirming fund movement...");
+        executor.execute(() -> {
+            try {
+                api.applyFundAction(action);
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(storageKey).commit();
+                postIfActive(() -> {
+                    fundActionRunning = false;
+                    toast("Fund movement confirmed.");
+                    refreshData(() -> showFunds(action.fundId));
+                });
+            } catch (Exception exception) {
+                // Validation responses have no effect; a lost response must retain the same request key.
+                boolean rejected = exception instanceof ApiException && ((ApiException) exception).status >= 400
+                        && ((ApiException) exception).status < 500 && ((ApiException) exception).status != 401
+                        && ((ApiException) exception).status != 408 && ((ApiException) exception).status != 429;
+                if (rejected) getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(storageKey).commit();
+                postIfActive(() -> {
+                    fundActionRunning = false;
+                    if (handleExpiredSession(exception)) return;
+                    beginScreen("Fund Request");
+                    addStatusCard(rejected ? "Request was not accepted" : "Request not yet confirmed",
+                            userFacingError(exception), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+                    if (!rejected) addButton("Retry the same request", () -> executeFundAction(action));
+                    addSecondaryButton("Check fund history", () -> showFunds(action.fundId));
+                });
+            }
+        });
     }
 
     private void showBudgetMonths() {
@@ -1053,7 +1431,8 @@ public final class MainActivity extends Activity {
         beginScreen("Bills and Paydays");
         if (summary != null && summary.forecastAvailable) {
             addMetric("Bills before next payday", MoneyFormatter.dollars(summary.billsBeforePaydayCents));
-            addMetric("Cash after bills", MoneyFormatter.dollars(summary.cashAfterBillsCents));
+            addMetric(summary.reservedCashCents == null ? "Cash after bills" : "Cash after bills and reserves",
+                    MoneyFormatter.dollars(summary.cashAfterBillsCents));
             addMetric("Next payday", summary.nextPayday);
             addMetric("Days until payday", Integer.toString(summary.daysUntilPayday));
         } else if (summary != null) {
@@ -1093,6 +1472,19 @@ public final class MainActivity extends Activity {
     }
 
     private void showBillEditor(ExpectedBill bill) {
+        if (summary == null || summary.reservedCashCents == null) { renderBillEditor(bill, null); return; }
+        showLoading("Loading bill funding options...");
+        executor.execute(() -> {
+            try {
+                ProvisionFunds funds = api.getProvisionFunds(budgetMonthId);
+                postIfActive(() -> renderBillEditor(bill, funds));
+            } catch (Exception exception) {
+                postIfActive(() -> showError("Could not load bill funding options", exception));
+            }
+        });
+    }
+
+    private void renderBillEditor(ExpectedBill bill, ProvisionFunds funds) {
         beginScreen(bill == null ? "Add Bill" : "Edit Bill");
         EditText name = new EditText(this);
         name.setHint("Bill name");
@@ -1109,6 +1501,26 @@ public final class MainActivity extends Activity {
         paid.setText("Paid");
         paid.setChecked(bill != null && bill.paid);
         root.addView(paid);
+        List<Integer> fundIds = new ArrayList<>();
+        List<String> fundNames = new ArrayList<>();
+        fundIds.add(null);
+        fundNames.add("Everyday cash (no provision fund)");
+        int selectedFundIndex = 0;
+        if (funds != null) {
+            for (ProvisionFunds.Fund fund : funds.funds) {
+                if (fund.archived && (bill == null || bill.reserveFundId == null || bill.reserveFundId != fund.id)) continue;
+                fundIds.add(fund.id);
+                fundNames.add(fund.name);
+                if (bill != null && bill.reserveFundId != null && bill.reserveFundId == fund.id) selectedFundIndex = fundIds.size() - 1;
+            }
+            if (bill != null && bill.reserveFundId != null && selectedFundIndex == 0) {
+                fundIds.add(bill.reserveFundId);
+                fundNames.add("Currently linked fund (unavailable)");
+                selectedFundIndex = fundIds.size() - 1;
+            }
+        }
+        Spinner billFund = funds == null ? null : fundChoices("Money reserved for this bill", fundNames, selectedFundIndex);
+        if (funds != null) addBody("Link a bill to its provision fund so the same money is not held twice in your cash cushion. Categorize the purchase when it arrives.");
         addButton(bill == null ? "Add bill" : "Save bill", () -> {
             String cleaned = name.getText().toString().trim();
             String due = dueOn.getText().toString().trim();
@@ -1132,13 +1544,16 @@ public final class MainActivity extends Activity {
                 return;
             }
             final boolean isPaid = paid.isChecked();
+            final Integer reserveFundId = billFund == null ? (bill == null ? null : bill.reserveFundId)
+                    : fundIds.get(billFund.getSelectedItemPosition());
             runMutation(
                     "Saving bill...",
                     () -> {
                         if (bill == null) {
-                            api.createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid);
+                            api.createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid, reserveFundId);
                         } else {
-                            api.updateExpectedBill(bill.id, cleaned, amountCents, due, isPaid);
+                            api.updateExpectedBill(bill.id, cleaned, amountCents, due, isPaid, reserveFundId,
+                                    billFund != null && !Objects.equals(bill.reserveFundId, reserveFundId));
                         }
                     },
                     () -> refreshData(this::showBillsAndPaydays)
@@ -2115,12 +2530,23 @@ public final class MainActivity extends Activity {
         addSection("USAA bank connection");
         if (BuildConfig.BANK_LINKING_ENABLED && bankStatus.optBoolean("enabled")) {
             addButton(bankStatus.optBoolean("connected") ? "Reconnect USAA" : "Connect USAA with Plaid", this::preparePlaidLink);
-            addButton("Sync bank data", () -> syncPlaidItems("all"));
+            if (bankStatus.optBoolean("connected")) {
+                addButton("Request fresh bank data", this::requestFreshBankData);
+                addBody("Ask USAA through Plaid for a newer bank update, then import what becomes available. It may take a minute or longer.");
+                JSONObject refresh = bankStatus.optJSONObject("refresh");
+                if (refresh != null) {
+                    if (!refresh.isNull("requested_at")) addFact("Fresh data requested (UTC)", refresh.optString("requested_at"));
+                    if (!refresh.optString("message").isEmpty()) addBody(refresh.optString("message"));
+                    int retrySeconds = refresh.optInt("retry_after_seconds");
+                    if (retrySeconds > 0) addBody("Another fresh request can be made in about " + retrySeconds
+                            + " seconds. Dashboard Sync remains available while USAA updates.");
+                }
+            }
             addFact("Balances checked (UTC)", bankStatus.optString("balance_checked_at", "Not checked"));
             addFact("Transactions downloaded (UTC)", bankStatus.optString("transactions_checked_at", "Not downloaded"));
             addFact("Bank transaction update", bankStatus.optString("transactions_updated_at", "Unavailable"));
             addFact("History complete", bankStatus.optBoolean("history_complete") ? "Yes" : "Waiting for bank history");
-            addBody("Refresh household data reads saved data. Sync bank data checks Plaid. Transactions can lag behind USAA.");
+            addBody("Reconnect renews or repairs USAA authorization. Dashboard Sync checks balances and imports transactions Plaid already has. Refresh household data reads saved app data.");
             JSONArray issues = bankStatus.optJSONArray("issues");
             if (issues != null) for (int i=0; i<issues.length(); i++) addWarning(issues.optString(i));
             addBody("Before confirming, compare each included account's available and current balances and recent posted/pending transactions with USAA. Review transfers, refunds, duplicate manual entries, and bills already paid. Bank data does not automatically mark bills paid or record income in your plan.");
@@ -2202,32 +2628,66 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void syncPlaidItems(String syncType) {
-        Set<Integer> plaidItemIds = new LinkedHashSet<>();
-        if (bankStatus.optInt("connection_id") > 0) plaidItemIds.add(bankStatus.optInt("connection_id"));
-        for (CashAccount account : accounts) {
-            if (account.plaidItemId > 0) {
-                plaidItemIds.add(account.plaidItemId);
-            }
-        }
-        if (plaidItemIds.isEmpty()) {
-            toast("No linked Plaid checking or savings accounts to sync.");
-            return;
-        }
-        showLoading("Running Plaid " + syncType + " sync...");
+    private void syncPlaidItems() {
+        if (bankActionRunning) return;
+        bankActionRunning = true;
+        showLoading("Importing available bank data...");
         executor.execute(() -> {
             try {
-                for (Integer plaidItemId : plaidItemIds) {
-                    if ("all".equals(syncType)) {
-                        api.syncPlaid(plaidItemId, "balance");
-                        api.syncPlaid(plaidItemId, "transaction");
-                    } else api.syncPlaid(plaidItemId, syncType);
-                }
-                postIfActive(() -> refreshData(this::showSettings));
+                api.syncAvailableBankData(budgetMonthId);
+                postIfActive(() -> {
+                    bankActionRunning = false;
+                    refreshData(this::showDashboard);
+                });
             } catch (Exception exception) {
-                postIfActive(() -> showError("Plaid sync failed", exception));
+                postIfActive(() -> {
+                    bankActionRunning = false;
+                    showError("Plaid sync failed", exception);
+                });
             }
         });
+    }
+
+    private void requestFreshBankData() {
+        if (bankActionRunning) return;
+        bankActionRunning = true;
+        showLoading("Asking USAA for a newer bank update. This may take a minute...");
+        executor.execute(() -> {
+            try {
+                BankRefreshStatus result = api.requestFreshBankData(budgetMonthId, status -> postIfActive(() ->
+                        showLoading("Importing available changes and checking again shortly. USAA transactions can take time to reach Plaid...")));
+                postIfActive(() -> {
+                    bankActionRunning = false;
+                    refreshData(() -> showFreshBankResult(result));
+                });
+            } catch (Exception exception) {
+                postIfActive(() -> {
+                    bankActionRunning = false;
+                    if (handleExpiredSession(exception)) return;
+                    beginScreen("Fresh Bank Data");
+                    addStatusCard("The fresh-data check could not finish", userFacingError(exception), COLOR_WARNING_BG, COLOR_WARNING_TEXT);
+                    addBody("A request may already have reached USAA. Dashboard Sync can check available data without sending another fresh request.");
+                    addButton("Sync on dashboard", this::syncPlaidItems);
+                    addSecondaryButton("Accounts / Settings", this::showSettings);
+                });
+            }
+        });
+    }
+
+    private void showFreshBankResult(BankRefreshStatus result) {
+        beginScreen("Fresh Bank Data");
+        String title = result.isChecked() ? "Available data imported"
+                : result.isFailed() ? "Fresh request needs attention" : "USAA may still be updating";
+        String detail = result.isChecked()
+                ? "Imported the latest transactions Plaid has made available. New USAA transactions can still take time to appear."
+                : result.isFailed() ? result.message
+                : "Available data has been imported. Fresh USAA transactions may still be on their way. Sync again in about a minute if transactions are missing.";
+        addStatusCard(title, detail, result.isFailed() ? COLOR_WARNING_BG : COLOR_SURFACE_ALT,
+                result.isFailed() ? COLOR_WARNING_TEXT : COLOR_PRIMARY_DARK);
+        if (!result.message.isEmpty() && !result.isFailed()) addBody(result.message);
+        addButton("Sync on dashboard", this::syncPlaidItems);
+        addSecondaryButton("Back to dashboard", this::showDashboard);
+        addSecondaryButton("Accounts / Settings", this::showSettings);
     }
 
     private void addCategoryCard(BudgetCategory category) {
@@ -2238,15 +2698,20 @@ public final class MainActivity extends Activity {
         String status = category.isOverspent()
                 ? "Overspent by " + MoneyFormatter.dollars(Math.abs((long) category.remainingCents))
                 : category.remainingCents == 0 ? "Fully used" : MoneyFormatter.dollars(category.remainingCents) + " left";
+        if (category.reserveFundId != null) status = category.remainingCents == 0 ? "No money saved yet"
+                : category.remainingCents < 0 ? "Fund short by " + MoneyFormatter.dollars(Math.abs((long) category.remainingCents))
+                : MoneyFormatter.dollars(category.remainingCents) + " saved";
         LinearLayout card = cardLayout(background, COLOR_BORDER);
         card.addView(rowTitle(category.name, categoryIcon(category.name)));
         TextView remaining = displayText(status, 21, textColor, LABEL_FONT);
         remaining.setPadding(0, dp(7), 0, dp(4));
         card.addView(remaining);
-        card.addView(mutedText("Spent " + MoneyFormatter.dollars(category.spentCents)
-                + " of " + MoneyFormatter.dollars(category.plannedCents)));
-        makeCardAction(card, category.name + ". " + status + ". Spent "
-                + MoneyFormatter.dollars(category.spentCents) + " of " + MoneyFormatter.dollars(category.plannedCents)
+        String detail = category.reserveFundId == null
+                ? "Spent " + MoneyFormatter.dollars(category.spentCents) + " of " + MoneyFormatter.dollars(category.plannedCents)
+                : "Saved balance carries forward · Monthly plan " + MoneyFormatter.dollars(category.plannedCents)
+                        + " · Spent " + MoneyFormatter.dollars(category.spentCents);
+        card.addView(mutedText(detail));
+        makeCardAction(card, category.name + ". " + status + ". " + detail
                 + ". Open category.", () -> showCategoryDetail(category.id));
         root.addView(card);
     }

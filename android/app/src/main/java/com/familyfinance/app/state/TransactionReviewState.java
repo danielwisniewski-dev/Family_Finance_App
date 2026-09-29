@@ -2,10 +2,39 @@ package com.familyfinance.app.state;
 
 import com.familyfinance.app.model.TransactionAssignment;
 import com.familyfinance.app.model.TransactionDetail;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 
 public final class TransactionReviewState {
     private TransactionReviewState() { }
+
+    private static final Comparator<TransactionDetail> NEWEST_FIRST = Comparator
+            .comparing((TransactionDetail detail) -> detail.transaction.occurredOn,
+                    Comparator.nullsLast(Comparator.reverseOrder()))
+            .thenComparing(Comparator.comparingInt((TransactionDetail detail) -> detail.transaction.id).reversed());
+
+    public static boolean hasAssignedCategory(TransactionDetail detail) {
+        if (detail.finalCategoryId != null) return true; // Includes a posted refund's category.
+        for (TransactionAssignment assignment : detail.assignments) {
+            if (assignment.active) return true;
+        }
+        return false;
+    }
+
+    public static List<TransactionDetail> newestFirst(List<TransactionDetail> transactions) {
+        ArrayList<TransactionDetail> ordered = new ArrayList<>(transactions);
+        ordered.sort(NEWEST_FIRST);
+        return ordered;
+    }
+
+    public static List<TransactionDetail> reviewOrder(List<TransactionDetail> transactions) {
+        ArrayList<TransactionDetail> ordered = new ArrayList<>(transactions);
+        ordered.sort(Comparator.comparingInt((TransactionDetail detail) -> hasAssignedCategory(detail) ? 0 : 1)
+                .thenComparing(NEWEST_FIRST));
+        return ordered;
+    }
 
     public static boolean canAssignTogether(TransactionDetail detail) {
         return detail.needsReview && !detail.transaction.ignored

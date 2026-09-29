@@ -316,7 +316,7 @@ class TransactionCategorizationTests(unittest.TestCase):
         reviewed_rows = self.repository.list_review_transactions(self.budget_month_id, status="reviewed")
         ignored_rows = self.repository.list_review_transactions(self.budget_month_id, status="ignored")
 
-        self.assertEqual([item.transaction.id for item in uncategorized_rows], [uncategorized, reviewed])
+        self.assertEqual([item.transaction.id for item in uncategorized_rows], [reviewed, uncategorized])
         self.assertEqual([item.transaction.id for item in reviewed_rows], [reviewed])
         self.assertEqual([item.transaction.id for item in ignored_rows], [ignored])
 
