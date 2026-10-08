@@ -17,7 +17,6 @@ from .demo_sessions import DemoSessionManager, demo_routes
 from .coach import (
     BudgetChangeSuggestionRequest,
     CoachService,
-    SafeToSpendCoachRequest,
     build_coach_service_from_env,
     coach_response_to_dict,
 )
@@ -26,7 +25,6 @@ from .db import (
     account_to_dict,
     merchant_rule_to_dict,
     notification_event_to_dict,
-    safe_to_spend_to_dict,
     summary_to_dict,
     transaction_detail_to_dict,
 )
@@ -412,51 +410,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"id": payday_id}, status=HTTPStatus.CREATED)
                 return
-            if parsed.path == "/safe-to-spend":
-                auth = self.require_auth()
-                budget_month_id = require_int(payload, "budget_month_id")
-                self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
-                self.repository.require_category_access(require_int(payload, "category_id"), auth["household_id"])
-                result = self.repository.safe_to_spend(
-                    budget_month_id=budget_month_id,
-                    category_id=require_int(payload, "category_id"),
-                    purchase_amount_cents=require_int(payload, "purchase_amount_cents"),
-                    today=parse_date(payload.get("today", household_today().isoformat())),
-                    urgency=payload.get("urgency", "planned_want"),
-                    actor_user_id=auth["user_id"],
-                )
-                self.send_json(safe_to_spend_to_dict(result))
-                return
-            if parsed.path == "/coach/safe-to-spend":
-                auth = self.require_auth()
-                amount_cents = require_int(payload, "amount_cents", fallback_key="purchase_amount_cents")
-                category_id = require_int(payload, "category_id")
-                budget_month_id = require_int(payload, "budget_month_id")
-                self.repository.require_budget_month_access(budget_month_id, auth["household_id"])
-                self.repository.require_category_access(category_id, auth["household_id"])
-                result = self.repository.safe_to_spend(
-                    budget_month_id=budget_month_id,
-                    category_id=category_id,
-                    purchase_amount_cents=amount_cents,
-                    today=parse_date(payload.get("today", household_today().isoformat())),
-                    urgency=payload.get("urgency", "planned_want"),
-                    actor_user_id=auth["user_id"],
-                )
-                coach_response = self.coach_service.explain_safe_to_spend(
-                    result=result,
-                    request=SafeToSpendCoachRequest(
-                        amount_cents=amount_cents,
-                        category_id=category_id,
-                        note=payload.get("note"),
-                        purpose=payload.get("purpose"),
-                    ),
-                )
-                self.send_json(
-                    {
-                        "safe_to_spend": safe_to_spend_to_dict(result),
-                        "coach": coach_response_to_dict(coach_response),
-                    }
-                )
+            if parsed.path in {"/safe-to-spend", "/coach/safe-to-spend"}:
+                self.require_auth()
+                self.send_error_json(HTTPStatus.GONE,
+                    "Spending Check has been removed. Use the dashboard cash balance and monthly budget instead.")
                 return
             if parsed.path == "/coach/budget-change-suggestion":
                 auth = self.require_auth()
@@ -538,6 +495,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self.repository.settings.plaid_enabled or request_refresh is None:
                     raise PlaidIntegrationError("Fresh bank requests are not enabled on this backend.")
                 self.send_json(request_refresh(plaid_item_id))
+                return
+            if resource_path(parsed.path, "budget-months", "bank-sync"):
+                auth = self.require_auth()
+                month_id = int(parsed.path.split("/")[2])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                force = payload.get("force", False)
+                if not isinstance(force, bool):
+                    raise ValueError("force must be a boolean")
+                from .automatic_bank_sync import sync_if_due
+                self.send_json(sync_if_due(self.repository, self.plaid_service, month_id, force=force))
                 return
             if parsed.path == "/plaid/sync":
                 auth = self.require_auth()
@@ -731,6 +698,32 @@ class ApiHandler(BaseHTTPRequestHandler):
                         included_in_cash_reality=boolean_field(payload, "included_in_cash_reality", False),
                     )
                 self.send_json({"ok": True})
+                return
+            if resource_path(parsed.path, "transactions", "budget-month"):
+                auth = self.require_auth()
+                transaction_id = int(parsed.path.split("/")[2])
+                month_id = require_int(payload, "budget_month_id")
+                self.repository.require_transaction_access(transaction_id, auth["household_id"])
+                self.repository.require_budget_month_access(month_id, auth["household_id"])
+                result = self.repository.move_transaction_month(transaction_id, month_id,
+                    preview=boolean_field(payload, "preview", False), revision=payload.get("revision"),
+                    actor_user_id=auth["user_id"])
+                self.send_json(result)
+                return
+            if resource_path(parsed.path, "transactions", "income"):
+                auth = self.require_auth()
+                transaction_id = int(parsed.path.split("/")[2])
+                self.repository.require_transaction_access(transaction_id, auth["household_id"])
+                if boolean_field(payload, "remove", False):
+                    self.repository.remove_transaction_income(transaction_id, auth["user_id"])
+                else:
+                    income_id = optional_int(payload, "income_id")
+                    if income_id is not None:
+                        self.repository.require_income_access(income_id, auth["household_id"])
+                    self.repository.apply_transaction_income(transaction_id, income_id, payload.get("new_income"), auth["user_id"],
+                        expected_month_id=require_int(payload, "budget_month_id"),
+                        expected_amount_cents=require_int(payload, "amount_cents"))
+                self.send_json(transaction_detail_to_dict(self.repository.get_transaction_detail(transaction_id)))
                 return
             if resource_path(parsed.path, "transactions", "review"):
                 auth = self.require_auth()

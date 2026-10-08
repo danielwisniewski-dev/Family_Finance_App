@@ -9,7 +9,7 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .domain import BudgetSummary, SafeToSpendResult, WarningLevel, format_money
+from .domain import BudgetSummary, format_money
 
 
 CoachWarningLevel = str
@@ -51,34 +51,6 @@ class CoachResponse:
 
 
 @dataclass(frozen=True)
-class SafeToSpendCoachRequest:
-    amount_cents: int
-    category_id: int
-    note: str | None = None
-    purpose: str | None = None
-
-
-@dataclass(frozen=True)
-class SafeToSpendFactPacket:
-    amount_cents: int
-    category_id: int
-    category_name: str
-    warning_level: CoachWarningLevel
-    budget_line_fits: bool
-    category_remaining_before_cents: int
-    category_remaining_after_cents: int
-    included_account_balance_cents: int
-    bills_before_payday_cents: int
-    cash_after_bills_before_purchase_cents: int
-    cash_after_purchase_and_bills_cents: int
-    days_until_payday: int
-    required_phrase: str
-    backend_facts: tuple[str, ...]
-    note: str | None
-    purpose: str | None
-
-
-@dataclass(frozen=True)
 class BudgetChangeSuggestionRequest:
     budget_month_id: int
     amount_cents: int
@@ -106,8 +78,6 @@ class BudgetChangeFactPacket:
 
 
 class CoachProvider(Protocol):
-    def explain_safe_to_spend(self, facts: SafeToSpendFactPacket) -> CoachResponse:
-        """Return an advisory explanation from backend-calculated facts."""
 
     def suggest_budget_change(self, facts: BudgetChangeFactPacket) -> CoachResponse:
         """Return a draft budget change suggestion without applying it."""
@@ -116,47 +86,6 @@ class CoachProvider(Protocol):
 class MockCoachProvider:
     """Deterministic provider used until a real AI provider is explicitly added."""
 
-    def explain_safe_to_spend(self, facts: SafeToSpendFactPacket) -> CoachResponse:
-        if facts.warning_level == "safe":
-            recommendation = "This is reasonable if the purchase is still needed."
-            actions = ("Proceed only for the stated purpose.",)
-            discussion = False
-        elif facts.warning_level == "caution":
-            recommendation = "Use caution and trim optional spending elsewhere."
-            actions = ("Check whether a smaller purchase would work.", "Avoid another optional purchase before payday.")
-            discussion = False
-        elif facts.warning_level == "no":
-            recommendation = "Do not make this purchase from the current plan."
-            actions = ("Wait until payday or choose a lower-cost option.", "Do not move money without approval.")
-            discussion = True
-        else:
-            recommendation = "Discuss this with your spouse before spending."
-            actions = ("Discuss the tradeoff before spending.", "Agree on any budget move before changing the plan.")
-            discussion = True
-
-        tradeoffs = (
-            f"{format_money(facts.category_remaining_after_cents)} would remain in {facts.category_name}.",
-            facts.required_phrase,
-        )
-        if not facts.budget_line_fits:
-            tradeoffs += ("This purchase does not fit the selected budget line.",)
-
-        return CoachResponse(
-            summary=f"{facts.warning_level.title()}: {facts.required_phrase}",
-            recommendation=recommendation,
-            tone="firm_practical_not_shaming",
-            warning_level=facts.warning_level,
-            facts_used=facts.backend_facts,
-            tradeoffs=tradeoffs,
-            suggested_actions=actions,
-            requires_spouse_discussion=discussion,
-            proposed_budget_change=None,
-            confidence="high",
-            limitations=(
-                "This uses backend-calculated budget and cash facts only.",
-                "This is not investment, tax, legal, or professional financial advice.",
-            ),
-        )
 
     def suggest_budget_change(self, facts: BudgetChangeFactPacket) -> CoachResponse:
         from_name = facts.from_category_name
@@ -259,30 +188,6 @@ class OpenAICoachProvider:
         self.timeout_seconds = timeout_seconds
         self._transport = transport or self._post_response
 
-    def explain_safe_to_spend(self, facts: SafeToSpendFactPacket) -> CoachResponse:
-        payload = self._build_payload(
-            task="safe_to_spend",
-            facts=safe_to_spend_facts_for_provider(facts),
-        )
-        response = self._call_or_fallback(payload, fallback_warning_level=facts.warning_level)
-        # Structured advice cannot change the backend decision or source facts.
-        if response.warning_level != facts.warning_level or response.proposed_budget_change is not None:
-            response = unavailable_provider_response(facts.warning_level)
-        elif facts.warning_level in {"no", "discuss"} and response != unavailable_provider_response(facts.warning_level):
-            # Matching an enum is insufficient: prose could still say "buy it".
-            # Consequential stop/discuss decisions use deterministic wording.
-            response = MockCoachProvider().explain_safe_to_spend(facts)
-        return replace(
-            response,
-            facts_used=facts.backend_facts,
-            tradeoffs=(
-                f"{format_money(facts.category_remaining_after_cents)} would remain in {facts.category_name}.",
-                facts.required_phrase,
-            ),
-            requires_spouse_discussion=(
-                response.requires_spouse_discussion or facts.warning_level in {"no", "discuss"}
-            ),
-        )
 
     def suggest_budget_change(self, facts: BudgetChangeFactPacket) -> CoachResponse:
         payload = self._build_payload(
@@ -358,31 +263,6 @@ class CoachService:
     def __init__(self, provider: CoachProvider | None = None):
         self.provider = provider or MockCoachProvider()
 
-    def explain_safe_to_spend(
-        self,
-        *,
-        result: SafeToSpendResult,
-        request: SafeToSpendCoachRequest,
-    ) -> CoachResponse:
-        facts = SafeToSpendFactPacket(
-            amount_cents=request.amount_cents,
-            category_id=request.category_id,
-            category_name=result.category_name,
-            warning_level=normalize_warning_level(result.warning_level),
-            budget_line_fits=result.budget_line_fits,
-            category_remaining_before_cents=result.category_remaining_before_cents,
-            category_remaining_after_cents=result.category_remaining_after_cents,
-            included_account_balance_cents=result.included_account_balance_cents,
-            bills_before_payday_cents=result.bills_before_payday_cents,
-            cash_after_bills_before_purchase_cents=result.cash_after_bills_before_purchase_cents,
-            cash_after_purchase_and_bills_cents=result.cash_after_purchase_and_bills_cents,
-            days_until_payday=result.days_until_payday,
-            required_phrase=result.required_phrase,
-            backend_facts=result.facts,
-            note=request.note,
-            purpose=request.purpose,
-        )
-        return self.provider.explain_safe_to_spend(facts)
 
     def suggest_budget_change(
         self,
@@ -412,12 +292,6 @@ class CoachService:
             purpose=request.purpose,
         )
         return self.provider.suggest_budget_change(facts)
-
-
-def normalize_warning_level(warning_level: WarningLevel) -> CoachWarningLevel:
-    if warning_level == WarningLevel.DISCUSS_WITH_SPOUSE:
-        return "discuss"
-    return warning_level.value
 
 
 def find_category(summary: BudgetSummary, category_id: int | None):
@@ -491,27 +365,6 @@ def parse_timeout(value: str) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise CoachConfigurationError("OPENAI_TIMEOUT_SECONDS must be finite and positive")
     return timeout
-
-
-def safe_to_spend_facts_for_provider(facts: SafeToSpendFactPacket) -> dict[str, Any]:
-    return {
-        "amount_cents": facts.amount_cents,
-        "category_id": facts.category_id,
-        "category_name": facts.category_name,
-        "warning_level": facts.warning_level,
-        "budget_line_fits": facts.budget_line_fits,
-        "category_remaining_before_cents": facts.category_remaining_before_cents,
-        "category_remaining_after_cents": facts.category_remaining_after_cents,
-        "included_account_balance_cents": facts.included_account_balance_cents,
-        "bills_before_payday_cents": facts.bills_before_payday_cents,
-        "cash_after_bills_before_purchase_cents": facts.cash_after_bills_before_purchase_cents,
-        "cash_after_purchase_and_bills_cents": facts.cash_after_purchase_and_bills_cents,
-        "days_until_payday": facts.days_until_payday,
-        "required_phrase": facts.required_phrase,
-        "backend_facts": list(facts.backend_facts),
-        "note": facts.note,
-        "purpose": facts.purpose,
-    }
 
 
 def budget_change_facts_for_provider(facts: BudgetChangeFactPacket) -> dict[str, Any]:
@@ -703,12 +556,12 @@ def proposed_budget_change_from_payload(payload: dict[str, Any] | None) -> Propo
 def unavailable_provider_response(warning_level: str) -> CoachResponse:
     return CoachResponse(
         summary="Coach explanation is temporarily unavailable.",
-        recommendation="Use the deterministic safe-to-spend result and discuss any unclear tradeoff before acting.",
+        recommendation="Review the dashboard and budget balances, and discuss any unclear tradeoff before changing the plan.",
         tone="firm_practical_not_shaming",
         warning_level=validate_warning_level(warning_level),
         facts_used=("Backend financial facts were calculated, but the OpenAI provider did not return a usable response.",),
         tradeoffs=("No budget changes were made.",),
-        suggested_actions=("Retry later.", "Use the backend safe-to-spend result as the source of truth."),
+        suggested_actions=("Retry later.", "Use the dashboard and budget balances as the source of truth."),
         requires_spouse_discussion=warning_level in {"no", "discuss"},
         proposed_budget_change=None,
         confidence="low",

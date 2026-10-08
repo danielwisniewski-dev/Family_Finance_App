@@ -391,8 +391,14 @@ class BankRefreshMigrationTests(unittest.TestCase):
                 balance_cents=15_000, available_balance_cents=15_000, current_balance_cents=15_000)
             fund = repo.create_fund(budget_month_id=month, name="Existing reserve", backing_account_id=account,
                                      monthly_plan_cents=1_000)
-            repo.add_fund_entry(fund_id=fund["id"], budget_month_id=month, kind="contribution", amount_cents=1_000,
-                               occurred_on=today, idempotency_key="synthetic-existing-contribution")
+            # Seed the historical v4 ledger directly. Current domain reads need
+            # the latest schema; this fixture deliberately has not upgraded yet.
+            with repo.connect() as connection:
+                operation, _ = repo._fund_operation(connection, household, "synthetic-existing-contribution",
+                    {"fund_id": fund["id"], "budget_month_id": month, "kind": "contribution", "amount_cents": 1_000,
+                     "occurred_on": today.isoformat(), "note": "", "actor_user_id": None})
+                connection.execute("""INSERT INTO reserve_entries(fund_id,operation_id,budget_month_id,kind,amount_cents,occurred_on)
+                    VALUES (?,?,?,'contribution',1000,?)""", (fund["id"], operation, month, today.isoformat()))
             auth = repo.authenticate_local_user(login="existing-v4", password="synthetic-v4-password")
             with repo.connect() as connection:
                 connection.execute("""INSERT INTO bank_sync_state(plaid_item_id,environment,balance_checked_at,

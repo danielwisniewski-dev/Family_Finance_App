@@ -63,14 +63,6 @@ class DemoDataTests(unittest.TestCase):
         self.assertTrue(self.repository.list_merchant_rules(self.context.household_id))
         self.assertTrue(self.repository.list_notification_events(household_id=self.context.household_id, user_id=self.context.user_id))
 
-    def test_ready_spending_check_can_show_safe_caution_and_no(self):
-        for category, amount, expected in (("Groceries", 2_500, "safe"), ("Rent", 120_000, "caution"), ("Dining Out", 10_000, "no")):
-            with self.subTest(expected=expected):
-                result = self.repository.safe_to_spend(budget_month_id=self.month, category_id=self.category(category),
-                    purchase_amount_cents=amount, today=self.today)
-                self.assertEqual(result.warning_level.value, expected)
-                self.assertIn("After upcoming bills, you would have about $", result.required_phrase)
-                self.assertIn("6 days until payday.", result.required_phrase)
 
     def test_sync_imports_once_and_preserves_production_review_rules(self):
         old_balance = self.repository.list_accounts(self.month)[0].balance_cents
@@ -83,8 +75,6 @@ class DemoDataTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertEqual(status["unreviewed_spending"], 2)
         self.assertFalse(status["sync_required"])
-        with self.assertRaisesRegex(ValueError, "Review imported"):
-            self.repository.safe_to_spend(budget_month_id=self.month, category_id=self.category("Groceries"), purchase_amount_cents=100, today=self.today)
         # Earmarking remains usable with the ordinary unreviewed-spending rule.
         fund = self.repository.get_funds(self.month)["funds"][0]
         self.repository.add_fund_entry(fund_id=fund["id"], budget_month_id=self.month, kind="contribution",

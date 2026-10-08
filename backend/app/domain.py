@@ -2,23 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from enum import Enum
 from typing import Iterable, Literal
 
 
 IncomeKind = Literal["main", "sporadic"]
-Urgency = Literal["need", "planned_want", "impulse_want", "household_discussion"]
 AccountType = Literal["checking", "savings"]
 PlaidSyncKind = Literal["balance", "transaction", "connection"]
 CategorizationSource = Literal["manual", "rule", "plaid_hint", "split"]
 NotificationSeverity = Literal["info", "caution", "important"]
-
-
-class WarningLevel(str, Enum):
-    SAFE = "safe"
-    CAUTION = "caution"
-    NO = "no"
-    DISCUSS_WITH_SPOUSE = "discuss_with_spouse"
 
 
 @dataclass(frozen=True)
@@ -125,6 +116,10 @@ class TransactionDetail:
     suggestion_reason: str | None = None
     matching_rule_id: int | None = None
     refund_category_id: int | None = None
+    budget_month_id: int | None = None
+    budget_month: str | None = None
+    income_id: int | None = None
+    income_name: str | None = None
 
     @property
     def final_category_id(self) -> int | None:
@@ -140,6 +135,8 @@ class TransactionDetail:
             return "ignored"
         if self.refund_category_id is not None:
             return "refund"
+        if self.income_id is not None:
+            return "income"
         if len(self.assignments) > 1:
             return "split"
         if len(self.assignments) == 1:
@@ -214,30 +211,6 @@ class BudgetSummary:
         return self.next_payday is not None
 
 
-@dataclass(frozen=True)
-class SafeToSpendResult:
-    warning_level: WarningLevel
-    purchase_amount_cents: int
-    category_id: int
-    category_name: str
-    category_remaining_before_cents: int
-    category_remaining_after_cents: int
-    included_account_balance_cents: int
-    bills_before_payday_cents: int
-    cash_after_bills_before_purchase_cents: int
-    cash_after_purchase_and_bills_cents: int
-    next_payday: date
-    days_until_payday: int
-    daily_cash_cushion_cents: int
-    low_cushion: bool
-    budget_line_fits: bool
-    required_phrase: str
-    facts: tuple[str, ...]
-    reserved_cash_cents: int = 0
-    funded_purchase_cents: int = 0
-    reserve_covered_bills_cents: int = 0
-
-
 def available_income_cents(income_lines: Iterable[IncomeLine]) -> int:
     total = 0
     for line in income_lines:
@@ -297,92 +270,6 @@ def summarize_budget(
             if cash_after_bills is not None and days_until_payday is not None else None
         ),
     )
-
-
-def calculate_safe_to_spend(
-    *,
-    category: CategoryLine,
-    purchase_amount_cents: int,
-    included_account_balance_cents: int,
-    expected_bills: Iterable[ExpectedBill],
-    paydays: Iterable[date],
-    today: date,
-    urgency: Urgency = "planned_want",
-    low_cushion_daily_cents: int = 5_000,
-    reserved_cash_cents: int = 0,
-    funded_purchase_cents: int = 0,
-    reserve_covered_bills_cents: int = 0,
-    reserve_covered_bills_after_cents: int = 0,
-) -> SafeToSpendResult:
-    if purchase_amount_cents <= 0:
-        raise ValueError("purchase_amount_cents must be positive")
-    if category.archived:
-        raise ValueError("Cannot spend from an archived category")
-
-    next_payday = find_next_payday(paydays, today)
-    days_until_payday = max((next_payday - today).days, 0)
-    bills_before_payday = sum_bills_before_payday(expected_bills, today, next_payday)
-    cash_after_bills_before_purchase = included_account_balance_cents - reserved_cash_cents - bills_before_payday + reserve_covered_bills_cents
-    cash_after_purchase_and_bills = (included_account_balance_cents - reserved_cash_cents + funded_purchase_cents
-                                     - bills_before_payday + reserve_covered_bills_after_cents - purchase_amount_cents)
-    divisor_days = max(days_until_payday, 1)
-    daily_cash_cushion = cash_after_purchase_and_bills // divisor_days
-
-    category_remaining_before = category.remaining_cents
-    category_remaining_after = category_remaining_before - purchase_amount_cents
-    budget_line_fits = category_remaining_after >= 0
-    low_cushion = daily_cash_cushion < low_cushion_daily_cents
-
-    if not budget_line_fits or cash_after_purchase_and_bills < 0:
-        warning_level = WarningLevel.NO
-    elif urgency == "household_discussion":
-        warning_level = WarningLevel.DISCUSS_WITH_SPOUSE
-    elif low_cushion:
-        warning_level = WarningLevel.DISCUSS_WITH_SPOUSE if urgency == "impulse_want" else WarningLevel.CAUTION
-    else:
-        warning_level = WarningLevel.SAFE
-
-    phrase = (
-        "After upcoming bills, you would have about "
-        f"{format_money(cash_after_purchase_and_bills)} left for "
-        f"{days_until_payday} days until payday."
-    )
-    facts = (
-        "The purchase fits the budget line." if budget_line_fits else "The purchase does not fit the budget line.",
-        f"{format_money(category_remaining_after)} would remain in {category.name}.",
-        phrase,
-        "The remaining cash cushion is low." if low_cushion else "The remaining cash cushion is not low.",
-    )
-
-    return SafeToSpendResult(
-        warning_level=warning_level,
-        purchase_amount_cents=purchase_amount_cents,
-        category_id=category.id,
-        category_name=category.name,
-        category_remaining_before_cents=category_remaining_before,
-        category_remaining_after_cents=category_remaining_after,
-        included_account_balance_cents=included_account_balance_cents,
-        bills_before_payday_cents=bills_before_payday,
-        cash_after_bills_before_purchase_cents=cash_after_bills_before_purchase,
-        cash_after_purchase_and_bills_cents=cash_after_purchase_and_bills,
-        next_payday=next_payday,
-        days_until_payday=days_until_payday,
-        daily_cash_cushion_cents=daily_cash_cushion,
-        low_cushion=low_cushion,
-        budget_line_fits=budget_line_fits,
-        required_phrase=phrase,
-        facts=facts,
-        reserved_cash_cents=reserved_cash_cents,
-        funded_purchase_cents=funded_purchase_cents,
-        reserve_covered_bills_cents=reserve_covered_bills_cents,
-    )
-
-
-def find_next_payday(paydays: Iterable[date], today: date) -> date:
-    future_paydays = sorted(payday for payday in paydays if payday >= today)
-    if not future_paydays:
-        raise ValueError("No upcoming payday configured")
-    return future_paydays[0]
 
 
 def sum_bills_before_payday(expected_bills: Iterable[ExpectedBill], today: date, next_payday: date) -> int:

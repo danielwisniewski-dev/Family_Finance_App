@@ -4,7 +4,7 @@
 
 This is a private household finance Android app for Daniel and Kara.
 
-The backend is the source of truth for money, budget, account, transaction, and safe-to-spend logic. Android must not fake financial state. Coach/AI features are advisory only and must not mutate budget data without explicit user action.
+The backend is the source of truth for money, budget, account, transaction, and dashboard cash-forecast logic. Android must not fake financial state. Coach/AI features are advisory only and must not mutate budget data without explicit user action.
 
 For broader product direction, read `docs/project-plan.md`.
 
@@ -17,7 +17,7 @@ Demo mode is a maintained app feature, not a disposable showcase. Read `docs/dem
 - Preserve the persistent **DEMO DATA** banner, automatic discard when leaving demo mode, and fresh sample data on reentry. There is no scenario selector or Reset demo button.
 - Keep each demo session's database, token, cached data, selected month and pending financial requests separate from real mode and other demo sessions. Demo routes must never use real Plaid/OpenAI providers or copy private household data.
 - For affected features, verify the normal workflow in both modes and update the feature-parity checklist/tests in `docs/demo-mode-plan.md`. A new feature is incomplete if it works only with the real household. Explicitly document an inherently production-only administration action and its clear demo explanation instead of silently calling production.
-- Include real → demo → real → fresh demo, synthetic Sync, Spending Check and a Provision Funds action in release smoke coverage. Verify unchanged real financial data, rejected cross-environment tokens, and no live provider calls. Record any unverified checks as pending; passing a synthetic test does not establish live bank correctness.
+- Include real → demo → real → fresh demo, synthetic Sync, dashboard cash/category balances and a Provision Funds action in release smoke coverage. Verify unchanged real financial data, rejected cross-environment tokens, and no live provider calls. Record any unverified checks as pending; passing a synthetic test does not establish live bank correctness.
 
 ## Repository Layout
 
@@ -32,14 +32,12 @@ Demo mode is a maintained app feature, not a disposable showcase. Read `docs/dem
 
 Use EveryDollar/Dave Ramsey-style monthly planning.
 
-Safe-to-spend must use both:
+Keep these separate and backend-calculated:
 
 1. budget category remaining
-2. real cash/account position after upcoming bills before next payday
+2. real cash/account position after upcoming bills before next payday and funded Provision Funds reserves, without double-counting funded bills or excluded accounts
 
-Safe-to-spend responses must include:
-
-“After upcoming bills, you would have about $___ left for ___ days until payday.”
+Spending Check was removed at Daniel's request on October 8, 2026. Do not restore a purchase-check screen, decision engine, coach explanation or notification workflow without a new request. Preserve the dashboard's cash-after-bills amount, days until payday and low-cushion indication; a missing payday must leave the forecast unavailable rather than inventing a balance.
 
 ## Current Scope Rules
 
@@ -91,7 +89,6 @@ Archived categories must preserve history but cannot be used for new:
 - manual spending
 - split lines
 - merchant rules
-- safe-to-spend requests
 
 Ignored transactions must not affect budget totals.
 
@@ -157,7 +154,7 @@ Avoid multiple full verification loops unless the milestone touches:
 
 * auth/security
 * Plaid/token handling
-* safe-to-spend math
+* dashboard cash-forecast math
 * cross-household access
 * transaction double-counting
 * production-readiness changes

@@ -215,15 +215,17 @@ class LivePlaidService(BankRefreshMixin, PlaidConnectionService):
                 with self.repository.connect() as conn:
                     conn.execute("UPDATE bank_sync_state SET transactions_checked_at=CURRENT_TIMESTAMP, transactions_updated_at=?, history_complete=?, transaction_error=0 WHERE plaid_item_id=?", (updated, int(complete), plaid_item_id))
                     mark_refresh_checked(conn, plaid_item_id, updated, complete)
+                    from .automatic_bank_sync import record_successful_sync
+                    record_successful_sync(conn, plaid_item_id)
                 return PlaidSyncOutcome(True, "transaction", **counts)
             except Exception as exc:
                 return self._failure(plaid_item_id, "transaction", exc)
 
     def _failure(self, item_id, kind, exc):
         code = exc.code if isinstance(exc, PlaidIntegrationError) else "PLAID_SYNC_INVALID"
-        message = ("Reconnect USAA in Settings, then sync again."
+        message = ("Reconnect USAA in Accounts / Settings to resume bank updates."
                    if code in {"ITEM_LOGIN_REQUIRED", "ITEM_LOCKED", "USER_PERMISSION_REVOKED", "ADDITIONAL_CONSENT_REQUIRED"}
-                   else "Bank sync did not finish. Try Sync again later; saved data was retained.")
+                   else "Bank sync did not finish. Retry later; saved data was retained.")
         with self.repository.connect() as conn:
             column = "balance_error" if kind == "balance" else "transaction_error"
             conn.execute(f"UPDATE bank_sync_state SET {column}=1 WHERE plaid_item_id=?", (item_id,))

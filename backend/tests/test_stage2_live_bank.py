@@ -125,25 +125,22 @@ class Stage2Tests(unittest.TestCase):
         self.assertFalse(self.repo.list_accounts(self.month)[0].included_in_cash_reality)
         self.assertFalse(bank_status(self.repo, self.month)["ready"])
 
-    def test_diagnostics_do_not_claim_live_spending_ready_before_reconciliation(self):
-        with patch('backend.app.db.household_today', return_value=self.today):
-            self.assertFalse(self.repo._safe_to_spend_diagnostic(self.month)["ok"])
-            self.ready()
-            self.assertTrue(self.repo._safe_to_spend_diagnostic(self.month)["ok"])
-
-    def test_current_cash_and_category_limits_required_after_reconciliation(self):
+    def test_bank_reconciliation_status_still_tracks_readiness(self):
+        self.assertFalse(bank_status(self.repo, self.month)["ready"])
         self.ready()
-        result = self.repo.safe_to_spend(budget_month_id=self.month, category_id=self.food, purchase_amount_cents=15000, today=self.today)
-        self.assertNotEqual(result.warning_level.value, "safe")
-        self.assertEqual(result.included_account_balance_cents, 48000)
-        self.assertIn("After upcoming bills", result.required_phrase)
+        self.assertTrue(bank_status(self.repo, self.month)["ready"])
 
-    def test_stale_sync_failure_and_missing_available_balance_block_safe_to_spend(self):
+    def test_dashboard_uses_current_cash_after_reconciliation(self):
+        self.ready()
+        summary = self.repo.get_summary(self.month, self.today)
+        self.assertEqual(summary.included_account_balance_cents, 48000)
+        self.assertTrue(summary.forecast_available)
+
+    def test_stale_sync_failure_and_missing_available_balance_block_reconciliation(self):
         item, _ = self.ready()
         for change in ["UPDATE bank_sync_state SET balance_checked_at='2000-01-01'", "UPDATE bank_sync_state SET transaction_error=1", "UPDATE cash_accounts SET available_balance_cents=NULL"]:
             with self.repo.connect() as conn: conn.execute(change)
-            with self.assertRaises(ValueError):
-                self.repo.safe_to_spend(budget_month_id=self.month, category_id=self.food, purchase_amount_cents=1, today=self.today)
+            self.assertFalse(bank_status(self.repo, self.month)["can_reconcile"])
             self.service.sync_balances(item); self.service.sync_transactions(item)
 
     def test_provider_freshness_and_history_not_successful_download_time(self):
@@ -289,7 +286,7 @@ class Stage2Tests(unittest.TestCase):
         self.repo.add_expected_bill(budget_month_id=october,name="Rent",amount_cents=10000,due_on=date(2026,10,1))
         self.repo.add_payday(household_id=self.household,payday_date=date(2026,10,5))
         with patch('backend.app.dates.household_today',return_value=date(2026,9,30)):
-            result=self.repo.safe_to_spend(budget_month_id=self.month,category_id=self.food,purchase_amount_cents=1,today=date(2026,9,30))
+            result=self.repo.get_summary(self.month, date(2026,9,30))
         self.assertEqual(result.bills_before_payday_cents,10000)
 
     def test_removed_transaction_reappears_for_review_without_old_assignment(self):
@@ -351,9 +348,9 @@ class Stage2Tests(unittest.TestCase):
             self.assertEqual(state["accounts"][0]["balance_cents"],48000)
             self.assertTrue(state["accounts"][0]["included_in_cash_reality"])
             self.assertEqual(request("POST",f"/budget-months/{self.month}/bank-reconciliation",{"revision":state["revision"]},tokens[1])[0],200)
-            result=request("POST","/safe-to-spend",{"budget_month_id":self.month,"category_id":self.food,"purchase_amount_cents":100,"today":self.today.isoformat()},tokens[0])
+            result=request("GET",f"/budget-months/{self.month}/summary?today={self.today.isoformat()}",token=tokens[0])
             self.assertEqual(result[0],200,result)
-            self.assertIn("After upcoming bills",result[1]["required_phrase"])
+            self.assertEqual(result[1]["included_account_balance_cents"],48000)
             other=self.repo.create_household("Other")
             other_month=self.repo.create_budget_month(household_id=other,month="2026-09")
             self.assertEqual(request("GET",f"/budget-months/{other_month}/bank-status",token=tokens[0])[0],403)
@@ -361,7 +358,7 @@ class Stage2Tests(unittest.TestCase):
             self.bank.fail_sync=True
             failure=request("POST","/plaid/sync",{"plaid_item_id":linked["plaid_item"]["id"],"sync_type":"transaction"},tokens[0])
             self.assertFalse(failure[1]["success"])
-            self.assertEqual(request("POST","/safe-to-spend",{"budget_month_id":self.month,"category_id":self.food,"purchase_amount_cents":100,"today":self.today.isoformat()},tokens[0])[0],400)
+            self.assertFalse(request("GET",f"/budget-months/{self.month}/bank-status",token=tokens[0])[1]["can_reconcile"])
         finally:
             server.task_dispatcher.shutdown(); server.close(); thread.join(timeout=5)
 

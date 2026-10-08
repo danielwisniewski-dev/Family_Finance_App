@@ -43,7 +43,7 @@ public final class TransactionReviewState {
 
     public static boolean canConfirmExisting(TransactionDetail detail) {
         return !detail.transaction.reviewed && !detail.transaction.ignored
-                && (detail.finalCategoryId != null || detail.isSplit() || detail.transaction.amountCents >= 0);
+                && (detail.finalCategoryId != null || detail.isSplit());
     }
 
     public static boolean matchesSelection(TransactionDetail selected, TransactionDetail current) {

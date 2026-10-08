@@ -2,7 +2,13 @@
 
 ## Purpose
 
-The September 29 release is [Ledger branding and daily bank sync](ledger-daily-sync.md): the chosen gold L coin icon, the name Ledger, and simpler Provision Funds contributions. Contributions no longer require next month's budget, completed transaction review, or monthly reconciliation. Same-day sync replaces the 15-minute download limit for contributions and spending checks; the spending check's category, review, reconciliation and cross-month bill requirements remain. The login screen now has a separate first-time setup page for connection details and the explained household setup check. Daniel also authorized [in-app Demo mode](demo-mode-plan.md) in this same update: the normal app with fictional data, a persistent banner, working synthetic bank actions, and automatic discard on exit. He authorized committing/publishing the branch, backend deployment and signed APK delivery September 29. Implementation commit `96ce24f438a16d668775bc02209139dc545ca8bd` is deployed with the existing household and bank connection preserved. The signed code-7 APK is verified and ready to install; physical-phone installation remains unverified. PR #23 is open and unmerged, with merge requiring separate approval. The feature/release notes distinguish deployed-runtime synthetic checks from the still-unverified household login/demo switch.
+October 8 release candidate, Ledger 0.8.0: Daniel retired Spending Check after a month of household use. The dashboard cash cushion and category balances support the household's manual decisions. Remove purchase-check screens, calculations, coach explanations and new check alerts; preserve cash-after-bills/reserves, days until payday, monthly budgeting and Provision Funds. Earlier milestone/release descriptions below are historical where they mention the checker. Daniel approved packaging and publishing the branch/PR. The [release handoff](ledger-0.8.0-release.md) records artifacts and the remaining deployment/merge steps.
+
+The same follow-up streamlines Transaction Detail: Split follows Assign category for spending; deposits apply to existing/new planned income instead of generic confirmation. Users may choose a budget month independently of bank posting dates, with a preview of category/income changes and retained bank-sync overrides. Backend links prevent duplicate receipts, preserve manual received amounts, and keep refunds/transfers separate. Maintain parity in demo mode; details and verification are in `docs/demo-mode-plan.md`.
+
+Automatic bank sync is also part of this unreleased follow-up: opening or returning to the app imports available bank data if either saved balance/transaction check is at least three hours old or from a previous household calendar day. The backend shares the decision across spouses, serializes sync requests and retains the successful-sync timestamp on failure. The dashboard stays usable with a small progress indicator and Retry on failure; the normal Sync button is removed. Reconnect USAA and Request fresh bank data remain in Accounts / Settings. Schema 7 preserves successful-sync and automatic-attempt timestamps; deploy the matching backend before installing this Android update.
+
+The September 29 release is [Ledger branding and daily bank sync](ledger-daily-sync.md): the chosen gold L coin icon, the name Ledger, and simpler Provision Funds contributions. Contributions no longer require next month's budget, completed transaction review, or monthly reconciliation. Same-day sync replaces the 15-minute download limit for contributions and spending checks; the spending check's category, review, reconciliation and cross-month bill requirements remain. The login screen now has a separate first-time setup page for connection details and the explained household setup check. Daniel also authorized [in-app Demo mode](demo-mode-plan.md) in this same update: the normal app with fictional data, a persistent banner, working synthetic bank actions, and automatic discard on exit. He authorized committing/publishing the branch, backend deployment and signed APK delivery September 29. Implementation commit `96ce24f438a16d668775bc02209139dc545ca8bd` is deployed with the existing household and bank connection preserved. The signed code-7 APK is verified and ready to install; physical-phone installation remains unverified. PR #23 merged September 29 at `9dffab8`. The feature/release notes distinguish deployed-runtime synthetic checks from the still-unverified household login/demo switch.
 
 The bank integration baseline is [Stage 2 private USAA/Plaid integration](stage-2-usaa-plaid.md), merged in PR #19 and deployed September 12, 2026. Native USAA linking and the user's bank-data comparison passed; Daniel reported the app working well on September 17. The deployed application baseline before Ledger is the September 23 Provision Funds release described below. Earlier milestone descriptions remain historical background; the Stage 2 record distinguishes completed checks from acceptance checks not yet individually recorded.
 
@@ -21,7 +27,7 @@ The app should help the household make better spending decisions before money di
 - Monthly planned budgeting
 - Live account awareness
 - Transaction review
-- Safe-to-spend checks
+- Dashboard cash-after-bills and category balances
 - Firm, practical accountability
 - Later AI-assisted coaching
 
@@ -31,16 +37,7 @@ This is a private family tool, not a public product.
 
 ## Core Product Principle
 
-The app must never answer based only on bank balance.
-
-Every safe-to-spend answer should consider both:
-
-1. Budget line remaining
-2. Real cash remaining after upcoming bills before the next payday
-
-Required safe-to-spend phrase pattern:
-
-> After upcoming bills, you would have about $___ left for ___ days until payday.
+The household compares two backend-calculated facts: budget category remaining and included cash after upcoming bills before the next payday and funded reserves. Display both clearly without making a hypothetical purchase decision.
 
 ---
 
@@ -98,37 +95,11 @@ Credit cards are intentionally excluded because the household is pausing credit 
 
 ---
 
-## Safe-to-Spend Logic
+## Dashboard Cash Forecast
 
-For a purchase request, the backend should calculate:
+The backend calculates included account cash, unpaid bills before the next payday, funded reserves, remaining cash, days until payday, and the configured low-cushion flag. Fund-backed bills and excluded accounts must not be counted twice. Category remaining stays a separate figure.
 
-- Requested amount
-- Selected budget category
-- Category remaining before purchase
-- Category remaining after purchase
-- Included account balance
-- Bills expected before next payday
-- Cash remaining after those bills
-- Days until next payday
-- Cash cushion per day
-- Warning level
-
-Warning levels:
-
-- `safe`
-- `caution`
-- `no`
-- `discuss`
-
-A purchase may fit the category but still receive a caution if the remaining cash cushion is low relative to the number of days until payday.
-
-The app should clearly explain:
-
-- Whether the purchase fits the budget line
-- How much remains in that line
-- How much cash remains after bills
-- How many days remain until payday
-- Whether the cushion is low
+The dashboard must remain readable without a payday, with unknown forecast fields clearly unavailable. Spending Check and its required purchase-answer phrase are retired; no purchase amount, safe/no/discuss decision, or new check notification is generated.
 
 ---
 
@@ -170,7 +141,7 @@ The eventual AI coach should be:
 
 The agent may eventually:
 
-- Explain safe-to-spend results
+- Explain dashboard cash and budget balances
 - Suggest moving money between categories
 - Suggest creating or reducing categories
 - Flag risky spending
@@ -377,7 +348,7 @@ Likely screens:
 4. Category detail
 5. Transactions
 6. Uncategorized transaction review
-7. Safe-to-spend check
+7. Dashboard cash forecast and budget balances
 8. Budget change approval placeholder
 9. Settings / accounts
 
@@ -420,7 +391,7 @@ The mock provider is deterministic and does not require an OpenAI, Anthropic, Ge
 
 The coach may:
 
-- Explain safe-to-spend results
+- Explain dashboard cash and budget balances
 - Suggest caution/no/discuss
 - Draft budget changes for later approval
 
@@ -453,7 +424,7 @@ The agent should use backend-calculated numbers only.
 
 Agent may:
 
-- Explain safe-to-spend results
+- Explain dashboard cash and budget balances
 - Suggest budget changes
 - Draft budget changes for approval
 - Flag risky spending
@@ -490,7 +461,7 @@ Notify on:
 - Funding changed
 - Money moved between categories
 - Transaction recategorized
-- Safe-to-spend request marked discuss
+- Explicit advisory budget-change discussion (Spending Check alerts are retired)
 - Low cash cushion warning
 
 ---
