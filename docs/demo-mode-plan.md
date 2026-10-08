@@ -103,6 +103,10 @@ Use disposable synthetic real/demo contexts for local acceptance, never the hous
 
 Keep this record current for each release. Preserve earlier evidence as historical results, and explicitly name any workflow or deployment check that has not been verified.
 
+### October 8 release packaging
+
+- Ledger `0.8.0-ledger` / code 8 is signed with the original certificate and has passed a disposable-emulator update from 0.7.1 plus offline login launch. Android unit tests/builds passed after the version change; the backend remains the verified 336-test implementation. [PR #24](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/24) is published and mergeable. The [release handoff](ledger-0.8.0-release.md) records the checksum, implementation commit, migration/rollout order and pending production/phone checks. No production deployment or PR merge was performed.
+
 ### October 8 automatic sync follow-up
 
 - The shared authenticated `POST /budget-months/{id}/bank-sync` endpoint checks both balance and transaction timestamps against three hours and the household calendar day. Android checks after initial data load and on return to the foreground. It never runs an unattended background timer or sends a fresh-bank-data request. Concurrent spouses recheck freshness under the bank service lock; a failed automatic attempt is throttled for one minute, while an explicit Retry can try immediately.

@@ -1,6 +1,6 @@
 # Ledger — Household Finance
 
-Current release candidate: **Ledger `0.8.0-ledger` / code 8**, with backend schema **7**. The signed APK and PR are being prepared under Daniel's October 8 approval. Backend deployment and PR merge remain pending; deploy the matching backend before installing this update. See the [release package, verification and rollout handoff](docs/ledger-0.8.0-release.md).
+Current release candidate: **Ledger `0.8.0-ledger` / code 8**, with backend schema **7**. The signed APK is verified and [PR #24](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/24) is published under Daniel's October 8 approval. Backend deployment and PR merge remain pending; deploy the matching backend before installing this update. See the [release package, verification and rollout handoff](docs/ledger-0.8.0-release.md).
 
 This update adds dashboard month arrows with confirmed copy-forward for missing months, useful card navigation, automatic sync on opening/returning after three hours or on a new household day, and a coin that fills Android's circular launcher mask. It removes Spending Check and user-visible budget-month IDs. Transaction Detail can move activity between budget months without changing bank dates, apply deposits once to existing/new planned income, and show Split only for spending. The dashboard still displays cash after bills/reserves and category balances. Reconnect USAA and Request fresh bank data remain in Settings.
 

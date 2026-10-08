@@ -2,7 +2,7 @@
 
 ## Status
 
-Daniel approved preparing the signed APK and publishing the branch/PR on October 8, 2026. Release candidate: **`0.8.0-ledger` / version code 8**, backend schema **7**, branch **`codex/ledger-budget-workflow`**, based on `main` at `9dffab8` (merged PR #23). Publication details will be recorded below after the commit and PR are created.
+Daniel approved preparing the signed APK and publishing the branch/PR on October 8, 2026. Release candidate: **`0.8.0-ledger` / version code 8**, backend schema **7**, branch **`codex/ledger-budget-workflow`**, based on `main` at `9dffab8` (merged PR #23). Implementation commit **`6d9761550f21070a4c17dabc20a1a3fa6656a2f2`** is published in [PR #24](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/24), targeting `main`. The PR is open, ready for review and mergeable; no GitHub CI checks are configured. The recorded local verification supplies the test evidence.
 
 **Backend deployment and PR merge are pending. Deploy the matching backend before installing this APK.** This handoff records a prepared release, not a production deployment. Do not archive away the APK or signing materials when closing the chat; they remain in the original project workspace.
 
@@ -38,7 +38,7 @@ The existing signing material lives under ignored `work/private-beta-signing`. N
 - Native synthetic walkthroughs: dashboard month navigation/copy cancellation/card destinations; transaction move/cancel/round trip; linked deposit existing/new income; no deposit Split; circular launcher render; automatic cold-open sync; recent foreground return skipping provider work; failure retaining dashboard/timestamp; successful Retry; unsaved income form retained through delayed sync.
 - Real → demo → real → fresh demo passed. Settings recovery controls and synthetic fresh-bank-data requests work. The maintained backend smoke covers Provision Funds, rejected cross-environment tokens, unchanged real data and zero outbound provider calls. Seed data remains compatible with schema 7 and real domain operations.
 - Verification fixes included the Android resumed lifecycle for quick app switches, historical migration fixtures, null import-hint handling and preserving pending-spending review state. Temporary test helpers were corrected for actual labels/HTTP status and do not ship in the app.
-- Source diff/secret/junk checks are required again on the staged release candidate before publication. The unchanged fake Plaid-shaped token in the existing redaction test is a reviewed test fixture.
+- The final 58-file branch secret/junk scan, staged diff check and working-tree review passed before publication. No signing material, APK, database, log or pre-existing attachment was staged. The unchanged fake Plaid-shaped token in the existing redaction test is a reviewed fixture. The only remaining untracked directory is the pre-existing `.codex-remote-attachments/`, deliberately untouched.
 - Signed-release smoke passed on a disposable Pixel emulator: installed signed 0.7.1, updated in place to signed 0.8.0, verified code 8 and the login screen, and checked for fatal crashes (none). Wi-Fi and mobile data were disabled; no physical phone or live household was used. Physical-phone installation and live USAA transaction correctness remain unverified.
 
 ## Backend migration and rollout
@@ -56,7 +56,7 @@ Do not roll a schema-5-only backend back onto a schema-7 database. If recovery i
 
 ## Publication and remaining work
 
-- Signed APK prepared and verified; release commit/PR publication in progress.
+- Signed APK prepared and verified; implementation commit `6d9761550f21070a4c17dabc20a1a3fa6656a2f2` is pushed on `codex/ledger-budget-workflow`. [PR #24](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/24) is open against `main`, ready for review and mergeable. A subsequent documentation-only closeout commit records this publication without changing the packaged application or backend.
 - Backend deployment, production migration verification and physical-phone installation: pending.
 - PR merge: pending explicit approval.
-- Prior PR #23 is already merged into `main`; its old open-PR wording in the current docs has been corrected.
+- Prior PR #23 is already merged into `main`; its old open-PR wording in the current docs has been corrected. Temporary fixture servers/emulators are stopped. Archiving the chat does not deploy or merge the PR; this checked-in handoff and the versioned local APK preserve what a later rollout needs.
