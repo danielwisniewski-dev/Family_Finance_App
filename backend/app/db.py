@@ -25,14 +25,10 @@ from .domain import (
     MerchantRule,
     NotificationEvent,
     PlaidItemLine,
-    SafeToSpendResult,
     TransactionCategoryAssignment,
     TransactionDetail,
     TransactionLine,
     TransactionUpsertResult,
-    Urgency,
-    WarningLevel,
-    calculate_safe_to_spend,
     summarize_budget,
 )
 
@@ -348,7 +344,6 @@ class BudgetRepository(FundRepositoryMixin):
         checks.append(diagnostic_check("ignored_transactions_not_counted", ignored_assignment_count == 0, "Ignored transactions have no active budget assignments.", "Ignored transactions still have active budget assignments.", ignored_assignment_count))
         checks.append(diagnostic_check("only_outflows_assigned", non_outflow_assignment_count == 0, "Spending categories contain only outgoing transactions.", "Review incoming or zero-value transactions with legacy spending assignments; budget totals may be overstated.", non_outflow_assignment_count))
         checks.append(diagnostic_check("archived_categories_unused", archived_rule_count == 0, "No active merchant rules target archived categories; historical assignments are preserved.", "Active merchant rules still target archived categories.", archived_rule_count))
-        checks.append(self._safe_to_spend_diagnostic(active_budget_month_id))
         return {
             "backend_reachable": True,
             "database_initialized": setup["initialized"],
@@ -363,29 +358,6 @@ class BudgetRepository(FundRepositoryMixin):
             },
         }
 
-    def _safe_to_spend_diagnostic(self, budget_month_id: int | None) -> dict[str, object]:
-        if budget_month_id is None:
-            return diagnostic_check("safe_to_spend_ready", False, "", "No active budget month is available for safe-to-spend.", 0)
-        try:
-            from .bank_data import require_bank_ready
-            require_bank_ready(self, budget_month_id, household_today())
-            snapshot = self._load_snapshot(budget_month_id)
-            category = next((item for item in snapshot["categories"] if not item.archived), None)
-            if category is None:
-                return diagnostic_check("safe_to_spend_ready", False, "", "No active category is available for safe-to-spend.", 0)
-            calculate_safe_to_spend(
-                category=category,
-                purchase_amount_cents=1,
-                included_account_balance_cents=snapshot["included_account_balance_cents"],
-                expected_bills=snapshot["expected_bills"],
-                paydays=snapshot["paydays"],
-                today=household_today(),
-                urgency="planned_want",
-                low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
-            )
-            return diagnostic_check("safe_to_spend_ready", True, "Safe-to-spend can be calculated for the active budget month.", "", 1)
-        except Exception as exc:
-            return diagnostic_check("safe_to_spend_ready", False, "", str(exc), 0)
 
     def initialize_private_household(self, *, household_name: str, users: Iterable[dict[str, str]]) -> dict[str, Any]:
         household_name = clean_required_text(household_name, "household_name")
@@ -766,7 +738,7 @@ class BudgetRepository(FundRepositoryMixin):
         with self.connect() as connection:
             budget_month = self._require_budget_month(connection, budget_month_id)
             income_rows = connection.execute(
-                "SELECT * FROM income_plan WHERE budget_month_id = ? ORDER BY id",
+                "SELECT * FROM income_totals WHERE budget_month_id = ? ORDER BY id",
                 (budget_month_id,),
             ).fetchall()
             group_rows = connection.execute(
@@ -854,7 +826,8 @@ class BudgetRepository(FundRepositoryMixin):
                 "name": row["name"],
                 "kind": row["kind"],
                 "planned_cents": int(row["planned_cents"]),
-                "received_cents": int(row["received_cents"]),
+                "received_cents": int(row["received_cents"] + row["linked_received_cents"]),
+                "linked_received_cents": int(row["linked_received_cents"]),
             }
             for row in income_rows
         ]
@@ -1473,11 +1446,16 @@ class BudgetRepository(FundRepositoryMixin):
                                   "plaid_transaction_id": plaid_transaction_id},
                     )
                 date_moved = existing["occurred_on"][:7] != occurred_on.isoformat()[:7]
-                if date_moved:
+                if date_moved and existing["budget_month_override_id"] is None:
                     self._supersede_active_assignments(connection, transaction_id)
                     assignments = ()
                     connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
                     connection.execute("UPDATE account_transactions SET reviewed=0 WHERE id=?", (transaction_id,))
+                if (existing["amount_cents"] != amount_cents or pending
+                        or (date_moved and existing["budget_month_override_id"] is None)):
+                    removed_income = connection.execute("DELETE FROM transaction_income WHERE transaction_id=?", (transaction_id,)).rowcount
+                    if removed_income:
+                        connection.execute("UPDATE account_transactions SET reviewed=0 WHERE id=?", (transaction_id,))
                 if existing["amount_cents"] != amount_cents:
                     connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
                     self._supersede_active_assignments(connection, transaction_id)
@@ -1550,6 +1528,7 @@ class BudgetRepository(FundRepositoryMixin):
                 return False
             already_removed = bool(row["ignored"]) and row["ignored_reason"] == "Removed by Plaid sync"
             self._supersede_active_assignments(connection, int(row["id"]))
+            connection.execute("DELETE FROM transaction_income WHERE transaction_id=?", (row["id"],))
             connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (row["id"],))
             connection.execute(
                 """
@@ -1720,6 +1699,18 @@ class BudgetRepository(FundRepositoryMixin):
                 raise LookupError(f"Transaction {transaction_id} not found")
             return self._transaction_detail_from_row(connection, row)
 
+    def apply_transaction_income(self, transaction_id, income_id=None, new_income=None, actor_user_id=None, **options):
+        from .transaction_planning import apply_income
+        return apply_income(self, transaction_id, income_id, new_income, actor_user_id, **options)
+
+    def remove_transaction_income(self, transaction_id, actor_user_id=None):
+        from .transaction_planning import remove_income
+        return remove_income(self, transaction_id, actor_user_id)
+
+    def move_transaction_month(self, transaction_id, budget_month_id, **options):
+        from .transaction_planning import move_month
+        return move_month(self, transaction_id, budget_month_id, **options)
+
     def assign_transaction_refund(self, transaction_id, category_id, actor_user_id=None):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1728,6 +1719,7 @@ class BudgetRepository(FundRepositoryMixin):
             if transaction["amount_cents"] <= 0 or transaction["pending"]:
                 raise ValueError("Only a posted incoming transaction can be applied as a refund")
             self._supersede_active_assignments(connection, transaction_id)
+            connection.execute("DELETE FROM transaction_income WHERE transaction_id=?", (transaction_id,))
             connection.execute("INSERT INTO transaction_refunds(transaction_id,budget_category_id,amount_cents) VALUES (?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET budget_category_id=excluded.budget_category_id,amount_cents=excluded.amount_cents", (transaction_id, category_id, transaction["amount_cents"]))
             connection.execute("UPDATE account_transactions SET reviewed=1, ignored=0, ignored_reason=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (transaction_id,))
             self._record_transaction_event(connection, transaction_id=transaction_id, event_type="refund_assigned", category_id=category_id, amount_cents=transaction["amount_cents"])
@@ -2014,6 +2006,7 @@ class BudgetRepository(FundRepositoryMixin):
             connection.execute("DELETE FROM transaction_refunds WHERE transaction_id=?", (transaction_id,))
             self._require_transaction(connection, transaction_id)
             if ignored:
+                connection.execute("DELETE FROM transaction_income WHERE transaction_id=?", (transaction_id,))
                 self._supersede_active_assignments(connection, transaction_id)
             connection.execute(
                 """
@@ -2594,7 +2587,13 @@ class BudgetRepository(FundRepositoryMixin):
             return
         values.append(income_id)
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             before = self._notification_context_for_income(connection, income_id)
+            if received_cents is not None:
+                linked = connection.execute("SELECT linked_received_cents FROM income_totals WHERE id=?", (income_id,)).fetchone()[0]
+                if received_cents < linked:
+                    raise ValueError("Received amount includes linked deposits. Unlink a deposit from Transaction Detail before reducing it below those deposits.")
+                values[assignments.index("received_cents = ?")] = received_cents - linked
             connection.execute(f"UPDATE income_plan SET {', '.join(assignments)} WHERE id = ?", values)
             self._insert_notification_event(
                 connection,
@@ -2620,6 +2619,7 @@ class BudgetRepository(FundRepositoryMixin):
     def remove_income(self, *, income_id: int, actor_user_id: int | None = None) -> None:
         with self.connect() as connection:
             before = self._notification_context_for_income(connection, income_id)
+            connection.execute("UPDATE account_transactions SET reviewed=0 WHERE id IN (SELECT transaction_id FROM transaction_income WHERE income_id=?)", (income_id,))
             connection.execute("DELETE FROM income_plan WHERE id = ?", (income_id,))
             self._insert_notification_event(
                 connection,
@@ -3082,72 +3082,6 @@ class BudgetRepository(FundRepositoryMixin):
             reserve_issues=tuple(funds["issues"]),
         )
 
-    def safe_to_spend(
-        self,
-        *,
-        budget_month_id: int,
-        category_id: int,
-        purchase_amount_cents: int,
-        today: date,
-        urgency: Urgency = "planned_want",
-        actor_user_id: int | None = None,
-    ) -> SafeToSpendResult:
-        from .bank_data import require_bank_ready
-        # Hold off writers while freshness, categories, bills and account balances are
-        # read. Release before emitting notifications through a separate connection.
-        with self.connect() as guard:
-            guard.execute("BEGIN IMMEDIATE")
-            require_bank_ready(self, budget_month_id, today)
-            snapshot = self._load_snapshot(budget_month_id)
-            category = next((item for item in snapshot["categories"] if item.id == category_id), None)
-            funds = cash_context(guard, snapshot["budget_month"]["household_id"], budget_month_id, today,
-                                 fund_id=category.reserve_fund_id if category else None,
-                                 purchase_amount_cents=purchase_amount_cents)
-            if funds["issues"]:
-                raise ValueError(funds["issues"][0])
-        category = next((item for item in snapshot["categories"] if item.id == category_id), None)
-        if category is None:
-            raise LookupError(f"Category {category_id} is not part of budget month {budget_month_id}")
-        result = calculate_safe_to_spend(
-            category=category,
-            purchase_amount_cents=purchase_amount_cents,
-            included_account_balance_cents=snapshot["included_account_balance_cents"],
-            expected_bills=snapshot["expected_bills"],
-            paydays=snapshot["paydays"],
-            today=today,
-            urgency=urgency,
-            low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
-            reserved_cash_cents=funds["reserved_cash_cents"],
-            funded_purchase_cents=funds["funded_purchase_cents"],
-            reserve_covered_bills_cents=funds["reserve_covered_bills_cents"],
-            reserve_covered_bills_after_cents=funds["reserve_covered_bills_after_cents"],
-        )
-        if result.warning_level in {
-            WarningLevel.CAUTION,
-            WarningLevel.NO,
-            WarningLevel.DISCUSS_WITH_SPOUSE,
-        }:
-            warning = result.warning_level.value
-            event_suffix = "discuss" if warning == "discuss_with_spouse" else warning
-            self.create_notification_event(
-                household_id=int(snapshot["budget_month"]["household_id"]),
-                budget_month_id=budget_month_id,
-                event_type=f"safe_to_spend_{event_suffix}",
-                actor_user_id=actor_user_id,
-                affected_entity_type="category",
-                affected_entity_id=category_id,
-                title="Safe-to-spend needs attention",
-                message=f"{category.name}: {result.required_phrase}",
-                severity="important" if result.warning_level == WarningLevel.NO else "caution",
-                metadata={
-                    "category_id": category_id,
-                    "purchase_amount_cents": purchase_amount_cents,
-                    "warning_level": warning,
-                    "category_remaining_after_cents": result.category_remaining_after_cents,
-                    "cash_after_purchase_and_bills_cents": result.cash_after_purchase_and_bills_cents,
-                },
-            )
-        return result
 
     def _active_assignments(self, connection: sqlite3.Connection, transaction_id: int) -> list[sqlite3.Row]:
         return connection.execute(
@@ -3507,6 +3441,8 @@ class BudgetRepository(FundRepositoryMixin):
 
     def _transaction_detail_from_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> TransactionDetail:
         transaction_id = int(row["id"])
+        budget = connection.execute("SELECT b.id,b.month FROM transaction_budget_months m JOIN budget_months b ON b.id=m.budget_month_id WHERE m.transaction_id=?", (transaction_id,)).fetchone()
+        income = connection.execute("SELECT i.id,i.name FROM transaction_income r JOIN income_plan i ON i.id=r.income_id WHERE r.transaction_id=?", (transaction_id,)).fetchone()
         refund = connection.execute("SELECT budget_category_id FROM transaction_refunds WHERE transaction_id=?", (transaction_id,)).fetchone()
         assignment_rows = connection.execute(
             """
@@ -3536,6 +3472,10 @@ class BudgetRepository(FundRepositoryMixin):
             suggestion_reason=suggestion["reason"],
             matching_rule_id=suggestion["rule_id"],
             refund_category_id=refund[0] if refund else None,
+            budget_month_id=budget['id'] if budget else None,
+            budget_month=budget['month'] if budget else None,
+            income_id=income['id'] if income else None,
+            income_name=income['name'] if income else None,
         )
 
     def _require_transaction(self, connection: sqlite3.Connection, transaction_id: int) -> sqlite3.Row:
@@ -3807,7 +3747,7 @@ class BudgetRepository(FundRepositoryMixin):
                 raise LookupError(f"Budget month {budget_month_id} not found")
 
             income_rows = connection.execute(
-                "SELECT * FROM income_plan WHERE budget_month_id = ? ORDER BY id",
+                "SELECT * FROM income_totals WHERE budget_month_id = ? ORDER BY id",
                 (budget_month_id,),
             ).fetchall()
             category_rows = connection.execute(
@@ -3880,7 +3820,7 @@ class BudgetRepository(FundRepositoryMixin):
                     name=row["name"],
                     kind=row["kind"],
                     planned_cents=row["planned_cents"],
-                    received_cents=row["received_cents"],
+                    received_cents=row["received_cents"] + row["linked_received_cents"],
                 )
                 for row in income_rows
             ],
@@ -4222,18 +4162,15 @@ def transaction_detail_to_dict(detail: TransactionDetail) -> dict[str, Any]:
         "suggestion_source": detail.suggestion_source,
         "suggestion_reason": detail.suggestion_reason,
         "matching_rule_id": detail.matching_rule_id,
+        "budget_month_id": detail.budget_month_id,
+        "budget_month": detail.budget_month,
+        "income_id": detail.income_id,
+        "income_name": detail.income_name,
     }
 
 
 def merchant_rule_to_dict(rule: MerchantRule) -> dict[str, Any]:
     return asdict(rule)
-
-
-def safe_to_spend_to_dict(result: SafeToSpendResult) -> dict[str, Any]:
-    payload = asdict(result)
-    payload["warning_level"] = result.warning_level.value
-    payload["next_payday"] = result.next_payday.isoformat()
-    return payload
 
 
 def notification_event_to_dict(event: NotificationEvent) -> dict[str, Any]:

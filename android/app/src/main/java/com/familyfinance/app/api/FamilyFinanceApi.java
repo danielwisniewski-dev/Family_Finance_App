@@ -7,7 +7,6 @@ import com.familyfinance.app.model.BudgetMonth;
 import com.familyfinance.app.model.CashAccount;
 import com.familyfinance.app.model.MerchantRule;
 import com.familyfinance.app.model.NotificationEvent;
-import com.familyfinance.app.model.SafeToSpendResult;
 import com.familyfinance.app.model.SetupStatus;
 import com.familyfinance.app.model.TransactionDetail;
 import com.familyfinance.app.model.ProvisionFunds;
@@ -157,7 +156,7 @@ public final class FamilyFinanceApi {
         } catch (ApiException exception) {
             if (action.transfer || !"contribution".equals(payload.optString("kind"))
                     || exception.status != 400 || !"bank_sync_required".equals(exception.code)) throw exception;
-            syncBankIfNeeded(payload.getInt("budget_month_id"), true);
+            syncBankForContribution(payload.getInt("budget_month_id"));
             // This explicit rejection made no financial change. Keep the same
             // request key, retry once, and let the backend recheck available cash.
             client.post(path, payload);
@@ -418,6 +417,22 @@ public final class FamilyFinanceApi {
         }
     }
 
+    /** The backend checks shared household timestamps and serializes concurrent phone requests. */
+    public JSONObject syncBankIfDue(int budgetMonthId, boolean force) throws ApiException {
+        try {
+            JSONObject result = client.post("/budget-months/" + budgetMonthId + "/bank-sync",
+                    new JSONObject().put("force", force));
+            if (!result.optBoolean("success")) {
+                throw new ApiException(result.optString("message", "Bank sync could not finish. Please retry."));
+            }
+            return result;
+        } catch (ApiException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            throw new ApiException("Could not check bank data", exception);
+        }
+    }
+
     /** Normal sync imports Plaid's available data; it never requests a bank refresh. */
     public JSONObject syncAvailableBankData(int budgetMonthId) throws ApiException {
         JSONObject status = getBankStatus(budgetMonthId);
@@ -574,6 +589,24 @@ public final class FamilyFinanceApi {
         ).optInt("unread_count");
     }
 
+    public JSONObject moveTransactionMonth(int transactionId, int monthId, boolean preview, String revision) throws Exception {
+        JSONObject body = new JSONObject().put("budget_month_id", monthId).put("preview", preview);
+        if (revision != null) body.put("revision", revision);
+        return client.patch("/transactions/" + transactionId + "/budget-month", body);
+    }
+
+    public void applyTransactionIncome(TransactionDetail detail, Integer incomeId, JSONObject newIncome) throws Exception {
+        int transactionId = detail.transaction.id;
+        JSONObject body = new JSONObject().put("budget_month_id", detail.budgetMonthId).put("amount_cents", detail.transaction.amountCents);
+        if (incomeId != null) body.put("income_id", incomeId);
+        if (newIncome != null) body.put("new_income", newIncome);
+        client.patch("/transactions/" + transactionId + "/income", body);
+    }
+
+    public void unlinkTransactionIncome(int transactionId) throws Exception {
+        client.patch("/transactions/" + transactionId + "/income", new JSONObject().put("remove", true));
+    }
+
     public TransactionDetail getTransaction(int transactionId) throws ApiException {
         return TransactionDetail.fromJson(client.get("/transactions/" + transactionId));
     }
@@ -692,18 +725,11 @@ public final class FamilyFinanceApi {
         }
     }
 
-    public SafeToSpendResult syncAndCheckSafeToSpend(
-            int budgetMonthId, int categoryId, int purchaseAmountCents
-    ) throws ApiException {
-        syncBankIfNeeded(budgetMonthId, false);
-        return safeToSpend(budgetMonthId, categoryId, purchaseAmountCents);
-    }
-
-    private void syncBankIfNeeded(int budgetMonthId, boolean force) throws ApiException {
+    private void syncBankForContribution(int budgetMonthId) throws ApiException {
         // Read current connection state instead of relying on the dashboard's cached snapshot.
         JSONObject status = getBankStatus(budgetMonthId);
         if (!(status.opt("enabled") instanceof Boolean)) {
-            throw new ApiException("Bank connection status is unavailable. Please retry this check.");
+            throw new ApiException("Bank connection status is unavailable. Please retry this update.");
         }
         if (status.optBoolean("enabled")) {
             Set<Integer> itemIds = new LinkedHashSet<>();
@@ -718,9 +744,6 @@ public final class FamilyFinanceApi {
                 }
             }
             if (itemIds.isEmpty()) throw new ApiException("Connect USAA in Accounts / Settings before using bank cash.");
-            // The backend owns the household calendar and freshness policy.
-            // Older backends without this flag retain the existing sync behavior.
-            if (!force && Boolean.FALSE.equals(status.opt("sync_required"))) return;
             for (int itemId : itemIds) {
                 syncPlaid(itemId, "balance");
                 syncPlaid(itemId, "transaction");
@@ -747,26 +770,6 @@ public final class FamilyFinanceApi {
             throw exception;
         } catch (Exception exception) {
             throw new ApiException("Could not build mark all notifications request", exception);
-        }
-    }
-
-    public SafeToSpendResult safeToSpend(
-            int budgetMonthId,
-            int categoryId,
-            int purchaseAmountCents
-    ) throws ApiException {
-        try {
-            JSONObject payload = new JSONObject();
-            payload.put("budget_month_id", budgetMonthId);
-            payload.put("category_id", categoryId);
-            payload.put("purchase_amount_cents", purchaseAmountCents);
-            payload.put("today", LocalDate.now().toString());
-            payload.put("urgency", "planned_want");
-            return SafeToSpendResult.fromJson(client.post("/safe-to-spend", payload));
-        } catch (ApiException exception) {
-            throw exception;
-        } catch (Exception exception) {
-            throw new ApiException("Could not build safe-to-spend request", exception);
         }
     }
 

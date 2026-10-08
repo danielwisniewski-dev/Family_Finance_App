@@ -45,7 +45,7 @@ def create_demo_context(db_path: Path, today: date | None = None) -> DemoContext
     with repository.connect() as connection:
         user_id = connection.execute("SELECT id FROM users WHERE username='alex-demo'").fetchone()[0]
     month = repository.create_budget_month(household_id=household, month=today.strftime("%Y-%m"))
-    repository.add_income(budget_month_id=month, name="Alex's paychecks", kind="main", planned_cents=320_000, received_cents=200_000)
+    paycheck_income = repository.add_income(budget_month_id=month, name="Alex's paychecks", kind="main", planned_cents=320_000)
     repository.add_income(budget_month_id=month, name="Jamie's paychecks", kind="main", planned_cents=200_000)
     categories = {}
     for order, (group_name, specs) in enumerate((
@@ -126,7 +126,7 @@ def create_demo_context(db_path: Path, today: date | None = None) -> DemoContext
         {"category_id": categories["Groceries"], "amount_cents": 4_000},
         {"category_id": categories["Household Supplies"], "amount_cents": 2_200}))
     repository.assign_transaction_refund(ids["demo-refund"], funds["Car Repairs"]["category_id"])
-    repository.mark_transaction_reviewed(ids["demo-paycheck"])
+    repository.apply_transaction_income(ids["demo-paycheck"], paycheck_income)
     for key in ("transfer-in", "transfer-out"):
         repository.set_transaction_ignored(transaction_id=ids["demo-" + key], ignored=True, reason="Transfer between household accounts")
     for name, amount in (("Car Repairs", 80_000), ("Annual Insurance", 90_000), ("Gifts", 30_000)):
@@ -138,7 +138,6 @@ def create_demo_context(db_path: Path, today: date | None = None) -> DemoContext
         occurred_on=today, idempotency_key="demo-gift-release", note="Free up an unused earmark", actor_user_id=user_id)
     repository.create_merchant_rule(household_id=household, merchant_match_text="Maple Market", category_id=categories["Groceries"], actor_user_id=user_id)
     reconcile_bank(repository, month, bank_status(repository, month)["revision"])
-    repository.safe_to_spend(budget_month_id=month, category_id=categories["Groceries"], purchase_amount_cents=2_500, today=today, actor_user_id=user_id)
     login = repository.authenticate_local_user("alex-demo", password)
     if login is None:
         raise RuntimeError("Demo session could not be created")

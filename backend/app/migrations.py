@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-LATEST_VERSION = 5
+LATEST_VERSION = 7
 
 
 def add_column(connection, table, column, definition):
@@ -100,9 +100,47 @@ def bank_refresh_requests(connection):
         add_column(connection, "bank_sync_state", column, definition)
 
 
+def transaction_planning(connection):
+    add_column(connection, "account_transactions", "budget_month_override_id", "INTEGER REFERENCES budget_months(id)")
+    connection.execute("DROP VIEW transaction_budget_months")
+    connection.execute("""CREATE VIEW transaction_budget_months AS
+        SELECT t.id AS transaction_id, b.id AS budget_month_id
+        FROM account_transactions t JOIN cash_accounts a ON a.id=t.cash_account_id
+        JOIN budget_months anchor ON anchor.id=a.budget_month_id
+        JOIN budget_months b ON b.household_id=anchor.household_id AND
+          ((t.budget_month_override_id IS NOT NULL AND b.id=t.budget_month_override_id) OR
+           (t.budget_month_override_id IS NULL AND
+            ((a.plaid_item_id IS NOT NULL AND b.month=substr(t.occurred_on,1,7)) OR
+             (a.plaid_item_id IS NULL AND b.id=anchor.id))))""")
+    connection.execute("""CREATE TABLE transaction_income (
+        transaction_id INTEGER PRIMARY KEY REFERENCES account_transactions(id) ON DELETE CASCADE,
+        income_id INTEGER NOT NULL REFERENCES income_plan(id) ON DELETE CASCADE,
+        request_json TEXT NOT NULL DEFAULT '{}')""")
+    connection.execute("CREATE INDEX transaction_income_plan ON transaction_income(income_id)")
+    # Existing received amounts remain manual receipts. Linked deposits are added
+    # at read time, so retries, refunds and bank corrections cannot double-count.
+    connection.execute("""CREATE VIEW income_totals AS
+        SELECT i.*, COALESCE((SELECT SUM(t.amount_cents) FROM transaction_income r
+            JOIN account_transactions t ON t.id=r.transaction_id
+            JOIN transaction_budget_months m ON m.transaction_id=t.id
+            WHERE r.income_id=i.id AND t.ignored=0 AND t.pending=0 AND t.amount_cents>0
+                AND m.budget_month_id=i.budget_month_id),0) AS linked_received_cents
+        FROM income_plan i""")
+
+
+def automatic_bank_sync(connection):
+    add_column(connection, "bank_sync_state", "last_successful_sync_at", "TEXT")
+    add_column(connection, "bank_sync_state", "auto_sync_attempted_at", "TEXT")
+    from .automatic_bank_sync import record_successful_sync
+    for row in connection.execute("SELECT plaid_item_id FROM bank_sync_state").fetchall():
+        record_successful_sync(connection, row[0])
+
+
 MIGRATIONS = [(1, "local_mvp_baseline", baseline), (2, "expiring_sessions_and_throttling", private_sessions),
               (3, "live_bank_sync_and_months", live_bank_data), (4, "persistent_provision_funds", provision_funds),
-              (5, "explicit_bank_refresh_requests", bank_refresh_requests)]
+              (5, "explicit_bank_refresh_requests", bank_refresh_requests),
+              (6, "transaction_months_and_income", transaction_planning),
+              (7, "automatic_bank_sync", automatic_bank_sync)]
 
 
 def migrate(connection: sqlite3.Connection) -> None:

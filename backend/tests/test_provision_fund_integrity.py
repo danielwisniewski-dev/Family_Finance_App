@@ -81,11 +81,8 @@ class ProvisionFundIntegrityTests(unittest.TestCase):
         return next(row for row in self.repo.get_summary(month or self.month, self.today).categories
                     if row.id == category_id)
 
-    def ordinary_spending_check(self, amount=100):
-        return self.repo.safe_to_spend(
-            budget_month_id=self.month, category_id=self.ordinary,
-            purchase_amount_cents=amount, today=self.today,
-        )
+    def dashboard_summary(self):
+        return self.repo.get_summary(self.month, self.today)
 
     def next_month(self):
         following = (self.today.replace(day=28) + timedelta(days=4)).replace(day=1)
@@ -370,20 +367,14 @@ class ProvisionFundIntegrityTests(unittest.TestCase):
         copied_category = self.state(fund, month=copied)["category_id"]
         self.repo.update_fund(fund_id=fund["id"], budget_month_id=self.month, archived=True)
         with self.assertRaises((ValueError, LookupError)):
-            self.repo.safe_to_spend(
-                budget_month_id=copied, category_id=copied_category,
-                purchase_amount_cents=100, today=self.today,
-            )
+            self.repo.record_spending(category_id=copied_category, amount_cents=100, occurred_on=self.today)
         # A generic category editor must not bypass the fund's archived state.
         try:
             self.repo.update_category(category_id=fund["category_id"], archived=False)
         except ValueError:
             pass
         with self.assertRaises((ValueError, LookupError)):
-            self.repo.safe_to_spend(
-                budget_month_id=self.month, category_id=fund["category_id"],
-                purchase_amount_cents=100, today=self.today,
-            )
+            self.repo.record_spending(category_id=fund["category_id"], amount_cents=100, occurred_on=self.today)
         self.assertEqual(self.state(fund)["balance_cents"], 10_000)
 
     def test_positive_reserves_are_not_cancelled_by_an_overspent_fund(self):
@@ -394,32 +385,27 @@ class ProvisionFundIntegrityTests(unittest.TestCase):
         self.repo.assign_transaction_category(transaction_id=transaction, category_id=first["category_id"], reviewed=True)
         self.assertEqual(self.state(first)["balance_cents"], -3_000)
         self.assertEqual(self.repo.get_funds(self.month, self.today)["reserved_included_cents"], 10_000)
-        with self.assertRaises(ValueError):
-            self.ordinary_spending_check()
+        self.assertTrue(self.dashboard_summary().reserve_issues)
 
-    def test_ordinary_spending_protects_reserves_and_fund_purchase_can_use_its_own(self):
+    def test_dashboard_protects_reserves_and_actual_fund_purchase_updates_its_balance(self):
         first, second = self.fund("First"), self.fund("Second")
         self.contribute(first, 20_000)
         self.contribute(second, 30_000)
-        ordinary = self.ordinary_spending_check(5_000)
-        self.assertEqual(ordinary.cash_after_purchase_and_bills_cents, 45_000)
-        own = self.repo.safe_to_spend(
-            budget_month_id=self.month, category_id=first["category_id"],
-            purchase_amount_cents=5_000, today=self.today,
-        )
-        self.assertTrue(own.budget_line_fits)
-        self.assertEqual(own.category_remaining_after_cents, 15_000)
-        self.assertEqual(own.cash_after_purchase_and_bills_cents, 50_000)
-        self.assertIn("After upcoming bills, you would have about", own.required_phrase)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 50_000)
+        transaction = self.transaction(amount=-5_000)
+        self.repo.assign_transaction_category(transaction_id=transaction, category_id=first["category_id"], reviewed=True)
+        self.account_snapshot(95_000)
+        self.assertEqual(self.state(first)["balance_cents"], 15_000)
+        self.assertEqual(self.state(second)["balance_cents"], 30_000)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 50_000)
 
-    def test_cash_drop_blocks_spending_without_rewriting_saved_fund_balance(self):
+    def test_cash_drop_warns_in_dashboard_and_blocks_new_funding(self):
         fund = self.fund()
         self.contribute(fund, 40_000)
         self.account_snapshot(20_000)
         self.assertEqual(self.state(fund)["balance_cents"], 40_000)
         self.assertTrue(self.repo.get_funds(self.month, self.today)["issues"])
-        with self.assertRaises(ValueError):
-            self.ordinary_spending_check()
+        self.assertTrue(self.dashboard_summary().reserve_issues)
         with self.assertRaises((ValueError, PermissionError)):
             self.contribute(fund, 100)
 
@@ -428,10 +414,10 @@ class ProvisionFundIntegrityTests(unittest.TestCase):
         fund = self.fund(account_id=separate)
         self.contribute(fund, 10_000)
         self.assertEqual(self.repo.get_funds(self.month, self.today)["reserved_included_cents"], 0)
-        self.assertEqual(self.ordinary_spending_check(1_000).cash_after_purchase_and_bills_cents, 99_000)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 100_000)
         self.repo.set_account_included(separate, True)
         self.assertEqual(self.repo.get_funds(self.month, self.today)["reserved_included_cents"], 10_000)
-        self.assertEqual(self.ordinary_spending_check(1_000).cash_after_purchase_and_bills_cents, 109_000)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 110_000)
 
     def test_funded_upcoming_bill_is_not_reserved_again(self):
         fund = self.fund()
@@ -440,12 +426,12 @@ class ProvisionFundIntegrityTests(unittest.TestCase):
             budget_month_id=self.month, name="Synthetic fund bill", amount_cents=6_000,
             due_on=self.today + timedelta(days=1), reserve_fund_id=fund["id"],
         )
-        self.assertEqual(self.ordinary_spending_check(1_000).cash_after_purchase_and_bills_cents, 79_000)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 80_000)
         self.repo.add_expected_bill(
             budget_month_id=self.month, name="Synthetic ordinary bill", amount_cents=4_000,
             due_on=self.today + timedelta(days=2),
         )
-        self.assertEqual(self.ordinary_spending_check(1_000).cash_after_purchase_and_bills_cents, 75_000)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 76_000)
 
     def test_multiple_bills_share_fund_coverage_once_and_reserve_the_unfunded_remainder(self):
         fund = self.fund()
@@ -455,7 +441,7 @@ class ProvisionFundIntegrityTests(unittest.TestCase):
                 budget_month_id=self.month, name=f"Synthetic funded bill {offset}", amount_cents=8_000,
                 due_on=self.today + timedelta(days=offset), reserve_fund_id=fund["id"],
             )
-        self.assertEqual(self.ordinary_spending_check(1_000).cash_after_purchase_and_bills_cents, 83_000)
+        self.assertEqual(self.dashboard_summary().cash_after_bills_cents, 84_000)
 
     def test_transfer_and_release_preserve_total_reserve_without_creating_expenses(self):
         first, second = self.fund("First"), self.fund("Second")

@@ -111,7 +111,9 @@ class ApiSecurityTests(unittest.TestCase):
             connection.putheader("Content-Type", "application/json")
             connection.putheader("Content-Length", "2")
             connection.putheader("Content-Length", "2")
-            connection.endheaders(b"{}")
+            # Reject duplicate framing before reading a body. Sending one races
+            # the server's close and can reset the socket on Windows.
+            connection.endheaders()
             response = connection.getresponse()
             self.assertEqual(response.status, 400)
             response.read()
@@ -148,8 +150,6 @@ class ApiSecurityTests(unittest.TestCase):
             ("/income", {"budget_month_id": self.month, "name": "Pay", "kind": "main", "planned_cents": 1.5}),
             ("/categories", {"budget_group_id": self.group, "name": "New", "planned_cents": 1.5}),
             ("/expected-bills", {"budget_month_id": self.month, "name": "Bill", "amount_cents": 1.5, "due_on": "2026-06-23"}),
-            ("/safe-to-spend", {"budget_month_id": self.month, "category_id": self.category, "purchase_amount_cents": 1.5}),
-            ("/coach/safe-to-spend", {"budget_month_id": self.month, "category_id": self.category, "amount_cents": 1.5}),
             ("/coach/budget-change-suggestion", {"budget_month_id": self.month, "amount_cents": 1.5}),
         ]
         for path, payload in cases:

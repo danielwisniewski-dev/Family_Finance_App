@@ -158,61 +158,6 @@ class NotificationEventTests(unittest.TestCase):
         self.assertEqual(len(unignored), 1)
         self.assertEqual(unignored[0]["severity"], "caution")
 
-    def test_risky_safe_to_spend_results_create_notification_events(self) -> None:
-        self.repository.update_cash_account(account_id=self.account_id, balance_cents=45_000)
-        self.repository.add_expected_bill(
-            budget_month_id=self.budget_month_id,
-            name="Utilities",
-            amount_cents=15_000,
-            due_on=date(2026, 6, 23),
-        )
-
-        self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=self.groceries_id,
-            purchase_amount_cents=5_000,
-            today=date(2026, 6, 21),
-            urgency="need",
-        )
-        self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=self.dining_id,
-            purchase_amount_cents=25_000,
-            today=date(2026, 6, 21),
-            urgency="planned_want",
-        )
-        self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=self.groceries_id,
-            purchase_amount_cents=1_000,
-            today=date(2026, 6, 21),
-            urgency="household_discussion",
-        )
-
-        self.assertEqual(len(self.events("safe_to_spend_caution")), 1)
-        self.assertEqual(len(self.events("safe_to_spend_no")), 1)
-        self.assertEqual(len(self.events("safe_to_spend_discuss")), 1)
-
-    def test_safe_safe_to_spend_result_does_not_create_notification_event(self) -> None:
-        before = self.repository.unread_notification_count(
-            budget_month_id=self.budget_month_id,
-            user_id=self.spouse_one_id,
-        )
-
-        self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=self.groceries_id,
-            purchase_amount_cents=1_000,
-            today=date(2026, 6, 21),
-            urgency="planned_want",
-        )
-
-        after = self.repository.unread_notification_count(
-            budget_month_id=self.budget_month_id,
-            user_id=self.spouse_one_id,
-        )
-        self.assertEqual(after, before)
-        self.assertEqual(len(self.events("safe_to_spend_safe")), 0)
 
     def test_event_list_returns_newest_events_first(self) -> None:
         first_id = self.repository.create_notification_event(

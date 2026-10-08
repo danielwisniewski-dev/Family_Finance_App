@@ -8,8 +8,9 @@ import static org.junit.Assert.assertEquals;
 public final class TransactionLineTest {
     @Test
     public void explicitNullMerchantUsesTransactionName() throws Exception {
-        TransactionLine transaction = TransactionLine.fromJson(data().put("merchant_name", JSONObject.NULL));
+        TransactionLine transaction = TransactionLine.fromJson(data().put("merchant_name", JSONObject.NULL).put("category_hint", JSONObject.NULL));
         assertEquals("", transaction.merchantName);
+        assertEquals("", transaction.categoryHint);
         assertEquals("Bank transaction name", transaction.displayName());
     }
 

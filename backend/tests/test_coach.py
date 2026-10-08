@@ -15,7 +15,8 @@ from backend.app.coach import (
     CoachService,
     MockCoachProvider,
     OpenAICoachProvider,
-    SafeToSpendFactPacket,
+    BudgetChangeFactPacket,
+    coach_response_to_dict,
     build_coach_service_from_env,
 )
 
@@ -35,71 +36,6 @@ class CoachApiTests(unittest.TestCase):
         self.server.server_close()
         self.temp_dir.cleanup()
 
-    def test_coach_safe_to_spend_returns_deterministic_facts_and_phrase(self) -> None:
-        fixture = self.seed_budget(balance_cents=100_000, grocery_planned_cents=50_000)
-
-        result = self.post(
-            "/coach/safe-to-spend",
-            {
-                "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
-                "amount_cents": 7_500,
-                "today": "2026-06-21",
-                "urgency": "planned_want",
-                "purpose": "weekly groceries",
-            },
-        )
-
-        safe_to_spend = result["safe_to_spend"]
-        coach = result["coach"]
-        self.assertEqual(safe_to_spend["warning_level"], "safe")
-        self.assertEqual(coach["warning_level"], "safe")
-        self.assertEqual(safe_to_spend["cash_after_purchase_and_bills_cents"], 72_500)
-        self.assertIn(
-            "After upcoming bills, you would have about $725.00 left for 7 days until payday.",
-            coach["summary"],
-        )
-        self.assertIn(safe_to_spend["required_phrase"], coach["tradeoffs"])
-        self.assertIn("This uses backend-calculated budget and cash facts only.", coach["limitations"])
-
-    def test_coach_warning_level_matches_backend_result(self) -> None:
-        fixture = self.seed_budget(balance_cents=60_000, grocery_planned_cents=50_000)
-
-        caution = self.post(
-            "/coach/safe-to-spend",
-            {
-                "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
-                "amount_cents": 10_000,
-                "today": "2026-06-21",
-            },
-        )
-        no = self.post(
-            "/coach/safe-to-spend",
-            {
-                "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
-                "amount_cents": 60_000,
-                "today": "2026-06-21",
-            },
-        )
-        discuss = self.post(
-            "/coach/safe-to-spend",
-            {
-                "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
-                "amount_cents": 1_000,
-                "today": "2026-06-21",
-                "urgency": "household_discussion",
-            },
-        )
-
-        self.assertEqual(caution["safe_to_spend"]["warning_level"], "caution")
-        self.assertEqual(caution["coach"]["warning_level"], "caution")
-        self.assertEqual(no["safe_to_spend"]["warning_level"], "no")
-        self.assertEqual(no["coach"]["warning_level"], "no")
-        self.assertEqual(discuss["safe_to_spend"]["warning_level"], "discuss_with_spouse")
-        self.assertEqual(discuss["coach"]["warning_level"], "discuss")
 
     def test_coach_endpoints_do_not_mutate_budget_category_or_transaction_data(self) -> None:
         fixture = self.seed_budget(balance_cents=100_000, grocery_planned_cents=50_000)
@@ -127,15 +63,6 @@ class CoachApiTests(unittest.TestCase):
         summary_before = self.get(f"/budget-months/{fixture['budget_month_id']}/summary?today=2026-06-21")
         transaction_before = self.get(f"/transactions/{transaction_id}")
 
-        self.post(
-            "/coach/safe-to-spend",
-            {
-                "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
-                "amount_cents": 7_500,
-                "today": "2026-06-21",
-            },
-        )
         proposal = self.post(
             "/coach/budget-change-suggestion",
             {
@@ -206,15 +133,6 @@ class CoachApiTests(unittest.TestCase):
             included_in_cash_reality=True,
         )
 
-        safe_response = self.post(
-            "/coach/safe-to-spend",
-            {
-                "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
-                "amount_cents": 7_500,
-                "today": "2026-06-21",
-            },
-        )
         suggestion_response = self.post(
             "/coach/budget-change-suggestion",
             {
@@ -226,7 +144,7 @@ class CoachApiTests(unittest.TestCase):
             },
         )
 
-        serialized = json.dumps({"safe": safe_response, "suggestion": suggestion_response})
+        serialized = json.dumps({"suggestion": suggestion_response})
         self.assertNotIn("access_token", serialized)
         self.assertNotIn("access_token_ref", serialized)
         self.assertNotIn("dummy-token-reference-for-redaction", serialized)
@@ -236,10 +154,10 @@ class CoachApiTests(unittest.TestCase):
         fixture = self.seed_budget(balance_cents=100_000, grocery_planned_cents=50_000)
 
         missing_amount = self.post(
-            "/coach/safe-to-spend",
+            "/coach/budget-change-suggestion",
             {
                 "budget_month_id": fixture["budget_month_id"],
-                "category_id": fixture["groceries_id"],
+                "to_category_id": fixture["groceries_id"],
                 "today": "2026-06-21",
             },
             expect_error=True,
@@ -255,7 +173,7 @@ class CoachApiTests(unittest.TestCase):
             expect_error=True,
         )
 
-        self.assertEqual(missing_amount["error"], "amount_cents or purchase_amount_cents is required")
+        self.assertEqual(missing_amount["error"], "amount_cents is required")
         self.assertEqual(invalid_amount["error"], "amount_cents must be an integer")
 
     def seed_budget(self, *, balance_cents: int, grocery_planned_cents: int) -> dict[str, int]:
@@ -418,11 +336,11 @@ class OpenAICoachProviderTests(unittest.TestCase):
             return {"output_text": json.dumps(valid_openai_coach_payload())}
 
         provider = OpenAICoachProvider(api_key="test-key", model="test-model", transport=fake_transport)
-        response = provider.explain_safe_to_spend(sample_safe_to_spend_facts())
+        response = provider.suggest_budget_change(sample_budget_change_facts())
 
-        self.assertEqual(response.summary, "Safe: stay inside the grocery plan.")
-        self.assertEqual(response.warning_level, "safe")
-        self.assertEqual(response.proposed_budget_change, None)
+        self.assertEqual(response.summary, "Draft a budget adjustment for review.")
+        self.assertEqual(response.warning_level, "discuss")
+        self.assertEqual(response.proposed_budget_change.amount_cents, 1000)
         self.assertIn("json_schema", json.dumps(captured[0]))
         self.assertNotIn("test-key", json.dumps(captured[0]))
 
@@ -431,10 +349,10 @@ class OpenAICoachProviderTests(unittest.TestCase):
             raise TimeoutError("network timed out with provider details")
 
         provider = OpenAICoachProvider(api_key="test-key", transport=fake_timeout)
-        response = provider.explain_safe_to_spend(sample_safe_to_spend_facts(warning_level="caution"))
+        response = provider.suggest_budget_change(sample_budget_change_facts())
 
-        self.assertEqual(response.warning_level, "caution")
-        self.assertEqual(response.confidence, "low")
+        self.assertEqual(response.warning_level, "discuss")
+        self.assertEqual(response, MockCoachProvider().suggest_budget_change(sample_budget_change_facts()))
         serialized = json.dumps(response.__dict__, default=str)
         self.assertNotIn("test-key", serialized)
         self.assertNotIn("provider details", serialized)
@@ -447,11 +365,10 @@ class OpenAICoachProviderTests(unittest.TestCase):
             return {"output_text": json.dumps(response)}
 
         provider = OpenAICoachProvider(api_key="test-key", transport=fake_malformed)
-        response = provider.explain_safe_to_spend(sample_safe_to_spend_facts(warning_level="safe"))
+        response = provider.suggest_budget_change(sample_budget_change_facts())
 
-        self.assertEqual(response.summary, "Coach explanation is temporarily unavailable.")
-        self.assertEqual(response.warning_level, "safe")
-        self.assertEqual(response.confidence, "low")
+        self.assertEqual(response.warning_level, "discuss")
+        self.assertEqual(response, MockCoachProvider().suggest_budget_change(sample_budget_change_facts()))
         serialized = json.dumps(response.__dict__, default=str)
         self.assertNotIn("test-key", serialized)
         self.assertNotIn("maybe", serialized)
@@ -516,10 +433,10 @@ class OpenAICoachProviderTests(unittest.TestCase):
             transaction_before = get_json(base_url, f"/transactions/{transaction_id}", fixture["auth_token"])
             coach_response = post_json(
                 base_url,
-                "/coach/safe-to-spend",
+                "/coach/budget-change-suggestion",
                 {
                     "budget_month_id": fixture["budget_month_id"],
-                    "category_id": fixture["groceries_id"],
+                    "to_category_id": fixture["groceries_id"],
                     "amount_cents": 7_500,
                     "today": "2026-06-21",
                 },
@@ -539,7 +456,7 @@ class OpenAICoachProviderTests(unittest.TestCase):
 
         self.assertEqual(summary_before, summary_after)
         self.assertEqual(transaction_before, transaction_after)
-        self.assertEqual(coach_response["coach"]["summary"], "Safe: stay inside the grocery plan.")
+        self.assertEqual(coach_response["coach"]["proposed_budget_change"]["status"], "draft_only")
         self.assertEqual(len(captured_payloads), 1)
         serialized_input = json.dumps(captured_payloads)
         serialized_output = json.dumps(coach_response)
@@ -550,46 +467,14 @@ class OpenAICoachProviderTests(unittest.TestCase):
         self.assertNotIn("dummy-token-reference-for-redaction", serialized_output)
 
 
-def sample_safe_to_spend_facts(*, warning_level: str = "safe") -> SafeToSpendFactPacket:
-    return SafeToSpendFactPacket(
-        amount_cents=7_500,
-        category_id=1,
-        category_name="Groceries",
-        warning_level=warning_level,
-        budget_line_fits=True,
-        category_remaining_before_cents=50_000,
-        category_remaining_after_cents=42_500,
-        included_account_balance_cents=100_000,
-        bills_before_payday_cents=20_000,
-        cash_after_bills_before_purchase_cents=80_000,
-        cash_after_purchase_and_bills_cents=72_500,
-        days_until_payday=7,
-        required_phrase="After upcoming bills, you would have about $725.00 left for 7 days until payday.",
-        backend_facts=(
-            "The purchase fits the budget line.",
-            "$425.00 would remain in Groceries.",
-            "After upcoming bills, you would have about $725.00 left for 7 days until payday.",
-            "The remaining cash cushion is not low.",
-        ),
-        note=None,
-        purpose="weekly groceries",
-    )
+def sample_budget_change_facts():
+    return BudgetChangeFactPacket(1, "2026-06", 1000, 2, "Food", 5000, 3, "Fuel", 2000, 77000, 6, None, None)
 
 
 def valid_openai_coach_payload() -> dict[str, object]:
-    return {
-        "summary": "Safe: stay inside the grocery plan.",
-        "recommendation": "This purchase is reasonable if it is still needed.",
-        "tone": "firm_practical_not_shaming",
-        "warning_level": "safe",
-        "facts_used": ["Backend safe-to-spend warning level was safe."],
-        "tradeoffs": ["After upcoming bills, you would have about $725.00 left for 7 days until payday."],
-        "suggested_actions": ["Proceed only for the stated purpose."],
-        "requires_spouse_discussion": False,
-        "proposed_budget_change": None,
-        "confidence": "high",
-        "limitations": ["Uses backend-calculated facts only."],
-    }
+    payload = coach_response_to_dict(MockCoachProvider().suggest_budget_change(sample_budget_change_facts()))
+    payload["summary"] = "Draft a budget adjustment for review."
+    return payload
 
 
 def get_json(base_url: str, path: str, auth_token: str | None = None) -> dict[str, object]:

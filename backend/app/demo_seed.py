@@ -4,8 +4,7 @@ import argparse
 from datetime import date, timedelta
 from pathlib import Path
 
-from .db import BudgetRepository, safe_to_spend_to_dict
-from .domain import format_money
+from .db import BudgetRepository, summary_to_dict
 
 
 DEMO_DANIEL_PASSWORD = "daniel-local-demo-only"
@@ -181,20 +180,11 @@ def seed_demo(db_path: Path, today: date) -> dict[str, object]:
     )
     repository.add_payday(household_id=household_id, payday_date=today + timedelta(days=6))
 
-    result = repository.safe_to_spend(
-        budget_month_id=budget_month_id,
-        category_id=eating_out_id,
-        purchase_amount_cents=3_000,
-        today=today,
-        urgency="planned_want",
-        actor_user_id=daniel_user_id,
-    )
-
     return {
         "budget_month_id": budget_month_id,
         "household_id": household_id,
         "category_id": eating_out_id,
-        "result": result,
+        "summary": repository.get_summary(budget_month_id, today),
     }
 
 
@@ -207,19 +197,14 @@ def main() -> None:
         seeded = seed_demo(args.db, args.today)
     except FileExistsError:
         parser.error("Database already exists. It was not changed. Choose a new --db path.")
-    result = seeded["result"]
-    print("Safe-to-spend result")
-    print(f"Decision: {result.warning_level.value}")
-    print(f"Budget line remaining after purchase: {format_money(result.category_remaining_after_cents)}")
-    print(result.required_phrase)
     print(f"Demo database: {args.db}")
-    print(f"Budget month ID: {seeded['budget_month_id']}")
+    print(f"Budget month: {seeded['summary'].month}")
     print("Local-only demo credentials:")
     print(f"  Daniel: username daniel / password {DEMO_DANIEL_PASSWORD}")
     print(f"  Kara: username kara / password {DEMO_KARA_PASSWORD}")
     print("Android emulator backend URL: http://10.0.2.2:8080")
     print("Seed includes Daniel/Kara users, categories, accounts, assigned transactions, and uncategorized review items.")
-    print(safe_to_spend_to_dict(result))
+    print(summary_to_dict(seeded["summary"]))
 
 
 if __name__ == "__main__":

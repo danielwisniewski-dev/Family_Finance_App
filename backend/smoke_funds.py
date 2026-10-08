@@ -64,9 +64,7 @@ def main():
             assert overview["total_shortfall_cents"] == 5000
             summary = request("GET", f"/budget-months/{month}/summary", token=two)
             assert summary["cash_after_bills_cents"] == 15000
-            purchase = request("POST", "/safe-to-spend", {"budget_month_id": month,
-                "category_id": category, "purchase_amount_cents": 16000, "today": today.isoformat()}, one)
-            assert purchase["warning_level"] == "no"
+            assert summary["reserved_cash_cents"] == 2000
             next_month = (today.replace(day=28) + timedelta(days=4)).replace(day=1).strftime("%Y-%m")
             copied = request("POST", "/budget-months", {"household_id": household,
                 "month": next_month, "copy_from_budget_month_id": month}, one)

@@ -11,7 +11,7 @@ class DemoFeatureSmokeTests(unittest.TestCase):
         self.assertEqual(result["outbound_calls"], 0)
         self.assertEqual(result["funded_funds"], 3)
         self.assertEqual(result["reviewed_new_transactions"], 2)
-        for area in ("real_database_unchanged", "fresh_reentry", "normal_spending_guards",
+        for area in ("real_database_unchanged", "fresh_reentry", "dashboard_forecast_and_retired_check",
                      "fund_contribute_release_move", "budget_edit_copy_manual_spending",
                      "transaction_split_refund_ignore_rules", "coach_advisory_only", "notifications"):
             self.assertTrue(result[area], area)
