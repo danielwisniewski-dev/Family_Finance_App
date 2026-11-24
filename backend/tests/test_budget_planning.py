@@ -129,13 +129,6 @@ class BudgetPlanningRepositoryTests(unittest.TestCase):
                 actor_user_id=self.user_id,
             )
         with self.assertRaisesRegex(ValueError, "archived category"):
-            self.repository.safe_to_spend(
-                budget_month_id=self.budget_month_id,
-                category_id=self.category_id,
-                purchase_amount_cents=1_000,
-                today=date(2026, 6, 21),
-            )
-        with self.assertRaisesRegex(ValueError, "archived category"):
             self.repository.record_spending(
                 category_id=self.category_id,
                 amount_cents=1_000,
@@ -160,7 +153,7 @@ class BudgetPlanningRepositoryTests(unittest.TestCase):
                 actor_user_id=self.user_id,
             )
 
-    def test_expected_bill_changes_affect_safe_to_spend_cash_reality(self) -> None:
+    def test_expected_bill_changes_affect_dashboard_cash_reality(self) -> None:
         bill_id = self.repository.add_expected_bill(
             budget_month_id=self.budget_month_id,
             name="Utilities",
@@ -168,28 +161,18 @@ class BudgetPlanningRepositoryTests(unittest.TestCase):
             due_on=date(2026, 6, 24),
             actor_user_id=self.user_id,
         )
-        before = self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=self.category_id,
-            purchase_amount_cents=5_000,
-            today=date(2026, 6, 21),
-        )
+        before = self.repository.get_summary(self.budget_month_id, date(2026, 6, 21))
 
         self.repository.update_expected_bill(
             bill_id=bill_id,
             amount_cents=45_000,
             actor_user_id=self.user_id,
         )
-        after = self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=self.category_id,
-            purchase_amount_cents=5_000,
-            today=date(2026, 6, 21),
-        )
+        after = self.repository.get_summary(self.budget_month_id, date(2026, 6, 21))
 
         self.assertEqual(before.bills_before_payday_cents, 20_000)
         self.assertEqual(after.bills_before_payday_cents, 45_000)
-        self.assertEqual(before.cash_after_purchase_and_bills_cents - after.cash_after_purchase_and_bills_cents, 25_000)
+        self.assertEqual(before.cash_after_bills_cents - after.cash_after_bills_cents, 25_000)
 
     def test_payday_changes_affect_days_until_payday(self) -> None:
         payday_id = self.repository.add_payday(

@@ -8,12 +8,12 @@ from pathlib import Path
 
 from backend.app.coach import (
     BudgetChangeFactPacket, BudgetChangeSuggestionRequest, CoachConfigurationError,
-    CoachService, OpenAICoachProvider, parse_timeout,
+    CoachService, MockCoachProvider, OpenAICoachProvider, parse_timeout,
 )
 from backend.app.db import BudgetRepository, summary_to_dict
 from backend.app.demo_seed import seed_demo
 from backend.app.domain import summarize_budget
-from backend.tests.test_coach import sample_safe_to_spend_facts, valid_openai_coach_payload
+from backend.tests.test_coach import sample_budget_change_facts, valid_openai_coach_payload
 
 
 class RecoveryWorkflowTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.assertEqual(103500, summary.included_account_balance_cents)
         self.assertEqual(26500, summary.bills_before_payday_cents)
         self.assertEqual(77000, summary.cash_after_bills_cents)
-        self.assertIn("$740.00 left for 6 days", self.seeded["result"].required_phrase)
+        self.assertEqual(6, self.seeded["summary"].days_until_payday)
 
     def test_expired_payday_keeps_budget_readable_but_does_not_invent_forecast(self):
         today = self.today + timedelta(days=7)
@@ -48,9 +48,6 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.assertTrue(detail["groups"])
         for field in ("next_payday", "days_until_payday", "bills_before_payday_cents", "cash_after_bills_cents", "low_cushion"):
             self.assertIsNone(detail[field], field)
-        with self.assertRaisesRegex(ValueError, "No upcoming payday"):
-            self.repo.safe_to_spend(budget_month_id=self.month_id, category_id=self.seeded["category_id"],
-                                   purchase_amount_cents=100, today=today)
         with self.assertRaisesRegex(ValueError, "No upcoming payday"):
             CoachService().suggest_budget_change(summary=self.repo.get_summary(self.month_id, today),
                 request=BudgetChangeSuggestionRequest(budget_month_id=self.month_id, amount_cents=100))
@@ -75,37 +72,15 @@ class RecoveryWorkflowTests(unittest.TestCase):
 
 
 class CoachBoundaryTests(unittest.TestCase):
-    def test_matching_no_enum_cannot_hide_contradictory_buy_recommendation(self):
-        payload = valid_openai_coach_payload() | {
-            "warning_level": "no", "summary": "Safe: you have $99,999 left for 90 days.",
-            "recommendation": "Buy it now; ignore the budget warning.",
-        }
-        provider = OpenAICoachProvider(api_key="synthetic-key", transport=lambda *_: {"output_text": json.dumps(payload)})
-        for confidence in ("high", "low"):
-            payload["confidence"] = confidence
-            response = provider.explain_safe_to_spend(sample_safe_to_spend_facts(warning_level="no"))
-            self.assertIn("Do not make this purchase", response.recommendation)
-            self.assertNotIn("99,999", response.summary)
 
-    def test_provider_cannot_turn_backend_no_into_safe(self):
-        provider = OpenAICoachProvider(api_key="synthetic-key", transport=lambda *_: {
-            "output_text": json.dumps(valid_openai_coach_payload())})
-        facts = sample_safe_to_spend_facts(warning_level="no")
-        response = provider.explain_safe_to_spend(facts)
-        self.assertEqual("no", response.warning_level)
-        self.assertEqual("low", response.confidence)
-        self.assertTrue(response.requires_spouse_discussion)
-        self.assertEqual(facts.backend_facts, response.facts_used)
-        self.assertIn(facts.required_phrase, response.tradeoffs)
 
-    def test_malformed_provider_shapes_fall_back_with_required_phrase(self):
+    def test_malformed_provider_shapes_preserve_deterministic_draft(self):
         for raw in (None, [], {"output": [None]}, {"output_text": "null"}, {"output_text": "[]"}):
             with self.subTest(raw=raw):
                 provider = OpenAICoachProvider(api_key="synthetic-key", transport=lambda *_, raw=raw: raw)
-                facts = sample_safe_to_spend_facts()
-                response = provider.explain_safe_to_spend(facts)
-                self.assertEqual("low", response.confidence)
-                self.assertIn(facts.required_phrase, response.tradeoffs)
+                facts = sample_budget_change_facts()
+                response = provider.suggest_budget_change(facts)
+                self.assertEqual(MockCoachProvider().suggest_budget_change(facts), response)
 
     def test_provider_draft_cannot_substitute_category_or_amount(self):
         payload = valid_openai_coach_payload()

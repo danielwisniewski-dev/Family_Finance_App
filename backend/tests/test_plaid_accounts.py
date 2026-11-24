@@ -17,7 +17,6 @@ from backend.app.plaid import (
     PlaidTransactionSnapshot,
     PlaidTransactionSync,
 )
-from backend.app.domain import WarningLevel
 
 
 class PlaidAccountTests(unittest.TestCase):
@@ -91,7 +90,7 @@ class PlaidAccountTests(unittest.TestCase):
         self.assertEqual(with_savings.included_account_balance_cents, 330_000)
         self.assertEqual(after_excluding_second_checking.included_account_balance_cents, 275_000)
 
-    def test_connected_account_inclusion_changes_safe_to_spend_cash_reality(self) -> None:
+    def test_connected_account_inclusion_changes_dashboard_cash_reality(self) -> None:
         plaid_item_id = self.create_plaid_item()
         savings_id = self.repository.upsert_connected_account(
             budget_month_id=self.budget_month_id,
@@ -127,30 +126,16 @@ class PlaidAccountTests(unittest.TestCase):
             due_on=date(2026, 6, 24),
         )
 
-        excluded = self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=category_id,
-            purchase_amount_cents=5_000,
-            today=date(2026, 6, 21),
-            urgency="planned_want",
-        )
+        excluded = self.repository.get_summary(self.budget_month_id, date(2026, 6, 21))
 
         self.repository.set_account_included(savings_id, True)
 
-        included = self.repository.safe_to_spend(
-            budget_month_id=self.budget_month_id,
-            category_id=category_id,
-            purchase_amount_cents=5_000,
-            today=date(2026, 6, 21),
-            urgency="planned_want",
-        )
+        included = self.repository.get_summary(self.budget_month_id, date(2026, 6, 21))
 
         self.assertEqual(excluded.included_account_balance_cents, 40_000)
-        self.assertEqual(excluded.cash_after_purchase_and_bills_cents, 5_000)
-        self.assertEqual(excluded.warning_level, WarningLevel.CAUTION)
+        self.assertEqual(excluded.cash_after_bills_cents, 10_000)
         self.assertEqual(included.included_account_balance_cents, 90_000)
-        self.assertEqual(included.cash_after_purchase_and_bills_cents, 55_000)
-        self.assertEqual(included.warning_level, WarningLevel.SAFE)
+        self.assertEqual(included.cash_after_bills_cents, 60_000)
 
     def test_transaction_upsert_prevents_duplicate_plaid_transactions(self) -> None:
         plaid_item_id = self.create_plaid_item()

@@ -1,6 +1,10 @@
 # Ledger — Household Finance
 
-Android `0.7.1-ledger` / code 7 names the app **Ledger** and adds the selected gold L coin icon. Its backend was deployed September 29 at `96ce24f438a16d668775bc02209139dc545ca8bd`, with the existing household, schema 5, recovery key and bank connection preserved. [PR #23](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/23) is open and unmerged; merge requires separate approval. [Ledger release notes](docs/ledger-daily-sync.md) cover same-day bank sync, streamlined Provision Funds contributions, simpler login and [Demo mode](docs/demo-mode-plan.md). The signed `work/releases/ledger-0.7.1.apk` is verified with the original certificate and ready to install as an update, preserving app data. The artifact lives in the original project workspace, not the separate documentation closeout worktree. Physical-phone installation and a household login/demo switch against the deployed service remain unverified.
+Current release candidate: **Ledger `0.8.0-ledger` / code 8**, with backend schema **7**. The signed APK is verified and [PR #24](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/24) is published under Daniel's October 8 approval. Backend deployment and PR merge remain pending; deploy the matching backend before installing this update. See the [release package, verification and rollout handoff](docs/ledger-0.8.0-release.md).
+
+This update adds dashboard month arrows with confirmed copy-forward for missing months, useful card navigation, automatic sync on opening/returning after three hours or on a new household day, and a coin that fills Android's circular launcher mask. It removes Spending Check and user-visible budget-month IDs. Transaction Detail can move activity between budget months without changing bank dates, apply deposits once to existing/new planned income, and show Split only for spending. The dashboard still displays cash after bills/reserves and category balances. Reconnect USAA and Request fresh bank data remain in Settings.
+
+Android `0.7.1-ledger` / code 7 names the app **Ledger** and adds the selected gold L coin icon. Its backend was deployed September 29 at `96ce24f438a16d668775bc02209139dc545ca8bd`, with the existing household, schema 5, recovery key and bank connection preserved. [PR #23](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/23) merged September 29 at `9dffab8`. [Ledger release notes](docs/ledger-daily-sync.md) cover same-day bank sync, streamlined Provision Funds contributions, simpler login and [Demo mode](docs/demo-mode-plan.md). The signed `work/releases/ledger-0.7.1.apk` is verified with the original certificate and ready to install as an update, preserving app data. The artifact lives in the original project workspace, not the separate documentation closeout worktree. Physical-phone installation and a household login/demo switch against the deployed service remain unverified.
 
 The private Android beta is deployed on Render with the Stage 2 USAA/Plaid integration. PR #19 was merged and deployed on September 12, 2026; Daniel confirmed native USAA linking and matching bank data. On September 17 he reported that the app is working well. See [the Stage 2 runbook and acceptance record](docs/stage-2-usaa-plaid.md) for verified results and checks not yet individually recorded.
 
@@ -66,7 +70,7 @@ Milestone 4 adds Android MVP screens that call the local backend API:
 - Uncategorized review queue
 - Safe-to-spend check using backend-calculated results
 - Transaction category assignment, reviewed/unreviewed, and ignore/unignore actions where supported by the backend
-- Accounts/settings screen with backend URL, budget month ID, health check, and account inclusion display
+- Accounts/settings screen with backend URL, selected budget month, health check, and account inclusion display
 
 Milestone 5A adds backend-first AI coach scaffolding without connecting to a real AI API:
 
@@ -176,7 +180,7 @@ Do not commit real passwords. The demo credentials below are local-only values f
 
 Stage 1 adds ordered, transactional SQLite migrations with a version ledger. The known local MVP schema is the baseline; upgrades reject future versions and inconsistent history. Hosted startup creates an encrypted recovery archive before upgrading an existing database.
 
-The hosted beta already has an initialized household and a schema 5 database, verified after the September 23 Provision Funds/bank-sync release. Never reset or reseed it. The Ledger update requires no schema change. For an offline local import, use the copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
+The hosted beta already has an initialized household and a schema 5 database, verified after the September 23 Provision Funds/bank-sync release. Never reset or reseed it. Ledger 0.7.1 required no schema change. Ledger 0.8.0 requires the additive schema 6 and 7 upgrades described in the [release handoff](docs/ledger-0.8.0-release.md). For an offline local import, use the copy-and-upgrade procedure in [the stage 1 runbook](docs/stage-1-private-beta.md); it preserves the original and validates an encrypted recovery copy. Arbitrary historical schemas still require investigation before migration.
 
 Deferred by design:
 
@@ -243,7 +247,7 @@ Android manual category assignment sends `reviewed: true`. New selections start 
 
 ## Run Tests
 
-Demo mode is part of normal maintenance. When changing a feature, schema, provider contract or financial rule, update its fictional seed/provider as needed and verify the same workflow in real and demo mode. Use the [demo parity checklist](docs/demo-mode-plan.md#feature-parity-and-maintenance-checklist); do not substitute client-side calculations or relax backend checks to make a demo pass. Release smoke coverage includes switching modes, synthetic Sync, Spending Check, Provision Funds, fresh data after leaving/reentering, and isolation from real data/providers.
+Demo mode is part of normal maintenance. When changing a feature, schema, provider contract or financial rule, update its fictional seed/provider as needed and verify the same workflow in real and demo mode. Use the [demo parity checklist](docs/demo-mode-plan.md#feature-parity-and-maintenance-checklist); do not substitute client-side calculations or relax backend checks to make a demo pass. Release smoke coverage includes switching modes, synthetic Sync, dashboard cash/category balances, Provision Funds, fresh data after leaving/reentering, and isolation from real data/providers.
 
 Install the backend dependencies from `requirements.txt` into the Python environment used for tests; the hosted HTTP tests require Waitress. A missing test dependency is not a reason to skip those tests.
 
@@ -299,7 +303,7 @@ For a fresh local database, start the API with a new local SQLite path:
 python -m backend.app.api --db work\family_finance.sqlite --host 127.0.0.1 --port 8080
 ```
 
-In Android, open **First-time setup**, save backend URL `http://10.0.2.2:8080` and the intended budget month ID, then tap **Save and check household setup**. An initialized server directs you to login; a new server offers private household creation. The check itself creates or resets nothing. After creating the private household/users and logging in, create the starter budget month if needed. Hosted setup retains its private setup code and authorization requirements; this is not public signup or production identity management.
+In Android, open **First-time setup**, save backend URL `http://10.0.2.2:8080`, then tap **Save and check household setup**. An initialized server directs you to login; a new server offers private household creation. The check itself creates or resets nothing. After creating the private household/users and logging in, create the starter budget month if needed. Hosted setup retains its private setup code and authorization requirements; this is not public signup or production identity management.
 
 ## Plaid Sandbox Setup
 
@@ -328,7 +332,7 @@ Sandbox manual flow:
 4. Tap `Link bank with Plaid Sandbox`.
 5. Complete Plaid Link with Sandbox test credentials.
 6. Confirm linked checking/savings accounts appear.
-7. Use the available bank-sync controls in Accounts / settings; the live Stage 2 flow has a combined `Sync bank data` action.
+7. Open or return to the app to sync when due; verify the dashboard timestamp and any Retry notice. Accounts / Settings retains Reconnect USAA and Request fresh bank data.
 8. Confirm imported transactions appear in `Transactions` and items needing attention appear in `Transaction Review`.
 
 Credit cards, loans, and investments returned by Plaid are ignored for this MVP.
@@ -347,7 +351,7 @@ Invoke-RestMethod http://127.0.0.1:8080/budget-months/1/summary -Headers $header
 
 ## In-app Demo mode
 
-After logging into the real account, use **Accounts / Settings → Demo mode**. A fresh fictional household opens in the normal app, with a persistent **DEMO DATA** banner. Funded budgets, Provision Funds, accounts and transactions are ready to explore. Sync uses a synthetic bank; Spending Check and other financial actions use the same backend rules as real mode. There is no scenario selector or separate reset control.
+After logging into the real account, use **Accounts / Settings → Demo mode**. A fresh fictional household opens in the normal app, with a persistent **DEMO DATA** banner. Funded budgets, Provision Funds, accounts and transactions are ready to explore. Sync uses a synthetic bank; Dashboard forecasts, budget balances and fund actions use the same backend rules as real mode. There is no scenario selector or separate reset control.
 
 Demo changes remain within that session. Switching Demo mode off discards them and restores the real account's saved session and selected month; the next entry creates fresh data. The first version needs internet access. Expired sessions or a backend restart cannot resume discarded demo data. See the [lifecycle, maintenance contract and verification record](docs/demo-mode-plan.md).
 
@@ -392,7 +396,7 @@ If `python` is not available on PATH, use the bundled Codex Python runtime:
 C:\Users\Daniel\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m backend.app.demo_seed
 ```
 
-The seed prints the demo database path and budget month ID. Android defaults to budget month ID `1`, which matches a freshly created demo database.
+The seed prints the demo database path, budget month and dashboard summary. Android selects the backend's active budget month automatically.
 
 ## Run Local Development Demo API
 
@@ -428,7 +432,7 @@ Open Android Studio, then:
 3. Make sure the backend API is still running on Windows at `http://127.0.0.1:8080`.
 4. Run the `app` configuration.
 5. On the emulator login screen, open **First-time setup** and set the backend URL to `http://10.0.2.2:8080`.
-6. Set budget month ID to `1` for the local development seed, then save and return to login.
+6. Save and return to login. The active budget month is selected automatically.
 7. Log in with `daniel` / `daniel-local-demo-only` or `kara` / `kara-local-demo-only`.
 
 Android emulators use `10.0.2.2` to reach the host machine loopback address. Use `http://10.0.2.2:8080` in the app, not `http://127.0.0.1:8080`, because `127.0.0.1` inside the emulator points to the emulator itself.
@@ -446,9 +450,9 @@ Changing the backend URL signs out and clears cached financial data before conne
 
 ## Recovery behavior and local smoke
 
-- A budget remains readable when there is no upcoming payday. Cash forecast fields are `null` and `forecast_available` is false; the app prompts for a payday instead of showing a zero or a safe result. Safe-to-spend and coach budget proposals still require a future payday. Summary responses also include `as_of` and the backend's configured `low_cushion` decision.
+- A budget remains readable when there is no upcoming payday. Cash forecast fields are `null` and `forecast_available` is false; the app prompts for a payday instead of showing a zero or a safe result. Coach budget proposals still require a future payday; the purchase checker is retired. Summary responses also include `as_of` and the backend's configured `low_cushion` decision.
 - Copied months keep income plans but reset received amounts. Bank sync preserves category choices, reconciles changed single-category amounts, and returns changed splits to review while retaining their history. Pending-to-posted replacements count once. Batch transaction changes and their cursor commit together.
-- Incoming/zero transactions cannot be assigned as expenses. Existing unsupported assignments are preserved and flagged by diagnostics. Stage 2 supports explicit transfer exclusion and single-category refunds; imports still do not automatically plan income. Transaction dates determine budget-month membership, and connected accounts cannot be moved to another month by relinking. See the Stage 2 runbook for reconciliation and rollover rules.
+- Incoming/zero transactions cannot be assigned as expenses. Existing unsupported assignments are preserved and flagged by diagnostics. Stage 2 supports explicit transfer exclusion and single-category refunds; imports still do not automatically plan income. Transaction dates determine the default budget month; an explicit transaction month override takes precedence and survives Sync. Posted deposits can be linked once to planned income received amounts. Connected accounts cannot be moved to another month by relinking. See the Stage 2 runbook for reconciliation and rollover rules.
 - Money requests use exact whole cents. Fractional JSON cents, booleans, malformed dates and invalid flags are rejected; Android rejects fractional cents and overflowing amounts instead of silently rounding or wrapping them.
 
 Repeat the isolated HTTP/persistence smoke without starting another server or touching your local databases:
@@ -457,7 +461,7 @@ Repeat the isolated HTTP/persistence smoke without starting another server or to
 python -m backend.smoke_review
 ```
 
-It creates a temporary synthetic household, uses mock providers, exercises authorization, budgeting, categorization/splits/ignores and safe-to-spend, then verifies saved state after a server restart. It removes only its temporary data.
+It creates a temporary synthetic household, uses mock providers, exercises authorization, budgeting, categorization/splits/ignores and the dashboard forecast, then verifies saved state after a server restart. It removes only its temporary data.
 
 ## MVP Smoke Test
 
@@ -467,20 +471,19 @@ With the local development demo API running and the Pixel 8 emulator open, verif
 
 - Login succeeds with local-only Daniel or Kara demo credentials.
 - Dashboard shows real backend data: included account balance, bills before next payday, cash remaining after bills, days until payday, and uncategorized count.
-- Dashboard starts with the check-in streak, personal best, and daily encouragement. Its compact month/sync line and cash-cushion heading use backend data; the Transaction Review card opens the queue.
+- Dashboard starts with a prominent month switcher and last-sync timestamp, followed by the check-in streak. Missing next months offer confirmed copy-forward or Cancel. Cards open the related income, budget, transaction, bill, fund and notification screens.
 - Monthly budget shows polished backend groups/categories and supports budget month switching/copy-forward, category add/edit/archive, and funding edits.
-- Safe to spend reuses a successful sync from the current household day or syncs the enabled connected bank when required before requesting the backend result and required phrase. Failed sync stops calculation; review and explicit reconciliation gates remain. A local manual fixture without bank linking needs no sync.
 - Transaction Review shows empty or non-empty state from backend data, plus local-only queue progress/cleared messaging. Category choices start blank and are alphabetical. Select transactions assigns only the selected eligible rows and reports partial completion if a save fails.
 - Tapping a transaction opens transaction detail when demo transactions exist.
-- Transaction detail can assign and review a category in one save, split a transaction, confirm an existing assignment when needed, create a merchant rule, and ignore/unignore a transaction. Merchant rules opens an alphabetical list with Edit/Delete; those actions preserve past transaction categories.
+- Transaction Detail places Split after Assign category for spending, offers Apply to income for deposits without Split, and previews moves to another budget month without changing bank dates/cash. Verify cancellation, received totals, relinking/unlinking, exclusions and persistence after bank Sync. Merchant rules opens an alphabetical list with Edit/Delete; those actions preserve past transaction categories.
 - New basic assignments and splits do not add notifications. Existing notification history is retained.
-- Accounts / settings shows account inclusion, Plaid Sandbox actions, account settings, and diagnostics/integrity checks.
+- Accounts / Settings shows account inclusion, connection recovery/fresh data controls, account settings and diagnostics. In connected real/demo mode verify automatic sync on launch/return when due, recent-success skipping, and inline Retry with the old timestamp after failure. The local CLI seed has no live bank connection.
 - Logout clears the local MVP token and returns to the login screen.
 
 Real in current MVP:
 
 - Backend API calls from Android
-- Backend summary, account, transaction, review queue, transaction detail, safe-to-spend, category assignment, review, and ignore data
+- Backend summary, account, transaction, review queue, transaction detail, cash forecast, category assignment, review, and ignore data
 - Deterministic backend financial calculations
 - Local mock/demo account and transaction data
 - Local-only Android motivational progress/streak display state
@@ -505,28 +508,10 @@ Current scope and limitations:
 Milestone 5 coach routes are backend routes behind a provider abstraction:
 
 ```text
-POST /coach/safe-to-spend
 POST /coach/budget-change-suggestion
 ```
 
-Safe-to-spend coach payload:
-
-```json
-{
-  "budget_month_id": 1,
-  "category_id": 1,
-  "amount_cents": 7500,
-  "today": "2026-06-21",
-  "urgency": "planned_want",
-  "purpose": "weekly groceries"
-}
-```
-
-The response includes both `safe_to_spend` and `coach`. The deterministic safe-to-spend result remains the source of truth, and the coach explanation must include:
-
-```text
-After upcoming bills, you would have about $___ left for ___ days until payday.
-```
+Spending Check has been removed. Authenticated requests to the two old purchase-check routes return HTTP 410 and cannot calculate a purchase or generate alerts.
 
 Budget change suggestion payload:
 
@@ -566,4 +551,4 @@ $env:OPENAI_TIMEOUT_SECONDS = "10"
 
 The OpenAI provider is a direct backend provider abstraction for short coach calls. It does not use the Agents SDK, does not expose provider internals to Android, does not access Plaid, and does not mutate budget, category, or transaction data.
 
-Provider output cannot replace structured backend facts, the safe-to-spend decision, or draft amounts/category IDs. Stop/discuss decisions use deterministic wording. Optional model prose on other results remains advisory and is not guaranteed factually correct; live OpenAI was not used in recovery verification. Keep the default mock provider for the reproducible local demo.
+Provider output cannot replace structured backend facts or draft amounts/category IDs. Invalid or contradictory drafts fall back to the deterministic budget proposal. Optional model prose on other results remains advisory and is not guaranteed factually correct; live OpenAI was not used in recovery verification. Keep the default mock provider for the reproducible local demo.

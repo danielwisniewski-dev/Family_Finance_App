@@ -314,33 +314,6 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         self.assertNotIn(plaid_item.access_token_ref, serialized)
         self.assertEqual(result["accounts"][0]["account_type"], "checking")
 
-    def test_safe_to_spend_uses_authenticated_household_context(self) -> None:
-        token = str(self.login("daniel", "daniel-local-test")["token"])
-
-        result = self.post(
-            "/safe-to-spend",
-            {
-                "budget_month_id": self.daniel["budget_month_id"],
-                "category_id": self.daniel["category_id"],
-                "purchase_amount_cents": 1_000,
-                "today": "2026-06-21",
-            },
-            token=token,
-        )
-        cross_household = self.post(
-            "/safe-to-spend",
-            {
-                "budget_month_id": self.kara["budget_month_id"],
-                "category_id": self.kara["category_id"],
-                "purchase_amount_cents": 1_000,
-                "today": "2026-06-21",
-            },
-            token=token,
-            expect_status=403,
-        )
-
-        self.assertEqual(result["warning_level"], "safe")
-        self.assertIn("Budget month", cross_household["error"])
 
     def test_notification_unread_and_read_state_uses_authenticated_user_by_default(self) -> None:
         daniel_token = str(self.login("daniel", "daniel-local-test")["token"])
@@ -419,10 +392,10 @@ class PrivateHouseholdAccessTests(unittest.TestCase):
         accounts = self.get(f"/budget-months/{self.daniel['budget_month_id']}/accounts", token=token)
         notifications = self.get(f"/budget-months/{self.daniel['budget_month_id']}/notifications", token=token)
         coach = self.post(
-            "/coach/safe-to-spend",
+            "/coach/budget-change-suggestion",
             {
                 "budget_month_id": self.daniel["budget_month_id"],
-                "category_id": self.daniel["category_id"],
+                "to_category_id": self.daniel["category_id"],
                 "amount_cents": 1_000,
                 "today": "2026-06-21",
             },

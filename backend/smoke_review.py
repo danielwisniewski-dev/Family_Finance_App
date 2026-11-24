@@ -93,22 +93,18 @@ def main():
             call("PATCH", f"/transactions/{transaction}/ignore", {"ignored": False})
             assert call("GET", f"/transactions/{transaction}")["assignments"] == []
             call("PATCH", f"/transactions/{transaction}/category", {"category_id": categories["Groceries"], "reviewed": True})
-            request = {"budget_month_id": month, "category_id": categories["Eating Out"],
-                       "purchase_amount_cents": 3000, "today": str(today)}
-            result = call("POST", "/safe-to-spend", request)
-            assert result["cash_after_purchase_and_bills_cents"] == 74000
-            assert result["category_remaining_after_cents"] == 3400
-            assert "$740.00 left for 6 days until payday." in result["required_phrase"]
-            call("POST", "/safe-to-spend", request | {"purchase_amount_cents": 0.5}, status=400)
+            result = summary()
+            assert result["cash_after_bills_cents"] == 77000
+            assert result["days_until_payday"] == 6
+            assert next(c for c in result["categories"] if c["id"] == categories["Eating Out"])["remaining_cents"] == 6400
+            call("POST", "/spending", {"category_id": categories["Eating Out"], "amount_cents": 0.5, "occurred_on": str(today)}, status=400)
             archived = call("POST", "/categories", {"budget_group_id": detail["groups"][0]["id"],
                                                      "name": "Archive check", "planned_cents": 1000}, status=201)["id"]
             call("PATCH", f"/categories/{archived}", {"archived": True})
             call("PATCH", f"/transactions/{transaction}/category", {"category_id": archived}, status=400)
-            call("POST", "/safe-to-spend", request | {"category_id": archived}, status=400)
             expired = today + timedelta(days=7)
             missing = call("GET", f"/budget-months/{month}/summary?today={expired}")
             assert missing["forecast_available"] is False and missing["cash_after_bills_cents"] is None
-            call("POST", "/safe-to-spend", request | {"today": str(expired)}, status=400)
             call("GET", "/app/diagnostics")
             snapshot = summary()
         # A new repository/server must return the saved state and session, not an in-memory cache.
@@ -122,7 +118,7 @@ def main():
             foreign_month = repo.create_budget_month(household_id=foreign, month=today.strftime("%Y-%m"))
             call("GET", f"/budget-months/{foreign_month}/summary", status=403)
     print("PASS: synthetic login, authorization, summaries, categorize/split/ignore, invalid inputs,")
-    print("      archived category guards, safe-to-spend, missing forecast, diagnostics, and server-restart persistence.")
+    print("      archived category guards, dashboard cash forecast, missing forecast, diagnostics, and server-restart persistence.")
     print("      Temporary database removed; no live integrations called.")
 
 

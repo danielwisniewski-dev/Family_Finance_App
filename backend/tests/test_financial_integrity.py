@@ -249,9 +249,7 @@ class FinancialIntegrityTests(unittest.TestCase):
         self.repo.update_connected_account_balance(plaid_item_id=self.item, plaid_account_id="synthetic-account", balance_cents=-1573)
         summary = self.repo.get_summary(self.month, date(2026, 1, 25))
         self.assertEqual(summary.included_account_balance_cents, -1573)
-        result = self.repo.safe_to_spend(budget_month_id=self.month, category_id=self.food,
-                                       purchase_amount_cents=1, today=date(2026, 1, 25))
-        self.assertEqual(result.warning_level.value, "no")
+        self.assertLess(summary.cash_after_bills_cents, 0)
         with self.assertRaises(ValueError):
             self.repo.update_cash_account(account_id=self.account, balance_cents=12.5)
         with self.assertRaises(ValueError):

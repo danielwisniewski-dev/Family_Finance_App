@@ -34,6 +34,7 @@ public final class JsonHttpClientTest {
     private final Map<String, Response> responses = new ConcurrentHashMap<>();
     private final Map<String, Queue<Response>> responseSequences = new ConcurrentHashMap<>();
     private final Map<String, String> requestHeaders = new ConcurrentHashMap<>();
+    private final Map<String, String> requestBodies = new ConcurrentHashMap<>();
     private final AtomicReference<Exception> serverError = new AtomicReference<>();
     private final List<String> requestOrder = Collections.synchronizedList(new ArrayList<>());
     private final List<String> fundBodies = Collections.synchronizedList(new ArrayList<>());
@@ -76,6 +77,7 @@ public final class JsonHttpClientTest {
                     requestOrder.add(key);
                     if (path.startsWith("/funds/")) fundBodies.add(new String(payload));
                     requestHeaders.put(path, headers.toString());
+                    requestBodies.put(path, new String(payload));
                     Response response = responses.getOrDefault(key, responses.get(path));
                     Queue<Response> sequence = responseSequences.get(key);
                     if (sequence != null && !sequence.isEmpty()) response = sequence.remove();
@@ -160,43 +162,15 @@ public final class JsonHttpClientTest {
         assertTrue(unlink.isNull("reserve_fund_id"));
     }
 
-    private FamilyFinanceApi spendingApi() {
+    private FamilyFinanceApi bankApi() {
         respond("/budget-months/1/bank-status", 200,
                 "{\"enabled\":true,\"connection_id\":7,\"accounts\":[{\"plaid_item_id\":7},{\"plaid_item_id\":7},{\"plaid_item_id\":8}]}");
         respond("/plaid/sync", 200, "{\"success\":true}");
-        respond("/safe-to-spend", 200, "{\"warning_level\":\"caution\",\"category_name\":\"Food\",\"required_phrase\":\"Synthetic backend answer\","
-                + "\"category_remaining_before_cents\":1000,\"category_remaining_after_cents\":500,"
-                + "\"cash_after_bills_before_purchase_cents\":2000,\"cash_after_purchase_and_bills_cents\":1500}");
         return new FamilyFinanceApi(new JsonHttpClient(baseUrl, "synthetic-test-session"));
     }
 
-    @Test
-    public void safeToSpendSyncsEachConnectionOnceBeforeUsingBackendAnswer() throws Exception {
-        assertEquals("Synthetic backend answer", spendingApi().syncAndCheckSafeToSpend(1, 3, 500).requiredPhrase);
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
-                "/plaid/sync:7:transaction", "/plaid/sync:8:balance", "/plaid/sync:8:transaction", "/safe-to-spend"), requestOrder);
-    }
 
-    @Test
-    public void spendingUsesTodaysBackendSyncDecisionEvenWhenReviewIsPending() throws Exception {
-        FamilyFinanceApi api = spendingApi();
-        respond("/budget-months/1/bank-status", 200,
-                "{\"enabled\":true,\"connection_id\":7,\"sync_required\":false,\"ready\":false}");
-        respond("/safe-to-spend", 400, "{\"message\":\"Review imported spending first\"}");
-        assertEquals("Review imported spending first", assertThrows(ApiException.class,
-                () -> api.syncAndCheckSafeToSpend(1, 3, 500)).getMessage());
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/safe-to-spend"), requestOrder);
-    }
 
-    @Test
-    public void malformedFreshnessFlagCannotSkipBankSync() throws Exception {
-        FamilyFinanceApi api = spendingApi();
-        respond("/budget-months/1/bank-status", 200,
-                "{\"enabled\":true,\"connection_id\":7,\"sync_required\":\"false\"}");
-        api.syncAndCheckSafeToSpend(1, 3, 500);
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
-                "/plaid/sync:7:transaction", "/safe-to-spend"), requestOrder);
-    }
 
     private PendingFundAction contribution() throws Exception {
         return PendingFundAction.create(4, false, new JSONObject().put("budget_month_id", 1)
@@ -211,7 +185,7 @@ public final class JsonHttpClientTest {
 
     @Test
     public void contributionAndReplayUseBackendWithoutAnotherBankCall() throws Exception {
-        FamilyFinanceApi api = spendingApi();
+        FamilyFinanceApi api = bankApi();
         respond("/funds/4/entries", 201, "{}");
         PendingFundAction action = contribution();
         api.applyFundAction(action);
@@ -222,7 +196,7 @@ public final class JsonHttpClientTest {
 
     @Test
     public void staleContributionSyncsAutomaticallyAndRetriesTheIdenticalRequest() throws Exception {
-        FamilyFinanceApi api = spendingApi();
+        FamilyFinanceApi api = bankApi();
         // Force a sync even when only an excluded fund backing account is stale.
         respond("/budget-months/1/bank-status", 200,
                 "{\"enabled\":true,\"connection_id\":7,\"sync_required\":false}");
@@ -238,7 +212,7 @@ public final class JsonHttpClientTest {
 
     @Test
     public void failedSyncDoesNotRetryContributionOrLoseItsRequestKey() throws Exception {
-        FamilyFinanceApi api = spendingApi();
+        FamilyFinanceApi api = bankApi();
         fundNeedsSyncThenSucceeds();
         respond("/plaid/sync:7:balance", 200, "{\"success\":false,\"error_message\":\"Reconnect USAA\"}");
         PendingFundAction action = contribution();
@@ -250,7 +224,7 @@ public final class JsonHttpClientTest {
 
     @Test
     public void contributionValidationDoesNotTriggerBankSync() throws Exception {
-        FamilyFinanceApi api = spendingApi();
+        FamilyFinanceApi api = bankApi();
         respond("/funds/4/entries", 400, "{\"code\":\"validation_error\",\"message\":\"Not enough cash\"}");
         assertThrows(ApiException.class, () -> api.applyFundAction(contribution()));
         assertEquals(Arrays.asList("/funds/4/entries"), requestOrder);
@@ -258,7 +232,7 @@ public final class JsonHttpClientTest {
 
     @Test
     public void contributionRetriesOnlyOnceIfBankStillNeedsAttention() throws Exception {
-        FamilyFinanceApi api = spendingApi();
+        FamilyFinanceApi api = bankApi();
         respond("/funds/4/entries", 400, "{\"code\":\"bank_sync_required\",\"message\":\"History incomplete\"}");
         assertThrows(ApiException.class, () -> api.applyFundAction(contribution()));
         assertEquals(2, fundBodies.size());
@@ -267,7 +241,7 @@ public final class JsonHttpClientTest {
 
     @Test
     public void releaseAndMoveNeverRequireBankSync() throws Exception {
-        FamilyFinanceApi api = spendingApi();
+        FamilyFinanceApi api = bankApi();
         respond("/funds/4/entries", 201, "{}");
         respond("/funds/4/transfer", 201, "{}");
         JSONObject payload = new JSONObject().put("budget_month_id", 1).put("kind", "release")
@@ -279,11 +253,42 @@ public final class JsonHttpClientTest {
 
     @Test
     public void dashboardSyncOnlyImportsAvailableDataAndDeduplicatesConnections() throws Exception {
-        spendingApi().syncAvailableBankData(1);
+        bankApi().syncAvailableBankData(1);
         assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance",
                 "/plaid/sync:7:transaction", "/plaid/sync:8:balance", "/plaid/sync:8:transaction",
                 "/budget-months/1/bank-status"), requestOrder);
         assertFalse(requestOrder.stream().anyMatch(path -> path.startsWith("/plaid/refresh")));
+    }
+
+    @Test
+    public void foregroundSyncUsesSharedPolicyAndRetryExplicitlyOverridesCadence() throws Exception {
+        String path = "/budget-months/1/bank-sync";
+        respond(path, 200, "{\"success\":true,\"synced\":false}");
+        FamilyFinanceApi api = new FamilyFinanceApi(new JsonHttpClient(baseUrl, "synthetic-session"));
+        assertFalse(api.syncBankIfDue(1, false).getBoolean("synced"));
+        assertFalse(new JSONObject(requestBodies.get(path)).getBoolean("force"));
+        api.syncBankIfDue(1, true);
+        assertTrue(new JSONObject(requestBodies.get(path)).getBoolean("force"));
+        assertEquals(Arrays.asList(path, path), requestOrder);
+    }
+
+    @Test
+    public void failedForegroundSyncRemainsAnErrorWithoutCallingFreshDataOrReplaying() throws Exception {
+        String path = "/budget-months/1/bank-sync";
+        respond(path, 200, "{\"success\":false,\"message\":\"Reconnect in Settings.\"}");
+        FamilyFinanceApi api = new FamilyFinanceApi(new JsonHttpClient(baseUrl, "synthetic-session"));
+        assertThrows(ApiException.class, () -> api.syncBankIfDue(1, false));
+        assertEquals(Arrays.asList(path), requestOrder);
+    }
+
+    @Test
+    public void automaticDemoSyncStaysInTheDemoRouteAndSession() throws Exception {
+        String path = "/demo/budget-months/1/bank-sync";
+        respond(path, 200, "{\"success\":true,\"synced\":true,\"demo\":true}");
+        FamilyFinanceApi api = new FamilyFinanceApi(new JsonHttpClient(baseUrl + "/demo", "synthetic-demo-session"));
+        assertTrue(api.syncBankIfDue(1, false).getBoolean("synced"));
+        assertEquals(Arrays.asList(path), requestOrder);
+        assertTrue(requestHeaders.get(path).contains("Bearer synthetic-demo-session"));
     }
 
     private String refreshResponse(String state, int inserted) {
@@ -364,51 +369,10 @@ public final class JsonHttpClientTest {
         assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/refresh:7"), requestOrder);
     }
 
-    @Test
-    public void balanceFailureStopsSpendingCheck() {
-        FamilyFinanceApi api = spendingApi();
-        respond("/plaid/sync:7:balance", 200, "{\"success\":false,\"error_message\":\"Reconnect USAA\"}");
-        assertEquals("Reconnect USAA", assertThrows(ApiException.class,
-                () -> api.syncAndCheckSafeToSpend(1, 3, 500)).getMessage());
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance"), requestOrder);
-    }
 
-    @Test
-    public void transactionFailureNeverFallsBackToSavedSpendingResult() {
-        FamilyFinanceApi api = spendingApi();
-        respond("/plaid/sync:7:transaction", 200, "{\"success\":false}");
-        assertThrows(ApiException.class, () -> api.syncAndCheckSafeToSpend(1, 3, 500));
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/plaid/sync:7:balance", "/plaid/sync:7:transaction"), requestOrder);
-    }
 
-    @Test
-    public void successfulSyncDoesNotBypassTransactionReviewOrReconciliation() {
-        FamilyFinanceApi api = spendingApi();
-        respond("/safe-to-spend", 400, "{\"message\":\"Review imported spending first\",\"code\":\"validation_error\"}");
-        assertEquals("Review imported spending first", assertThrows(ApiException.class,
-                () -> api.syncAndCheckSafeToSpend(1, 3, 500)).getMessage());
-        assertEquals("/safe-to-spend", requestOrder.get(requestOrder.size() - 1));
-    }
 
-    @Test
-    public void manualBudgetsCheckWithoutBankCalls() throws Exception {
-        FamilyFinanceApi api = spendingApi();
-        respond("/budget-months/1/bank-status", 200, "{\"enabled\":false}");
-        api.syncAndCheckSafeToSpend(1, 3, 500);
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/safe-to-spend"), requestOrder);
-    }
 
-    @Test
-    public void missingConnectionOrFailedStatusDoesNotCheckSpending() {
-        FamilyFinanceApi api = spendingApi();
-        respond("/budget-months/1/bank-status", 200, "{\"enabled\":true,\"accounts\":[]}");
-        assertThrows(ApiException.class, () -> api.syncAndCheckSafeToSpend(1, 3, 500));
-        respond("/budget-months/1/bank-status", 401, "{}");
-        assertEquals(401, assertThrows(ApiException.class, () -> api.syncAndCheckSafeToSpend(1, 3, 500)).status);
-        respond("/budget-months/1/bank-status", 200, "{}");
-        assertThrows(ApiException.class, () -> api.syncAndCheckSafeToSpend(1, 3, 500));
-        assertEquals(Arrays.asList("/budget-months/1/bank-status", "/budget-months/1/bank-status", "/budget-months/1/bank-status"), requestOrder);
-    }
 
     @Test
     public void bankSyncReportsFailureEvenWithSuccessfulHttpStatus() {

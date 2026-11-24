@@ -72,9 +72,9 @@ public final class TransactionReviewStateTest {
     }
 
     @Test
-    public void unassignedIncomingMoneyStaysInTheSecondGroupDespiteBeingConfirmable() throws Exception {
+    public void unassignedIncomingMoneyRequiresIncomeOrRefundChoice() throws Exception {
         TransactionDetail income = TransactionDetail.fromJson(data(9, "2026-09-23", 5000, null));
-        assertTrue(TransactionReviewState.canConfirmExisting(income));
+        assertFalse(TransactionReviewState.canConfirmExisting(income));
         assertFalse(TransactionReviewState.hasAssignedCategory(income));
         assertEquals(Arrays.asList(2, 9, 3, 1), ids(TransactionReviewState.reviewOrder(Arrays.asList(
                 income, transaction(1, "2026-09-21", null), transaction(2, "2026-09-19", 1),

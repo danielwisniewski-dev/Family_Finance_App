@@ -79,22 +79,6 @@ class Milestone12HardeningApiTests(unittest.TestCase):
         self.assertIn("amount_cents must be positive", invalid_bill["error"])
         self.assertIn("Date fields must use YYYY-MM-DD", invalid_date["error"])
 
-    def test_safe_to_spend_missing_payday_returns_clear_safe_error(self) -> None:
-        category_id = self.create_budget_with_category()
-
-        error = self.post(
-            "/safe-to-spend",
-            {
-                "budget_month_id": 1,
-                "category_id": category_id,
-                "purchase_amount_cents": 500,
-                "today": "2026-06-24",
-            },
-            expect_status=400,
-        )
-
-        self.assert_error_contract(error, "validation_error", 400)
-        self.assertIn("No upcoming payday configured", error["error"])
 
     def test_diagnostics_are_authenticated_sanitized_and_report_integrity(self) -> None:
         self.create_budget_with_category()

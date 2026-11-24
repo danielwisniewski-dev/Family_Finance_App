@@ -114,28 +114,6 @@ class DailyFundingTests(unittest.TestCase):
         self.assertEqual(self.repo.list_accounts(self.month)[0].balance_cents, 48000)
         self.assertFalse(bank_status(self.repo, self.month)["reconciled"])
 
-    def test_spending_keeps_review_reconciliation_and_next_month_checks(self):
-        self.contribute()
-        with self.assertRaisesRegex(ValueError, "next budget month"):
-            self.spending_check()
-        self.repo.create_budget_month(household_id=self.household, month="2026-10")
-        with self.assertRaisesRegex(ValueError, "Review imported"):
-            self.spending_check()
-        transaction = self.repo.list_budget_transactions(self.month)[0].transaction.id
-        self.repo.assign_transaction_category(transaction_id=transaction,
-                                              category_id=self.fund["category_id"], reviewed=True)
-        with self.assertRaisesRegex(ValueError, "confirm reconciliation"):
-            self.spending_check()
-        state = bank_status(self.repo, self.month)
-        reconcile_bank(self.repo, self.month, state["revision"])
-        # The last sync was nine hours ago; category and cash accounting still apply.
-        result = self.spending_check()
-        self.assertIn("After upcoming bills", result.required_phrase)
-        self.assertEqual(result.category_remaining_before_cents, 3800)
-
-    def spending_check(self):
-        return self.repo.safe_to_spend(budget_month_id=self.month, category_id=self.fund["category_id"],
-                                      purchase_amount_cents=100, today=self.today)
 
     def test_previous_day_and_individual_stale_accounts_block_new_contributions(self):
         self.set_sync_at("2026-09-30T03:59:59Z")

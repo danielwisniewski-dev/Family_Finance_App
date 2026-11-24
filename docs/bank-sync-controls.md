@@ -1,16 +1,17 @@
 # Bank sync controls
 
-Part of the Provision Funds release deployed September 23, with the existing household and bank connection preserved. PR #22 is merged into `main` at `d5e524a`. Physical-phone installation remains unverified; the deployment and preservation record is in the ignored `work/provision-release-handoff.md`.
+Originally part of the Provision Funds release deployed September 23, with the existing household and bank connection preserved. PR #22 is merged into `main` at `d5e524a`. Physical-phone installation remains unverified; the deployment and preservation record is in the ignored `work/provision-release-handoff.md`.
 
 | Location | Action | Behavior |
 | --- | --- | --- |
-| Dashboard | Sync | Updates account balances and imports transactions Plaid already has, then returns to the dashboard. Does not request a new bank transaction extraction. |
+| App opening / return | Automatic sync | Checks the shared household timestamps and imports available balances/transactions when three hours old or from an earlier household day. Keeps the dashboard usable and preserves unsaved forms. Never requests a new bank extraction. |
+| Dashboard, after a failure | Retry | Retries the ordinary import immediately; the last successful timestamp is retained on failure. |
 | Accounts / Settings | Request fresh bank data | Explicitly asks Plaid to retrieve newer USAA transactions, then imports the available changes. |
 | Accounts / Settings | Reconnect USAA | Opens Plaid Link in update mode to renew or repair the existing bank authorization. |
 
-The existing Refresh household data action reads saved app data. The [Ledger update](ledger-daily-sync.md), deployed September 29 with a verified signed APK ready to install, reuses a successful balance/transaction sync from the current household calendar day for safe-to-spend and Provision Funds contributions. Automatic syncs use normal balance/transaction sync only, never Transactions Refresh. Manual Dashboard Sync still runs when requested.
+The table describes the current [Ledger 0.8.0 release candidate](ledger-0.8.0-release.md); backend deployment is pending. The regular Sync button and fresh-data result's Sync shortcut are removed. The small dashboard indicator shows progress next to Last sync. A failure offers Retry without discarding saved screen data. Both spouses use the backend's shared timestamps and sync lock, and failed automatic attempts have a one-minute retry delay.
 
-All normal Sync entry points return to Dashboard after the import and screen-data reload succeed, including the follow-up sync after Reconnect USAA and the Sync shortcut on the fresh-data result.
+Refresh household data reads saved app data. Provision Funds contributions still require same-day bank readiness and can sync automatically before retrying the original idempotent request. Automatic syncs only import available data; Request fresh bank data remains an explicit action. Spending Check is retired.
 
 The Ledger release adds [in-app Demo mode](demo-mode-plan.md). Its same bank controls use an isolated synthetic provider and fictional accounts; they never call Plaid, consume a real connection or open real bank authorization. Keep provider-interface changes compatible with this synthetic implementation. Verify ordinary Sync/fresh-data/reconnect behavior, current timestamps, repeated-sync deduplication and normal review/reconciliation requirements using the demo acceptance flow. Do not use a demo flag to relax real bank readiness rules or report synthetic checks as live USAA verification.
 
@@ -40,7 +41,9 @@ Schema 5 adds request timestamps and status to `bank_sync_state`; existing balan
 
 Provider errors remain sanitized. Authorization errors suggest Reconnect; temporary bank/network errors suggest trying later. The existing atomic cursor import handles changes, removals and duplicates. Pagination retries recognize Plaid's current `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION` code.
 
-## Verification
+## Historical September 23 verification
+
+Current verification (336 backend tests, 106 Android unit tests and native real/demo walkthroughs) is recorded in the [Ledger 0.8.0 handoff](ledger-0.8.0-release.md).
 
 Verification uses synthetic provider responses and disposable data. It covers the explicit-request boundary, shared cooldown/restarts, concurrent requests, uncertain responses, timestamp/import ordering, pending versus checked status, rate limits, request redaction, ownership, migration preservation, and normal Sync/Reconnect compatibility. No live refresh or bank authorization was exercised while developing this update.
 

@@ -17,6 +17,10 @@ public final class TransactionDetail {
     public final String suggestionSource;
     public final String suggestionReason;
     public final Integer matchingRuleId;
+    public int budgetMonthId;
+    public String budgetMonth = "";
+    public Integer incomeId;
+    public String incomeName = "";
 
     public TransactionDetail(
             TransactionLine transaction,
@@ -51,7 +55,7 @@ public final class TransactionDetail {
         Integer categoryId = json.isNull("final_category_id") ? null : json.optInt("final_category_id");
         Integer suggestedCategoryId = json.isNull("suggested_category_id") ? null : json.optInt("suggested_category_id");
         Integer matchingRuleId = json.isNull("matching_rule_id") ? null : json.optInt("matching_rule_id");
-        return new TransactionDetail(
+        TransactionDetail detail = new TransactionDetail(
                 TransactionLine.fromJson(json.optJSONObject("transaction")),
                 assignments,
                 categoryId,
@@ -62,6 +66,11 @@ public final class TransactionDetail {
                 json.optString("suggestion_reason", ""),
                 matchingRuleId
         );
+        detail.budgetMonthId = json.optInt("budget_month_id", 0);
+        detail.budgetMonth = json.optString("budget_month", "");
+        detail.incomeId = json.has("income_id") && !json.isNull("income_id") ? json.optInt("income_id") : null;
+        detail.incomeName = json.optString("income_name", "");
+        return detail;
     }
 
     public boolean isSplit() {

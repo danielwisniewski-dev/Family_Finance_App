@@ -82,10 +82,8 @@ def run():
             shared = call("GET", summary_path, token=daniel)
             assert shared["total_spent_cents"] == 1234
             assert shared == call("GET", summary_path, token=kara)
-            result = call("POST", "/safe-to-spend", {"budget_month_id": month, "category_id": category,
-                "purchase_amount_cents": 2000, "today": "2026-09-11"}, kara)
-            assert result["cash_after_purchase_and_bills_cents"] == 88000
-            assert "$880.00 left for 5 days until payday." in result["required_phrase"]
+            assert shared["cash_after_bills_cents"] == 90000
+            assert shared["days_until_payday"] == 5
             call("POST", "/plaid/link-token", {}, daniel, 403)
             call("POST", "/auth/logout", {}, daniel)
             call("GET", summary_path, token=daniel, expected=401)
@@ -97,7 +95,7 @@ def run():
             call("GET", summary_path, token=kara, expected=401)
             fresh = call("POST", "/auth/login", {"username": "kara", "password": users[1]["password"]})["token"]
             assert shared == call("GET", summary_path, token=fresh)
-    print("Stage 1 smoke passed: protected setup, two-user shared totals, safe-to-spend, logout, restart, encrypted restore, and fresh login after recovery.")
+    print("Stage 1 smoke passed: protected setup, two-user shared totals, dashboard forecast, logout, restart, encrypted restore, and fresh login after recovery.")
 
 
 def main():

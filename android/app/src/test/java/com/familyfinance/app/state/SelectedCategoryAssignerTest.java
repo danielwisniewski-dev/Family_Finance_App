@@ -97,10 +97,10 @@ public final class SelectedCategoryAssignerTest {
         assertTrue(TransactionReviewState.canAssignTogether(transaction(1, -1200, true, false, null, "uncategorized")));
     }
 
-    @Test public void confirmationIsOnlyOfferedForUnreviewedExistingAllocationsOrInflows() throws Exception {
+    @Test public void confirmationIsOnlyOfferedForUnreviewedExistingAllocations() throws Exception {
         assertTrue(TransactionReviewState.canConfirmExisting(transaction(1, -1200, false, false, 40, "rule")));
         assertTrue(TransactionReviewState.canConfirmExisting(transaction(1, -1200, false, false, 40, "manual")));
-        assertTrue(TransactionReviewState.canConfirmExisting(transaction(1, 1200, false, false, null, "uncategorized")));
+        assertFalse(TransactionReviewState.canConfirmExisting(transaction(1, 1200, false, false, null, "uncategorized")));
         assertTrue(TransactionReviewState.canConfirmExisting(transaction(1, -1200, false, false, null, "split")));
         assertFalse(TransactionReviewState.canConfirmExisting(transaction(1, -1200, false, false, null, "uncategorized")));
         assertFalse(TransactionReviewState.canConfirmExisting(transaction(1, -1200, true, false, 40, "manual")));

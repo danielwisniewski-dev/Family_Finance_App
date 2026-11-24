@@ -58,13 +58,14 @@ def fund_rows(connection, household_id, budget_month_id):
             FROM reserve_entries e LEFT JOIN users u ON u.id=e.actor_user_id
             LEFT JOIN reserve_funds other ON other.id=e.counterpart_fund_id WHERE e.fund_id=? ORDER BY e.id""", (row["id"],))]
         expenses = [dict(e) for e in connection.execute("""SELECT -t.id AS id,'expense' AS kind,
-            -SUM(a.amount_cents) AS amount_cents,t.occurred_on,t.name AS note,'' AS actor_name,'' AS counterpart_name
+            -SUM(a.amount_cents) AS amount_cents,t.occurred_on,t.name AS note,'' AS actor_name,'' AS counterpart_name,m.budget_month_id
             FROM transaction_category_assignments a JOIN budget_categories c ON c.id=a.budget_category_id
             JOIN account_transactions t ON t.id=a.transaction_id
+            LEFT JOIN transaction_budget_months m ON m.transaction_id=t.id
             WHERE c.reserve_fund_id=? AND a.active=1 AND t.ignored=0 GROUP BY t.id
-            UNION ALL SELECT -t.id AS id,'refund' AS kind,r.amount_cents,t.occurred_on,t.name,'',''
+            UNION ALL SELECT -t.id AS id,'refund' AS kind,r.amount_cents,t.occurred_on,t.name,'','',m.budget_month_id
             FROM transaction_refunds r JOIN budget_categories c ON c.id=r.budget_category_id
-            JOIN account_transactions t ON t.id=r.transaction_id WHERE c.reserve_fund_id=? AND t.ignored=0""",
+            JOIN account_transactions t ON t.id=r.transaction_id LEFT JOIN transaction_budget_months m ON m.transaction_id=t.id WHERE c.reserve_fund_id=? AND t.ignored=0""",
             (row["id"], row["id"]))]
         direct = sum(e["amount_cents"] for e in entries if e["budget_month_id"] == budget_month_id and e["kind"] in {"contribution", "release"})
         balance = sum(e["amount_cents"] for e in entries) + sum(e["amount_cents"] for e in expenses)
@@ -72,7 +73,7 @@ def fund_rows(connection, household_id, budget_month_id):
         fund.update(category_id=category["id"] if category else None,
                     category_archived=bool(category and category["archived"]),
                     monthly_plan_cents=planned, contributed_this_month_cents=direct,
-                    spent_this_month_cents=-sum(e["amount_cents"] for e in expenses if e["occurred_on"][:7] == month),
+                    spent_this_month_cents=-sum(e["amount_cents"] for e in expenses if e["budget_month_id"] == budget_month_id),
                     balance_cents=balance, monthly_shortfall_cents=max(0, planned-direct),
                     deficit_cents=max(0, -balance),
                     breakdown=json.loads(row["breakdown_json"]),
@@ -81,7 +82,7 @@ def fund_rows(connection, household_id, budget_month_id):
     return result
 
 
-def cash_context(connection, household_id, budget_month_id, today, *, fund_id=None, purchase_amount_cents=0, balance_adjustments=None):
+def cash_context(connection, household_id, budget_month_id, today, *, balance_adjustments=None):
     rows = fund_rows(connection, household_id, budget_month_id)
     for row in rows:
         row["balance_cents"] += (balance_adjustments or {}).get(row["id"], 0)
@@ -91,10 +92,6 @@ def cash_context(connection, household_id, budget_month_id, today, *, fund_id=No
     balances = {r["id"]: max(0, r["balance_cents"]) for r in rows}
     included = {r["id"] for r in rows if r["included_in_cash_reality"] and r["backing_account_id"] in month_accounts}
     reserved = sum(balances[f] for f in included)
-    release = min(balances.get(fund_id, 0), purchase_amount_cents) if fund_id in included else 0
-    after = dict(balances)
-    if fund_id in after:
-        after[fund_id] = max(0, after[fund_id]-purchase_amount_cents)
     payday = connection.execute("SELECT MIN(payday_date) FROM paydays WHERE household_id=? AND payday_date>=?", (household_id, today.isoformat())).fetchone()[0]
     bills = connection.execute("""SELECT e.* FROM expected_bills e JOIN budget_months b ON b.id=e.budget_month_id
         WHERE b.household_id=? AND e.paid=0 AND e.due_on>=? AND e.due_on<? ORDER BY e.due_on,e.id""",
@@ -123,8 +120,8 @@ def cash_context(connection, household_id, budget_month_id, today, *, fund_id=No
         fund = next(f for f in rows if f["backing_account_id"] == account_id)
         if protected > max(0, fund["backing_balance_cents"]):
             issues.append(f"{fund['backing_account_name']} has less cash than its provision funds. Reconcile the reserve balances.")
-    return {"rows": rows, "reserved_cash_cents": reserved, "funded_purchase_cents": release,
-            "reserve_covered_bills_cents": covered(balances), "reserve_covered_bills_after_cents": covered(after),
+    return {"rows": rows, "reserved_cash_cents": reserved,
+            "reserve_covered_bills_cents": covered(balances),
             "bills_cents": sum(b["amount_cents"] for b in bills), "next_payday": payday,
             "issues": list(dict.fromkeys(issues)), "reserved_by_account": by_account,
             "available_account_ids": month_accounts}

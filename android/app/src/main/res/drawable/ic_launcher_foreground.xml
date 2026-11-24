@@ -1,4 +1,8 @@
+<!-- Enlarge and recenter the approved artwork so circular launcher masks stay inside the coin. -->
 <inset xmlns:android="http://schemas.android.com/apk/res/android"
-    android:inset="5%">
+    android:insetLeft="-11%"
+    android:insetTop="-11%"
+    android:insetRight="-9%"
+    android:insetBottom="-9%">
     <bitmap android:src="@drawable/ledger_coin" android:gravity="fill" />
 </inset>

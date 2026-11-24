@@ -56,10 +56,10 @@ def run_smoke() -> dict:
 
                 detail = demo_request("GET", f"/budget-months/{month}/budget-detail")
                 categories = {c["name"]: c["id"] for g in detail["groups"] for c in g["categories"]}
-                check = {"budget_month_id": month, "category_id": categories["Groceries"], "purchase_amount_cents": 2500}
-                result = demo_request("POST", "/safe-to-spend", check)
-                assert "After upcoming bills, you would have about $" in json.dumps(result)
-                demo_request("POST", "/coach/safe-to-spend", check)
+                assert detail["forecast_available"]
+                assert detail["cash_after_bills_cents"] == 142_000
+                for path in ("/safe-to-spend", "/coach/safe-to-spend"):
+                    demo_request("POST", path, {}, expected=410)
                 original = demo_request("GET", f"/budget-months/{month}/funds")["funds"]
                 fund = next(f for f in original if f["name"] == "Car Repairs")
                 assert all(f["balance_cents"] > 0 for f in original)
@@ -98,6 +98,14 @@ def run_smoke() -> dict:
                 copied = demo_request("GET", f"/budget-months/{created['id']}/budget-detail")
                 assert "Demo groceries edited" in json.dumps(copied)
                 assert len(demo_request("GET", f"/budget-months/{created['id']}/funds")["funds"]) == len(original)
+                assert [(i["name"], i["planned_cents"]) for i in copied["income"]] == [
+                    (i["name"], i["planned_cents"]) for i in detail["income"]]
+                # Dashboard navigation uses the same activate/read routes in demo mode.
+                for selected in (created["id"], month):
+                    demo_request("PATCH", f"/budget-months/{selected}/activate")
+                    months = demo_request("GET", "/budget-months")["budget_months"]
+                    assert [m["id"] for m in months if m["is_active"]] == [selected]
+                assert len([m for m in months if m["month"] == new_month]) == 1
 
                 # Advisory coach output may suggest a change but never applies it.
                 before_advice = category_totals()
@@ -107,6 +115,10 @@ def run_smoke() -> dict:
                 assert advice["coach"]["proposed_budget_change"]["status"] == "draft_only"
                 assert category_totals() == before_advice
                 status = demo_request("GET", f"/budget-months/{month}/bank-status")
+                automatic = demo_request("POST", f"/budget-months/{month}/bank-sync")
+                assert automatic["success"] and not automatic["synced"]
+                automatic = demo_request("POST", f"/budget-months/{month}/bank-sync", {"force": True})
+                assert automatic["success"] and automatic["synced"]
                 item = status["connection_id"]
                 for kind in ("balance", "transaction"):
                     outcome = demo_request("POST", "/plaid/sync", {"plaid_item_id": item, "sync_type": kind})
@@ -117,7 +129,7 @@ def run_smoke() -> dict:
                 assert len(demo_request("GET", f"/budget-months/{month}/transactions")["transactions"]) == len(transactions)
                 queue = demo_request("GET", f"/budget-months/{month}/transaction-review-queue")["transactions"]
                 assert queue, "Sync must supply transactions to demonstrate ordinary review"
-                demo_request("POST", "/safe-to-spend", check, expected=400)
+                assert demo_request("GET", f"/budget-months/{month}/bank-status")["unreviewed_spending"] > 0
                 for txn in queue:
                     if txn["transaction"]["merchant_name"] == "Willow Home Goods":
                         demo_request("PATCH", f"/transactions/{txn['transaction']['id']}/split", {"splits": [
@@ -139,7 +151,7 @@ def run_smoke() -> dict:
                 status = demo_request("GET", f"/budget-months/{month}/bank-status")
                 assert status["unreviewed_spending"] == 0
                 demo_request("POST", f"/budget-months/{month}/bank-reconciliation", {"revision": status["revision"]})
-                demo_request("POST", "/safe-to-spend", check)
+                assert demo_request("GET", f"/budget-months/{month}/summary")["forecast_available"]
                 demo_request("POST", "/plaid/refresh", {"plaid_item_id": item})
                 link = demo_request("POST", "/plaid/link-token", expected=201)
                 assert link["link_token"] == "demo-bank-link"
@@ -152,6 +164,20 @@ def run_smoke() -> dict:
                 demo_request("PATCH", f"/notifications/{notifications[0]['id']}/read")
                 rules = demo_request("GET", "/merchant-category-rules")["rules"]
                 assert any(r["merchant_match_text"] == "willow home goods" for r in rules)
+                paycheck = next(t for t in transactions if t["transaction"]["name"] == "Cedar Workshop Payroll")
+                paycheck_id = paycheck["transaction"]["id"]
+                income_id = paycheck["income_id"]
+                assert income_id is not None
+                demo_request("PATCH", f"/transactions/{paycheck_id}/income", {"income_id": income_id, "budget_month_id": month, "amount_cents": 200_000})
+                assert next(i for i in demo_request("GET", f"/budget-months/{month}/budget-detail")["income"] if i["id"] == income_id)["received_cents"] == 200_000
+                for target in (created["id"], month):
+                    preview = demo_request("PATCH", f"/transactions/{paycheck_id}/budget-month", {"budget_month_id": target, "preview": True})
+                    assert preview["can_move"]
+                    demo_request("PATCH", f"/transactions/{paycheck_id}/budget-month", {"budget_month_id": target, "revision": preview["revision"]})
+                demo_request("PATCH", f"/transactions/{paycheck_id}/income", {"budget_month_id": month, "amount_cents": 200_000, "new_income": {"name": "Demo linked income", "kind": "main", "planned_cents": 200_000}})
+                linked = demo_request("GET", f"/transactions/{paycheck_id}")
+                assert linked["income_name"] == "Demo linked income"
+                assert linked["transaction"]["occurred_on"] == paycheck["transaction"]["occurred_on"]
                 demo_request("POST", "/exit")
                 request("GET", "/demo/budget-months", bearer=demo, expected=401)
                 assert real.db_path.read_bytes() == baseline, "Demo operations changed the real database"
@@ -159,14 +185,19 @@ def run_smoke() -> dict:
                 assert fresh["token"] != demo
                 fresh_detail = request("GET", f"/demo/budget-months/{month}/budget-detail", bearer=fresh["token"])
                 assert "Demo groceries edited" not in json.dumps(fresh_detail)
+                assert "Demo linked income" not in json.dumps(fresh_detail)
+                assert fresh_detail["income"][0]["received_cents"] == 200_000
+                fresh_months = request("GET", "/demo/budget-months", bearer=fresh["token"])["budget_months"]
+                assert not any(m["month"] == new_month for m in fresh_months)
+                assert [m["id"] for m in fresh_months if m["is_active"]] == [month]
                 fresh_funds = request("GET", f"/demo/budget-months/{month}/funds", bearer=fresh["token"])["funds"]
                 assert next(f for f in fresh_funds if f["id"] == fund["id"])["balance_cents"] == fund["balance_cents"]
                 request("POST", "/demo/exit", bearer=fresh["token"])
                 request("GET", "/budget-months", bearer=token)
                 return {"ok": True, "funded_funds": len(original), "reviewed_new_transactions": len(queue),
                         "real_database_unchanged": True, "outbound_calls": 0,
-                        "fresh_reentry": True, "normal_spending_guards": True,
-                        "fund_contribute_release_move": True, "budget_edit_copy_manual_spending": True,
+                        "fresh_reentry": True, "dashboard_forecast_and_retired_check": True,
+                        "fund_contribute_release_move": True, "transaction_month_move_and_income": True, "budget_edit_copy_manual_spending": True,
                         "transaction_split_refund_ignore_rules": True, "coach_advisory_only": True,
                         "notifications": True}
         finally:

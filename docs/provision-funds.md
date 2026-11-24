@@ -19,7 +19,7 @@ The later [Ledger update](ledger-daily-sync.md), deployed September 29 with a ve
 
 The backend owns all balances. Actual fund balances come from the contribution ledger and active, non-ignored spending/refund allocations. Imported transaction corrections, removals, recategorization and split changes must affect the reserve consistently without double-counting.
 
-Ordinary safe-to-spend protects funded reserves in included accounts. Spending from a selected fund can use that fund's saved money while protecting other funds. Excluded backing cash must not be subtracted a second time. A planned bill can identify its fund so cash already reserved for that bill is not held twice. Missing or insufficient backing must not yield a reassuring spending result.
+The dashboard cash cushion protects funded reserves in included accounts. Categorized fund purchases reduce that fund's saved balance while other funds remain protected. Excluded backing cash must not be subtracted a second time. A planned bill can identify its fund so cash already reserved for that bill is not held twice. The dashboard surfaces missing or insufficient backing, and funding operations enforce backing requirements.
 
 Monetary actions require an idempotency key. A retry cannot create another contribution, release, or movement, and reuse with different contents is rejected. Ownership and actor checks apply to the fund, budget month, backing account and movement destination.
 

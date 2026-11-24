@@ -49,7 +49,7 @@ public final class TransactionLine {
                 json.optString("name", "Transaction"),
                 json.isNull("merchant_name") ? "" : json.optString("merchant_name", ""),
                 json.optBoolean("pending"),
-                json.optString("category_hint", ""),
+                json.isNull("category_hint") ? "" : json.optString("category_hint", ""),
                 json.optBoolean("reviewed"),
                 json.optBoolean("ignored"),
                 json.optString("ignored_reason", ""),

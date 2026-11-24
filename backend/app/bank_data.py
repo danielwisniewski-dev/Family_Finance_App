@@ -53,7 +53,7 @@ def bank_status(repository, month_id):
     enabled = repository.settings.plaid_enabled
     issues = []
     if enabled and not rows:
-        issues.append("Connect your bank before using safe-to-spend.")
+        issues.append("Connect your bank to load household cash.")
     if enabled and not any(a.plaid_item_id and a.included_in_cash_reality for a in accounts):
         issues.append("Choose which bank accounts fund household spending.")
     if enabled and any(not a.plaid_item_id and a.included_in_cash_reality for a in accounts):
@@ -72,11 +72,11 @@ def bank_status(repository, month_id):
                 sync_issues.append("An included account lacks an available balance checked today. Sync your bank and retry.")
     issues.extend(sync_issues)
     # Earmarking existing cash does not require a completed review queue or the
-    # spending-check reconciliation. Available cash and recorded bills still apply.
+    # monthly reconciliation. Available cash and recorded bills still apply.
     funding_issues = list(dict.fromkeys(issues))
     unreviewed = sum(not t["ignored"] and t["amount_cents"] < 0 and (not t["reviewed"] or not t["assigned"]) for t in txns)
     if enabled and unreviewed:
-        issues.append("Review imported spending, transfers, and possible manual duplicates before using safe-to-spend.")
+        issues.append("Review imported spending, transfers, and possible manual duplicates before reconciling.")
     # A revision binds the user's confirmation to the values visible when they opened
     # the reconciliation screen. It is not a token and conveys no account access.
     revision = hashlib.sha256(json.dumps({"month": month,
@@ -95,6 +95,8 @@ def bank_status(repository, month_id):
             "balance_checked_at": rows[0]["balance_checked_at"] if rows else None,
             "transactions_checked_at": rows[0]["transactions_checked_at"] if rows else None,
             "transactions_updated_at": rows[0]["transactions_updated_at"] if rows else None,
+            "last_successful_sync_at": min((r["last_successful_sync_at"] for r in rows), default=None)
+                if all(r["last_successful_sync_at"] for r in rows) else None,
             "history_complete": bool(rows and rows[0]["history_complete"]),
             "refresh": status_for_row(rows[0] if rows else None),
             "reconciled_at": rows[0]["reconciled_at"] if rows else None}
@@ -111,25 +113,6 @@ def reconcile_bank(repository, month_id, revision):
         conn.execute("UPDATE bank_sync_state SET reconciled_at=CURRENT_TIMESTAMP, reconciled_month=(SELECT month FROM budget_months WHERE id=?) WHERE plaid_item_id IN (SELECT id FROM plaid_items WHERE household_id=?)",
                      (month_id, repository.household_id_for_budget_month(month_id)))
     return bank_status(repository, month_id)
-
-
-def require_bank_ready(repository, month_id, today):
-    if not repository.settings.plaid_enabled:
-        return
-    status = bank_status(repository, month_id)
-    with repository.connect() as conn:
-        month = conn.execute("SELECT month FROM budget_months WHERE id=?", (month_id,)).fetchone()[0]
-        household = repository.household_id_for_budget_month(month_id)
-        payday = conn.execute("SELECT MIN(payday_date) FROM paydays WHERE household_id=? AND payday_date>=?", (household, today.isoformat())).fetchone()[0]
-        if payday and not conn.execute("SELECT 1 FROM budget_months WHERE household_id=? AND month=?", (household,payday[:7])).fetchone():
-            raise ValueError("Plan the next budget month and its upcoming bills before checking spending across payday.")
-    from .dates import household_today
-    if today != household_today():
-        raise ValueError("Live safe-to-spend must use today's date.")
-    if month != today.strftime("%Y-%m"):
-        raise ValueError("Use the current budget month for safe-to-spend with live balances.")
-    if not status["ready"]:
-        raise ValueError(status["issues"][0] if status["issues"] else "Compare bank balances and transactions, then confirm reconciliation in Settings.")
 
 
 def require_funding_bank_ready(repository, month_id):
