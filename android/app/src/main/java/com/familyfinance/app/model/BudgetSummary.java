@@ -25,6 +25,7 @@ public final class BudgetSummary {
     public final List<BudgetCategory> categories;
     public final Integer reservedCashCents;
     public final List<String> reserveIssues;
+    public final List<String> dashboardReserveIssues;
 
     public BudgetSummary(
             int budgetMonthId,
@@ -42,14 +43,16 @@ public final class BudgetSummary {
     ) {
         this(budgetMonthId, month, includedAccountBalanceCents, plannedIncomeTotalCents,
                 assignedTotalCents, remainingToAssignCents, totalSpentCents, billsBeforePaydayCents,
-                cashAfterBillsCents, daysUntilPayday, nextPayday, categories, true, null, "", null, Collections.emptyList());
+                cashAfterBillsCents, daysUntilPayday, nextPayday, categories, true, null, "", null,
+                Collections.emptyList(), Collections.emptyList());
     }
 
     private BudgetSummary(int budgetMonthId, String month, int includedAccountBalanceCents,
             int plannedIncomeTotalCents, int assignedTotalCents, int remainingToAssignCents,
             int totalSpentCents, Integer billsBeforePaydayCents, Integer cashAfterBillsCents,
             Integer daysUntilPayday, String nextPayday, List<BudgetCategory> categories,
-            boolean forecastAvailable, Boolean lowCushion, String asOf, Integer reservedCashCents, List<String> reserveIssues) {
+            boolean forecastAvailable, Boolean lowCushion, String asOf, Integer reservedCashCents,
+            List<String> reserveIssues, List<String> dashboardReserveIssues) {
         this.budgetMonthId = budgetMonthId;
         this.month = month;
         this.includedAccountBalanceCents = includedAccountBalanceCents;
@@ -67,6 +70,7 @@ public final class BudgetSummary {
         this.categories = Collections.unmodifiableList(new ArrayList<>(categories));
         this.reservedCashCents = reservedCashCents;
         this.reserveIssues = Collections.unmodifiableList(new ArrayList<>(reserveIssues));
+        this.dashboardReserveIssues = Collections.unmodifiableList(new ArrayList<>(dashboardReserveIssues));
     }
 
     public BudgetSummary(
@@ -104,9 +108,8 @@ public final class BudgetSummary {
             }
         }
         boolean forecastAvailable = json.optBoolean("forecast_available", !json.isNull("next_payday"));
-        ArrayList<String> reserveIssues = new ArrayList<>();
-        JSONArray issues = json.optJSONArray("reserve_issues");
-        if (issues != null) for (int i = 0; i < issues.length(); i++) reserveIssues.add(issues.optString(i));
+        List<String> reserveIssues = issueMessages(json.optJSONArray("reserve_issues"));
+        JSONArray dashboardIssues = json.optJSONArray("dashboard_reserve_issues");
         return new BudgetSummary(
                 json.optInt("budget_month_id"),
                 json.optString("month", "Unknown month"),
@@ -124,8 +127,17 @@ public final class BudgetSummary {
                 json.opt("low_cushion") instanceof Boolean ? json.optBoolean("low_cushion") : null,
                 json.optString("as_of", ""),
                 json.isNull("reserved_cash_cents") ? null : JsonMoney.cents(json, "reserved_cash_cents"),
-                reserveIssues
+                reserveIssues,
+                dashboardIssues == null ? reserveIssues : issueMessages(dashboardIssues)
         );
+    }
+
+    private static List<String> issueMessages(JSONArray issues) {
+        List<String> messages = new ArrayList<>();
+        if (issues != null) {
+            for (int i = 0; i < issues.length(); i++) messages.add(issues.optString(i));
+        }
+        return messages;
     }
 
     public int uncategorizedAttentionCount(List<TransactionDetail> reviewQueue) {

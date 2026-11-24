@@ -1,5 +1,7 @@
 # Ledger 0.8.0 release handoff
 
+This is the October packaging snapshot. PR #24 subsequently merged at `02ca1a6`. The current candidate and next rollout are documented in [Ledger 0.9.0](ledger-0.9.0-release.md).
+
 ## Status
 
 Daniel approved preparing the signed APK and publishing the branch/PR on October 8, 2026. Release candidate: **`0.8.0-ledger` / version code 8**, backend schema **7**, branch **`codex/ledger-budget-workflow`**, based on `main` at `9dffab8` (merged PR #23). Implementation commit **`6d9761550f21070a4c17dabc20a1a3fa6656a2f2`** is published in [PR #24](https://github.com/danielwisniewski-dev/Family_Finance_App/pull/24), targeting `main`. The PR is open, ready for review and mergeable; no GitHub CI checks are configured. The recorded local verification supplies the test evidence.

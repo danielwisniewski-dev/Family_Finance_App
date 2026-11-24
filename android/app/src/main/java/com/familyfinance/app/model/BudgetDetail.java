@@ -13,19 +13,22 @@ public final class BudgetDetail {
     public final List<BudgetGroup> groups;
     public final List<ExpectedBill> expectedBills;
     public final List<Payday> paydays;
+    public final List<PaydaySchedule.Occurrence> scheduledPaydays;
 
     public BudgetDetail(
             BudgetSummary summary,
             List<PlannedIncome> income,
             List<BudgetGroup> groups,
             List<ExpectedBill> expectedBills,
-            List<Payday> paydays
+            List<Payday> paydays,
+            List<PaydaySchedule.Occurrence> scheduledPaydays
     ) {
         this.summary = summary;
         this.income = Collections.unmodifiableList(new ArrayList<>(income));
         this.groups = Collections.unmodifiableList(new ArrayList<>(groups));
         this.expectedBills = Collections.unmodifiableList(new ArrayList<>(expectedBills));
         this.paydays = Collections.unmodifiableList(new ArrayList<>(paydays));
+        this.scheduledPaydays = Collections.unmodifiableList(new ArrayList<>(scheduledPaydays));
     }
 
     public static BudgetDetail fromJson(JSONObject json) {
@@ -61,6 +64,7 @@ public final class BudgetDetail {
             }
         }
 
-        return new BudgetDetail(BudgetSummary.fromJson(json), income, groups, bills, paydays);
+        return new BudgetDetail(BudgetSummary.fromJson(json), income, groups, bills, paydays,
+                PaydaySchedule.occurrences(json.optJSONArray("scheduled_paydays")));
     }
 }

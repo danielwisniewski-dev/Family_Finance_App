@@ -15,6 +15,7 @@ from .auth import hash_password, hash_session_token, new_session_token, verify_p
 from .migrations import migrate
 from .funds import FundRepositoryMixin, cash_context, fund_rows
 from .dates import household_today
+from .payday_schedules import PaydayScheduleRepositoryMixin, household_schedules
 from .security import RateLimitError, RuntimeSettings, attempt_key
 from .domain import (
     AccountLine,
@@ -51,7 +52,7 @@ DUMMY_PASSWORD_HASH = hash_password(new_session_token())
 UNCHANGED = object()
 
 
-class BudgetRepository(FundRepositoryMixin):
+class BudgetRepository(FundRepositoryMixin, PaydayScheduleRepositoryMixin):
     def __init__(self, db_path: str | Path, settings: RuntimeSettings | None = None):
         self.db_path = Path(db_path)
         self.settings = settings or RuntimeSettings()
@@ -797,6 +798,7 @@ class BudgetRepository(FundRepositoryMixin):
                 "SELECT * FROM paydays WHERE household_id = ? ORDER BY payday_date, id",
                 (budget_month["household_id"],),
             ).fetchall()
+            scheduled_paydays = household_schedules(connection, budget_month["household_id"], today)["upcoming_paydays"][:6]
 
         categories_by_group: dict[int, list[dict[str, Any]]] = {}
         summary_categories = {category.id: category for category in summary.categories}
@@ -851,6 +853,7 @@ class BudgetRepository(FundRepositoryMixin):
                 "due_on": row["due_on"],
                 "paid": bool(row["paid"]),
                 "reserve_fund_id": row["reserve_fund_id"],
+                "budget_category_id": row["budget_category_id"],
             }
             for row in bill_rows
         ]
@@ -862,6 +865,7 @@ class BudgetRepository(FundRepositoryMixin):
             }
             for row in payday_rows
         ]
+        detail["scheduled_paydays"] = scheduled_paydays
         return detail
 
     def update_account_balance(self, budget_month_id: int, included_account_balance_cents: int) -> None:
@@ -2873,11 +2877,13 @@ class BudgetRepository(FundRepositoryMixin):
         paid: bool = False,
         actor_user_id: int | None = None,
         reserve_fund_id: int | None = None,
+        budget_category_id: int | None = None,
     ) -> int:
         name = clean_required_text(name, "name")
         validate_positive_cents(amount_cents, "amount_cents")
         with self.connect() as connection:
             context = self._notification_context_for_budget_month(connection, budget_month_id)
+            self._validate_bill_budget_link(connection, budget_month_id, budget_category_id, reserve_fund_id)
             if reserve_fund_id is not None:
                 fund = self._require_fund(connection, reserve_fund_id, context["household_id"])
                 if fund["archived"]:
@@ -2890,6 +2896,8 @@ class BudgetRepository(FundRepositoryMixin):
                 """,
                 (budget_month_id, name, amount_cents, due_on.isoformat(), 1 if paid else 0, reserve_fund_id),
             )
+            if budget_category_id is not None:
+                connection.execute("UPDATE expected_bills SET budget_category_id=? WHERE id=?", (budget_category_id, bill_id))
             self._insert_notification_event(
                 connection,
                 household_id=context["household_id"],
@@ -2915,6 +2923,7 @@ class BudgetRepository(FundRepositoryMixin):
         paid: bool | None = None,
         actor_user_id: int | None = None,
         reserve_fund_id=UNCHANGED,
+        budget_category_id=UNCHANGED,
     ) -> None:
         assignments: list[str] = []
         values: list[Any] = []
@@ -2935,11 +2944,20 @@ class BudgetRepository(FundRepositoryMixin):
         if reserve_fund_id is not UNCHANGED:
             assignments.append("reserve_fund_id = ?")
             values.append(reserve_fund_id)
+        if budget_category_id is not UNCHANGED:
+            assignments.append("budget_category_id = ?")
+            values.append(budget_category_id)
         if not assignments:
             return
         values.append(bill_id)
         with self.connect() as connection:
             before = self._notification_context_for_bill(connection, bill_id)
+            if budget_category_id is not UNCHANGED or reserve_fund_id is not UNCHANGED:
+                self._validate_bill_budget_link(
+                    connection, before["budget_month_id"],
+                    before["budget_category_id"] if budget_category_id is UNCHANGED else budget_category_id,
+                    before["reserve_fund_id"] if reserve_fund_id is UNCHANGED else reserve_fund_id,
+                )
             if reserve_fund_id is not UNCHANGED and reserve_fund_id is not None:
                 fund = self._require_fund(connection, reserve_fund_id, before["household_id"])
                 if fund["archived"]:
@@ -2963,6 +2981,23 @@ class BudgetRepository(FundRepositoryMixin):
                     "action": "updated",
                 },
             )
+
+    @staticmethod
+    def _validate_bill_budget_link(connection, month_id, category_id, fund_id):
+        if category_id is None:
+            return
+        if fund_id is not None:
+            raise ValueError("Choose either a budget category or a Provision Fund for this bill.")
+        if connection.execute(
+            """SELECT c.id FROM budget_categories c JOIN budget_groups g ON g.id=c.budget_group_id
+               WHERE c.id=? AND g.budget_month_id=? AND g.archived=0 AND c.archived=0 AND c.reserve_fund_id IS NULL""",
+            (category_id, month_id),
+        ).fetchone() is None:
+            raise ValueError("Choose an active spending category from this bill's budget month.")
+
+    def match_bill_budget(self, transaction_id, household_id, actor_user_id, confirmed=None):
+        from .bill_budget import match_bill_budget
+        return match_bill_budget(self, transaction_id, household_id, actor_user_id, confirmed)
 
     def remove_expected_bill(self, *, bill_id: int, actor_user_id: int | None = None) -> None:
         with self.connect() as connection:
@@ -3066,7 +3101,9 @@ class BudgetRepository(FundRepositoryMixin):
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             snapshot = self._load_snapshot(budget_month_id)
-            funds = cash_context(connection, snapshot["budget_month"]["household_id"], budget_month_id, today)
+            household_id = snapshot["budget_month"]["household_id"]
+            funds = cash_context(connection, household_id, budget_month_id, today)
+        paydays = [date.fromisoformat(funds["next_payday"])] if funds["next_payday"] else []
         return summarize_budget(
             budget_month_id=budget_month_id,
             month=snapshot["budget_month"]["month"],
@@ -3074,12 +3111,13 @@ class BudgetRepository(FundRepositoryMixin):
             categories=snapshot["categories"],
             included_account_balance_cents=snapshot["included_account_balance_cents"],
             expected_bills=snapshot["expected_bills"],
-            paydays=snapshot["paydays"],
+            paydays=paydays,
             today=today,
             low_cushion_daily_cents=snapshot["budget_month"]["low_cushion_daily_cents"],
             reserved_cash_cents=funds["reserved_cash_cents"],
             reserve_covered_bills_cents=funds["reserve_covered_bills_cents"],
             reserve_issues=tuple(funds["issues"]),
+            overdrawn_fund_issues=funds["overdrawn_issues"],
         )
 
 
@@ -3169,7 +3207,9 @@ class BudgetRepository(FundRepositoryMixin):
                 eb.name,
                 eb.amount_cents,
                 eb.due_on,
-                eb.paid
+                eb.paid,
+                eb.reserve_fund_id,
+                eb.budget_category_id
             FROM expected_bills eb
             JOIN budget_months b ON b.id = eb.budget_month_id
             WHERE eb.id = ?
@@ -3366,11 +3406,13 @@ class BudgetRepository(FundRepositoryMixin):
             """,
             (source_budget_month_id,),
         ).fetchall()
+        category_id_map = {}
         for row in category_rows:
             new_group_id = group_id_map.get(int(row["budget_group_id"]))
             if new_group_id is None:
                 continue
-            connection.execute(
+            category_id_map[row["id"]] = insert_and_return_id(
+                connection,
                 """
                 INSERT INTO budget_categories(budget_group_id, name, planned_cents, archived, display_order, reserve_fund_id)
                 VALUES (?, ?, ?, 0, ?, ?)
@@ -3385,8 +3427,8 @@ class BudgetRepository(FundRepositoryMixin):
         for row in bill_rows:
             connection.execute(
                 """
-                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid, reserve_fund_id)
-                VALUES (?, ?, ?, ?, 0, ?)
+                INSERT INTO expected_bills(budget_month_id, name, amount_cents, due_on, paid, reserve_fund_id, budget_category_id)
+                VALUES (?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     target_budget_month_id,
@@ -3394,6 +3436,7 @@ class BudgetRepository(FundRepositoryMixin):
                     row["amount_cents"],
                     same_day_in_month(row["due_on"], target_month),
                     row["reserve_fund_id"],
+                    category_id_map.get(row["budget_category_id"]),
                 ),
             )
 
@@ -3797,10 +3840,6 @@ class BudgetRepository(FundRepositoryMixin):
                          (a.plaid_item_id IS NOT NULL AND anchor.household_id=(SELECT household_id FROM budget_months WHERE id=?)) ORDER BY a.id""",
                 (budget_month_id, budget_month_id),
             ).fetchall()
-            payday_rows = connection.execute(
-                "SELECT payday_date FROM paydays WHERE household_id = ? ORDER BY payday_date",
-                (budget_month["household_id"],),
-            ).fetchall()
             funds_by_id = {f["id"]: f for f in fund_rows(connection, budget_month["household_id"], budget_month_id)}
 
         if account_rows:
@@ -3847,7 +3886,6 @@ class BudgetRepository(FundRepositoryMixin):
                 )
                 for row in bill_rows
             ],
-            "paydays": [date.fromisoformat(row["payday_date"]) for row in payday_rows],
         }
 
 

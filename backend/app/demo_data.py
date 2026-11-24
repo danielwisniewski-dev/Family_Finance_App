@@ -8,6 +8,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 from datetime import date, timedelta
+from .payday_schedules import PaydayRule
 from pathlib import Path
 
 from .bank_data import bank_status, reconcile_bank
@@ -58,8 +59,9 @@ def create_demo_context(db_path: Path, today: date | None = None) -> DemoContext
         for index, (name, planned) in enumerate(specs):
             categories[name] = repository.add_category(budget_group_id=group, name=name, planned_cents=planned, display_order=index)
     # Paydays remain useful even when entry happens on the last day of a month.
-    for offset in (6, 20):
-        repository.add_payday(household_id=household, payday_date=today + timedelta(days=offset))
+    repository.save_payday_schedule(household, "Alex’s paychecks", PaydayRule("every_two_weeks", today + timedelta(days=6)))
+    jamie_payday = today + timedelta(days=20)
+    repository.save_payday_schedule(household, "Jamie’s paychecks", PaydayRule("monthly", jamie_payday, jamie_payday.day))
     previous_day = today.replace(day=1) - timedelta(days=1)
     next_day = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
     txn_date = max(today.replace(day=1), today - timedelta(days=2))
@@ -111,8 +113,15 @@ def create_demo_context(db_path: Path, today: date | None = None) -> DemoContext
                                          ("Auto insurance installment", 80_000, 5, funds["Annual Insurance"]["id"]),
                                          ("Rent", 180_000, 10, None)):
         due = today + timedelta(days=offset)
-        repository.add_expected_bill(budget_month_id=month_ids[due.strftime("%Y-%m")], name=name, amount_cents=amount,
-            due_on=due, reserve_fund_id=fund_id)
+        bill_month = month_ids[due.strftime("%Y-%m")]
+        category_name = {"Electric": "Utilities", "Internet": "Internet", "Rent": "Rent"}.get(name)
+        with repository.connect() as connection:
+            category = connection.execute(
+                """SELECT c.id FROM budget_categories c JOIN budget_groups g ON g.id=c.budget_group_id
+                   WHERE g.budget_month_id=? AND c.name=?""", (bill_month, category_name),
+            ).fetchone()
+        repository.add_expected_bill(budget_month_id=bill_month, name=name, amount_cents=amount,
+            due_on=due, reserve_fund_id=fund_id, budget_category_id=category[0] if category else None)
     if not service.sync_transactions(item).success:
         raise RuntimeError("Demo transaction fixture could not be imported")
     with repository.connect() as connection:

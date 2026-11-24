@@ -10,6 +10,7 @@ import json
 from datetime import date
 
 from .dates import household_today
+from .payday_schedules import next_household_payday
 
 
 def _cents(value, label, *, positive=False):
@@ -92,7 +93,7 @@ def cash_context(connection, household_id, budget_month_id, today, *, balance_ad
     balances = {r["id"]: max(0, r["balance_cents"]) for r in rows}
     included = {r["id"] for r in rows if r["included_in_cash_reality"] and r["backing_account_id"] in month_accounts}
     reserved = sum(balances[f] for f in included)
-    payday = connection.execute("SELECT MIN(payday_date) FROM paydays WHERE household_id=? AND payday_date>=?", (household_id, today.isoformat())).fetchone()[0]
+    payday = next_household_payday(connection, household_id, today)
     bills = connection.execute("""SELECT e.* FROM expected_bills e JOIN budget_months b ON b.id=e.budget_month_id
         WHERE b.household_id=? AND e.paid=0 AND e.due_on>=? AND e.due_on<? ORDER BY e.due_on,e.id""",
         (household_id, today.isoformat(), payday or today.isoformat())).fetchall()
@@ -109,11 +110,14 @@ def cash_context(connection, household_id, budget_month_id, today, *, balance_ad
         return total
 
     issues = []
+    overdrawn_issues = {}
     by_account = {}
     for fund in rows:
         by_account[fund["backing_account_id"]] = by_account.get(fund["backing_account_id"], 0) + max(0, fund["balance_cents"])
         if fund["balance_cents"] < 0:
-            issues.append(f"{fund['name']} has spent more than was set aside. Add money or correct its transactions.")
+            message = f"{fund['name']} has spent more than was set aside. Add money or correct its transactions."
+            issues.append(message)
+            overdrawn_issues[fund["id"]] = message
         if fund["balance_cents"] > 0 and fund["backing_account_id"] not in month_accounts:
             issues.append(f"The account backing {fund['name']} is unavailable in this budget month.")
     for account_id, protected in by_account.items():
@@ -123,7 +127,7 @@ def cash_context(connection, household_id, budget_month_id, today, *, balance_ad
     return {"rows": rows, "reserved_cash_cents": reserved,
             "reserve_covered_bills_cents": covered(balances),
             "bills_cents": sum(b["amount_cents"] for b in bills), "next_payday": payday,
-            "issues": list(dict.fromkeys(issues)), "reserved_by_account": by_account,
+            "issues": list(dict.fromkeys(issues)), "overdrawn_issues": overdrawn_issues, "reserved_by_account": by_account,
             "available_account_ids": month_accounts}
 
 

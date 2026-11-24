@@ -58,6 +58,19 @@ def run_smoke() -> dict:
                 categories = {c["name"]: c["id"] for g in detail["groups"] for c in g["categories"]}
                 assert detail["forecast_available"]
                 assert detail["cash_after_bills_cents"] == 142_000
+                today = household_today()
+                plan = {"name": "Demo temporary payday", "frequency": "weekly",
+                        "starts_on": (today + timedelta(days=2)).isoformat()}
+                original_date = plan["starts_on"]
+                assert len(demo_request("GET", "/payday-schedules")["schedules"]) == 2
+                schedule_id = demo_request("POST", "/payday-schedules", plan, expected=201)["id"]
+                assert demo_request("GET", f"/budget-months/{month}/summary")["next_payday"] == original_date
+                shifted = (today + timedelta(days=3)).isoformat()
+                demo_request("PATCH", f"/payday-schedules/{schedule_id}/move",
+                             {"original_date": original_date, "moved_to": shifted})
+                assert demo_request("GET", f"/budget-months/{month}/summary")["next_payday"] == shifted
+                request("GET", "/demo/payday-schedules", bearer=token, expected=401)
+                request("GET", "/payday-schedules", bearer=demo, expected=401)
                 for path in ("/safe-to-spend", "/coach/safe-to-spend"):
                     demo_request("POST", path, {}, expected=410)
                 original = demo_request("GET", f"/budget-months/{month}/funds")["funds"]
@@ -178,6 +191,24 @@ def run_smoke() -> dict:
                 linked = demo_request("GET", f"/transactions/{paycheck_id}")
                 assert linked["income_name"] == "Demo linked income"
                 assert linked["transaction"]["occurred_on"] == paycheck["transaction"]["occurred_on"]
+                bill_id = demo_request("POST", "/expected-bills", {
+                    "budget_month_id": month, "name": "Demo renewal", "amount_cents": 20_000,
+                    "due_on": household_today().isoformat(), "budget_category_id": categories["Health"],
+                }, expected=201)["id"]
+                payment = next(item["transaction"]["id"] for item in transactions
+                               if item["transaction"]["name"] == "Lantern Kitchen")
+                demo_request("PATCH", f"/transactions/{payment}/category", {"category_id": categories["Health"]})
+                match_path = f"/transactions/{payment}/bill-budget"
+                offer = demo_request("PATCH", match_path)["offer"]
+                assert offer["bill_id"] == bill_id and offer["expense_cents"] == 19_600
+                saved = demo_request("GET", f"/budget-months/{month}/budget-detail")
+                assert next(b["amount_cents"] for b in saved["expected_bills"] if b["id"] == bill_id) == 20_000
+                request("PATCH", match_path, {"confirmed": offer}, bearer=demo, expected=401)
+                demo_request("PATCH", match_path, {"confirmed": offer})
+                saved = demo_request("GET", f"/budget-months/{month}/budget-detail")
+                assert next(b["amount_cents"] for b in saved["expected_bills"] if b["id"] == bill_id) == 19_600
+                assert next(c["planned_cents"] for g in saved["groups"] for c in g["categories"]
+                            if c["id"] == categories["Health"]) == 19_600
                 demo_request("POST", "/exit")
                 request("GET", "/demo/budget-months", bearer=demo, expected=401)
                 assert real.db_path.read_bytes() == baseline, "Demo operations changed the real database"
@@ -186,12 +217,16 @@ def run_smoke() -> dict:
                 fresh_detail = request("GET", f"/demo/budget-months/{month}/budget-detail", bearer=fresh["token"])
                 assert "Demo groceries edited" not in json.dumps(fresh_detail)
                 assert "Demo linked income" not in json.dumps(fresh_detail)
+                assert "Demo renewal" not in json.dumps(fresh_detail)
                 assert fresh_detail["income"][0]["received_cents"] == 200_000
                 fresh_months = request("GET", "/demo/budget-months", bearer=fresh["token"])["budget_months"]
                 assert not any(m["month"] == new_month for m in fresh_months)
                 assert [m["id"] for m in fresh_months if m["is_active"]] == [month]
                 fresh_funds = request("GET", f"/demo/budget-months/{month}/funds", bearer=fresh["token"])["funds"]
                 assert next(f for f in fresh_funds if f["id"] == fund["id"])["balance_cents"] == fund["balance_cents"]
+                fresh_schedules = request("GET", "/demo/payday-schedules", bearer=fresh["token"])
+                assert len(fresh_schedules["schedules"]) == 2
+                assert not any(item["name"] == plan["name"] for item in fresh_schedules["schedules"])
                 request("POST", "/demo/exit", bearer=fresh["token"])
                 request("GET", "/budget-months", bearer=token)
                 return {"ok": True, "funded_funds": len(original), "reviewed_new_transactions": len(queue),
@@ -199,7 +234,7 @@ def run_smoke() -> dict:
                         "fresh_reentry": True, "dashboard_forecast_and_retired_check": True,
                         "fund_contribute_release_move": True, "transaction_month_move_and_income": True, "budget_edit_copy_manual_spending": True,
                         "transaction_split_refund_ignore_rules": True, "coach_advisory_only": True,
-                        "notifications": True}
+                        "notifications": True, "household_payday_schedules": True}
         finally:
             app.demo_manager.close()
 

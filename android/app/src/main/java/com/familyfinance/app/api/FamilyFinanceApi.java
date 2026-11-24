@@ -14,6 +14,7 @@ import com.familyfinance.app.model.BankRefreshStatus;
 import com.familyfinance.app.state.PendingFundAction;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.time.LocalDate;
@@ -385,6 +386,11 @@ public final class FamilyFinanceApi {
     }
 
     public int createExpectedBill(int budgetMonthId, String name, int amountCents, String dueOn, boolean paid, Integer reserveFundId) throws ApiException {
+        return createExpectedBill(budgetMonthId, name, amountCents, dueOn, paid, reserveFundId, null);
+    }
+
+    public int createExpectedBill(int budgetMonthId, String name, int amountCents, String dueOn, boolean paid,
+            Integer reserveFundId, Integer categoryId) throws ApiException {
         try {
             JSONObject payload = new JSONObject();
             payload.put("budget_month_id", budgetMonthId);
@@ -393,6 +399,7 @@ public final class FamilyFinanceApi {
             payload.put("due_on", dueOn);
             payload.put("paid", paid);
             if (reserveFundId != null) payload.put("reserve_fund_id", reserveFundId);
+            if (categoryId != null) payload.put("budget_category_id", categoryId);
             return client.post("/expected-bills", payload).optInt("id");
         } catch (ApiException exception) {
             throw exception;
@@ -407,14 +414,26 @@ public final class FamilyFinanceApi {
 
     public void updateExpectedBill(int billId, String name, int amountCents, String dueOn, boolean paid,
             Integer reserveFundId, boolean updateFundLink) throws ApiException {
+        updateExpectedBill(billId, name, amountCents, dueOn, paid, reserveFundId, updateFundLink, null, false);
+    }
+
+    public void updateExpectedBill(int billId, String name, int amountCents, String dueOn, boolean paid,
+            Integer reserveFundId, boolean updateFundLink, Integer categoryId, boolean updateCategoryLink) throws ApiException {
         try {
             JSONObject payload = expectedBillUpdatePayload(name, amountCents, dueOn, paid, reserveFundId, updateFundLink);
+            if (updateCategoryLink) payload.put("budget_category_id", categoryId == null ? JSONObject.NULL : categoryId);
             client.patch("/expected-bills/" + billId, payload);
         } catch (ApiException exception) {
             throw exception;
         } catch (Exception exception) {
             throw new ApiException("Could not update expected bill", exception);
         }
+    }
+
+    public JSONObject matchBillBudget(int transactionId, JSONObject confirmed) throws ApiException, JSONException {
+        JSONObject payload = new JSONObject();
+        if (confirmed != null) payload.put("confirmed", confirmed);
+        return client.patch("/transactions/" + transactionId + "/bill-budget", payload).optJSONObject("offer");
     }
 
     /** The backend checks shared household timestamps and serializes concurrent phone requests. */
@@ -549,6 +568,27 @@ public final class FamilyFinanceApi {
 
     public void deletePayday(int paydayId) throws ApiException {
         client.delete("/paydays/" + paydayId);
+    }
+
+    public JSONObject getPaydaySchedules() throws ApiException {
+        return client.get("/payday-schedules");
+    }
+
+    public void savePaydaySchedule(int scheduleId, String name, String frequency, String startsOn,
+                                   Integer dayOne, Integer dayTwo) throws ApiException, JSONException {
+        JSONObject payload = new JSONObject().put("name", name).put("frequency", frequency)
+                .put("starts_on", startsOn).put("day_one", dayOne).put("day_two", dayTwo);
+        if (scheduleId == 0) client.post("/payday-schedules", payload);
+        else client.patch("/payday-schedules/" + scheduleId, payload);
+    }
+
+    public void deletePaydaySchedule(int scheduleId) throws ApiException {
+        client.delete("/payday-schedules/" + scheduleId);
+    }
+
+    public void moveScheduledPayday(int scheduleId, String original, String movedTo) throws ApiException, JSONException {
+        client.patch("/payday-schedules/" + scheduleId + "/move", new JSONObject().put("original_date", original)
+                .put("moved_to", movedTo == null ? JSONObject.NULL : movedTo));
     }
 
     public List<TransactionDetail> getTransactions(int budgetMonthId) throws ApiException {
