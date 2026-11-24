@@ -3,6 +3,8 @@ package com.familyfinance.app.state;
 import android.content.Context;
 import android.content.SharedPreferences;
 import org.json.JSONObject;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -38,6 +40,7 @@ public final class DemoModeStore {
         if (!encrypted.save(token, origin)) return false;
         if (!preferencesFor(scope).edit().clear().putString("base_url", origin)
                 .putInt("budget_month_id", response.optInt("budget_month_id"))
+                .putLong("session_expires_at", reminderExpiry(response))
                 .putInt("current_user_id", user.optInt("id")).putString("current_user_name", user.optString("name"))
                 .putInt("household_id", household.optInt("id")).putString("household_name", household.optString("name"))
                 .commit()) { encrypted.clear(); return false; }
@@ -45,6 +48,15 @@ public final class DemoModeStore {
             encrypted.clear(); return false;
         }
         return true;
+    }
+
+    private static long reminderExpiry(JSONObject response) {
+        try {
+            return Instant.parse(response.optString("expires_at")).getEpochSecond();
+        } catch (DateTimeParseException exception) {
+            // A response without a usable deadline is unsafe to schedule in a disposable session.
+            return 0;
+        }
     }
 
     /** Queue encrypted credentials for best-effort revocation, then stop using this session immediately. */

@@ -1,6 +1,6 @@
 # Stage 1 private beta
 
-Historical Stage 1 runbook. For the deployed USAA integration, September 23 application baseline and September 29 rollout, see [Stage 2](stage-2-usaa-plaid.md), [Provision Funds](provision-funds.md) and [Ledger](ledger-daily-sync.md). Version numbers and rollout status below describe Stage 1. Existing signed phone installations must be updated in place using the original signing key; the historical debug-install instructions below do not apply to them.
+Historical Stage 1 runbook. For the current candidate and schema 9 rollout, see [Ledger 0.9.0](ledger-0.9.0-release.md). For the deployed USAA integration and September releases, see [Stage 2](stage-2-usaa-plaid.md), [Provision Funds](provision-funds.md) and [Ledger](ledger-daily-sync.md). Version numbers below describe Stage 1. Existing signed phone installations use the original signing key for updates.
 
 The later [Ledger release](ledger-daily-sync.md), deployed September 29 with a verified signed APK ready to install, adds [in-app Demo mode](demo-mode-plan.md) on the same hosted service with disposable session databases. Its data is not a household backup and must not replace/reseed `FF_DB_PATH`. Preserve real recovery archives and keys. The September 29 headroom/recovery preflight and deployment preservation checks passed; no additional service or plan upgrade was made. Demo sessions expire on backend restart; test mode/token isolation as part of subsequent auth/hosting changes. Historical Stage 1 test results below do not verify that addition.
 

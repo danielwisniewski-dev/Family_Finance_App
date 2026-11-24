@@ -1,16 +1,21 @@
 package com.familyfinance.app;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.TimePickerDialog;
+import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -46,6 +51,7 @@ import com.familyfinance.app.model.ExpectedBill;
 import com.familyfinance.app.model.MerchantRule;
 import com.familyfinance.app.model.NotificationEvent;
 import com.familyfinance.app.model.Payday;
+import com.familyfinance.app.model.PaydaySchedule;
 import com.familyfinance.app.model.PlannedIncome;
 import com.familyfinance.app.model.ProvisionFunds;
 import com.familyfinance.app.model.BankRefreshStatus;
@@ -86,13 +92,19 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.YearMonth;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 
 import kotlin.Unit;
 
 public final class MainActivity extends Activity {
-    private static final String PREFS = "family_finance";
+    static final String PREFS = "family_finance";
+    private static final String TRANSACTION_SELECTION_TITLE = "Choose multiple transactions";
+    private static final int REQUEST_REMINDER_PERMISSION = 101;
+    private DailyReminder dailyReminder;
+    private Runnable refreshReminderSetting;
     private static final String DEFAULT_BASE_URL = BuildConfig.DEFAULT_BACKEND_URL;
     private static final int DEFAULT_BUDGET_MONTH_ID = 0; // Resolve the household's active month after login.
     private static final String PREF_LAST_BUDGET_CHECK_DATE = "last_budget_check_date";
@@ -197,6 +209,7 @@ public final class MainActivity extends Activity {
         repairingBank = savedInstanceState != null && savedInstanceState.getBoolean("repairingBank", false);
         if (!BuildConfig.DEBUG) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         demoStore = new DemoModeStore(this);
+        dailyReminder = new DailyReminder(this);
         loadPreferences();
         retryDemoCleanup();
         if (demoMode && (authToken == null || authToken.isEmpty())) {
@@ -215,6 +228,8 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         foreground = true;
+        dailyReminder.foregroundChanged(true, !authToken.isEmpty());
+        if (refreshReminderSetting != null) refreshReminderSetting.run();
         automaticSyncPending = true;
         maybeSyncOnOpen();
     }
@@ -222,7 +237,17 @@ public final class MainActivity extends Activity {
     @Override
     protected void onPause() {
         foreground = false;
+        dailyReminder.foregroundChanged(false, !authToken.isEmpty());
         super.onPause();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_REMINDER_PERMISSION) {
+            dailyReminder.refreshSchedule();
+            if (refreshReminderSetting != null) refreshReminderSetting.run();
+        }
     }
 
     @Override
@@ -310,7 +335,7 @@ public final class MainActivity extends Activity {
                 showMerchantRules();
             } else if ("Merchant rules".equals(currentScreen)) {
                 showTransactions(reviewingQueue);
-            } else if ("Transaction Detail".equals(currentScreen) || "Select transactions".equals(currentScreen)) {
+            } else if ("Transaction Detail".equals(currentScreen) || TRANSACTION_SELECTION_TITLE.equals(currentScreen)) {
                 showTransactions(reviewingQueue);
             } else if ("Fund Detail".equals(currentScreen) || "Edit Fund".equals(currentScreen)
                     || "Add Fund".equals(currentScreen) || "Set Aside Money".equals(currentScreen)
@@ -347,7 +372,7 @@ public final class MainActivity extends Activity {
             secureSession().clear();
             prefs.edit().putString("base_url", DEFAULT_BASE_URL)
                     .remove("auth_token").remove("current_user_id").remove("current_user_name")
-                    .remove("household_id").remove("household_name").apply();
+                    .remove("household_id").remove("household_name").remove("session_expires_at").apply();
         }
         budgetMonthId = prefs.getInt("budget_month_id", DEFAULT_BUDGET_MONTH_ID);
         // Legacy plaintext tokens are deliberately discarded; a fresh login encrypts the new session.
@@ -358,6 +383,7 @@ public final class MainActivity extends Activity {
         currentUserName = prefs.getString("current_user_name", "");
         householdName = prefs.getString("household_name", "");
         api = demoMode ? FamilyFinanceApi.demo(baseUrl, authToken) : new FamilyFinanceApi(baseUrl, authToken);
+        dailyReminder.sessionChanged(!authToken.isEmpty());
     }
 
     private void saveConnectionPreferences(String newBaseUrl, int newBudgetMonthId) {
@@ -382,7 +408,7 @@ public final class MainActivity extends Activity {
         loadPreferences();
     }
 
-    private boolean saveAuthSession(String token, JSONObject user, JSONObject household) {
+    private boolean saveAuthSession(String token, JSONObject user, JSONObject household, long expiresAt) {
         if (!secureSession().save(token, baseUrl)) {
             showLogin("The phone could not securely save your session. Please try logging in again.");
             return false;
@@ -394,6 +420,7 @@ public final class MainActivity extends Activity {
                 .putString("current_user_name", user.optString("name"))
                 .putInt("household_id", household.optInt("id"))
                 .putString("household_name", household.optString("name"))
+                .putLong("session_expires_at", expiresAt)
                 .apply();
         loadPreferences();
         return true;
@@ -425,6 +452,7 @@ public final class MainActivity extends Activity {
                 .remove("current_user_name")
                 .remove("household_id")
                 .remove("household_name")
+                .remove("session_expires_at")
                 .apply();
         loadPreferences();
         clearFinancialData();
@@ -755,7 +783,8 @@ public final class MainActivity extends Activity {
                         if (!saveAuthSession(
                                 auth.optString("token"),
                                 auth.optJSONObject("user") == null ? new JSONObject() : auth.optJSONObject("user"),
-                                auth.optJSONObject("household") == null ? new JSONObject() : auth.optJSONObject("household")
+                                auth.optJSONObject("household") == null ? new JSONObject() : auth.optJSONObject("household"),
+                                auth.optLong("expires_at", Long.MAX_VALUE)
                         )) return;
                         showLoading("Loading dashboard...");
                         refreshData(this::showDashboard);
@@ -820,7 +849,7 @@ public final class MainActivity extends Activity {
                     "Cash after bills is unavailable until you add an upcoming payday.");
             makeCardAction(cashCard, "Included account balance. " + MoneyFormatter.dollars(summary.includedAccountBalanceCents)
                     + ". Open accounts and settings.", this::showSettings);
-            addButton("Add a payday", () -> showPaydayEditor(null));
+            addButton("Set up paydays", this::showPaydaySchedules);
         }
         if (summary.reservedCashCents != null) {
             LinearLayout reserveCard = addMetricCard("Reserved for irregular expenses  \u203A",
@@ -829,7 +858,7 @@ public final class MainActivity extends Activity {
                             : "This portion of your included account balance is reserved. Add a payday to see your cash cushion.");
             makeCardAction(reserveCard, "Reserved for irregular expenses. "
                     + MoneyFormatter.dollars(summary.reservedCashCents) + ". Open provision funds.", this::showFunds);
-            for (String issue : summary.reserveIssues) addWarning(issue);
+            for (String issue : summary.dashboardReserveIssues) addWarning(issue);
         }
         if (reviewQueue.isEmpty()) {
             addAllCaughtUpCard(() -> showTransactions(true));
@@ -1647,11 +1676,13 @@ public final class MainActivity extends Activity {
         if (budgetDetail == null || budgetDetail.expectedBills.isEmpty()) {
             addBody("No expected bills yet.");
         } else {
-            for (ExpectedBill bill : budgetDetail.expectedBills) {
-                addBody(bill.name + " | " + MoneyFormatter.dollars(bill.amountCents) + " | due " + bill.dueOn + (bill.paid ? " | paid" : ""));
-                addButton("Edit " + bill.name, () -> showBillEditor(bill));
-                addDangerButton("Remove " + bill.name, () -> runMutation(
-                        "Removing bill...",
+            for (int i = 0; i < budgetDetail.expectedBills.size(); i++) {
+                ExpectedBill bill = budgetDetail.expectedBills.get(i);
+                if (i > 0) addBillPaydayDivider();
+                addBody(bill.name).setTypeface(Typeface.DEFAULT_BOLD);
+                addBody(MoneyFormatter.dollars(bill.amountCents) + " · due " + bill.dueOn + (bill.paid ? " · paid" : ""));
+                addBillPaydayActions(bill.name, () -> showBillEditor(bill), () -> runMutation(
+                        "Deleting bill...",
                         () -> currentApi().deleteExpectedBill(bill.id),
                         () -> refreshData(this::showBillsAndPaydays)
                 ));
@@ -1659,21 +1690,58 @@ public final class MainActivity extends Activity {
         }
         addButton("Add bill", () -> showBillEditor(null));
         addSection("Paydays");
-        if (budgetDetail == null || budgetDetail.paydays.isEmpty()) {
-            addBody("No paydays configured.");
-        } else {
-            for (Payday payday : budgetDetail.paydays) {
-                addBody(payday.paydayDate);
-                addButton("Edit " + payday.paydayDate, () -> showPaydayEditor(payday));
-                addDangerButton("Remove " + payday.paydayDate, () -> runMutation(
-                        "Removing payday...",
+        addSecondaryButton("Manage payday schedules", this::showPaydaySchedules);
+        if (budgetDetail != null && !budgetDetail.scheduledPaydays.isEmpty()) {
+            addBody("Upcoming from your schedules");
+            for (int i = 0; i < budgetDetail.scheduledPaydays.size(); i++) {
+                PaydaySchedule.Occurrence payday = budgetDetail.scheduledPaydays.get(i);
+                if (i > 0) addBillPaydayDivider();
+                addBody(payday.date).setTypeface(Typeface.DEFAULT_BOLD);
+                addBody(payday.name + (payday.date.equals(payday.original) ? "" : " · moved from " + payday.original));
+            }
+        }
+        if (budgetDetail != null && !budgetDetail.paydays.isEmpty()) {
+            addSection("One-time paydays");
+            for (int i = 0; i < budgetDetail.paydays.size(); i++) {
+                Payday payday = budgetDetail.paydays.get(i);
+                if (i > 0) addBillPaydayDivider();
+                addBody(payday.paydayDate).setTypeface(Typeface.DEFAULT_BOLD);
+                addBillPaydayActions("payday on " + payday.paydayDate, () -> showPaydayEditor(payday), () -> runMutation(
+                        "Deleting payday...",
                         () -> currentApi().deletePayday(payday.id),
                         () -> refreshData(this::showBillsAndPaydays)
                 ));
             }
         }
-        addButton("Add payday", () -> showPaydayEditor(null));
+        addButton("Add one-time payday", () -> showPaydayEditor(null));
         addNav();
+    }
+
+    private void addBillPaydayDivider() {
+        View divider = new View(this);
+        divider.setBackgroundColor(COLOR_BORDER);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        params.setMargins(0, dp(12), 0, dp(12));
+        root.addView(divider, params);
+    }
+
+    private void addBillPaydayActions(String item, Runnable edit, Runnable delete) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        Button editButton = styledButton("Edit", COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK, edit);
+        Button deleteButton = styledButton("Delete", COLOR_DANGER_BG, COLOR_DANGER_TEXT, () ->
+                new AlertDialog.Builder(this).setTitle("Delete " + item + "?")
+                        .setMessage("This entry will be removed from the household plan.")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Delete", (dialog, which) -> delete.run())
+                        .show());
+        editButton.setContentDescription("Edit " + item);
+        deleteButton.setContentDescription("Delete " + item);
+        LinearLayout.LayoutParams editParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        editParams.setMarginEnd(dp(8));
+        row.addView(editButton, editParams);
+        row.addView(deleteButton, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        root.addView(row);
     }
 
     private void showBillEditor(ExpectedBill bill) {
@@ -1726,6 +1794,29 @@ public final class MainActivity extends Activity {
         }
         Spinner billFund = funds == null ? null : fundChoices("Money reserved for this bill", fundNames, selectedFundIndex);
         if (funds != null) addBody("Link a bill to its provision fund so the same money is not held twice in your cash cushion. Categorize the purchase when it arrives.");
+        List<Integer> categoryIds = new ArrayList<>();
+        List<String> categoryNames = new ArrayList<>();
+        categoryIds.add(null);
+        categoryNames.add("No linked budget category");
+        Integer currentCategoryId = bill == null ? null : bill.budgetCategoryId;
+        int selectedCategoryIndex = 0;
+        if (summary != null) {
+            for (BudgetCategory category : BudgetScreenState.sortedCategoryChoices(summary.categories)) {
+                if (category.reserveFundId != null) continue;
+                if (budgetDetail != null && budgetDetail.expectedBills.stream().anyMatch(other ->
+                        (bill == null || other.id != bill.id) && Objects.equals(other.budgetCategoryId, category.id))) continue;
+                categoryIds.add(category.id);
+                categoryNames.add(category.name);
+                if (Objects.equals(currentCategoryId, category.id)) selectedCategoryIndex = categoryIds.size() - 1;
+            }
+        }
+        if (currentCategoryId != null && selectedCategoryIndex == 0) {
+            categoryIds.add(currentCategoryId);
+            categoryNames.add("Currently linked category (unavailable)");
+            selectedCategoryIndex = categoryIds.size() - 1;
+        }
+        Spinner billCategory = fundChoices("Dedicated budget category", categoryNames, selectedCategoryIndex);
+        addBody("Link the budget line used only for this bill to get a prompt when the posted payment differs.");
         addButton(bill == null ? "Add bill" : "Save bill", () -> {
             String cleaned = name.getText().toString().trim();
             String due = dueOn.getText().toString().trim();
@@ -1751,14 +1842,20 @@ public final class MainActivity extends Activity {
             final boolean isPaid = paid.isChecked();
             final Integer reserveFundId = billFund == null ? (bill == null ? null : bill.reserveFundId)
                     : fundIds.get(billFund.getSelectedItemPosition());
+            Integer categoryId = categoryIds.get(billCategory.getSelectedItemPosition());
+            if (reserveFundId != null && categoryId != null) {
+                toast("Choose either a budget category or a Provision Fund for this bill.");
+                return;
+            }
             runMutation(
                     "Saving bill...",
                     () -> {
                         if (bill == null) {
-                            currentApi().createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid, reserveFundId);
+                            currentApi().createExpectedBill(budgetMonthId, cleaned, amountCents, due, isPaid, reserveFundId, categoryId);
                         } else {
                             currentApi().updateExpectedBill(bill.id, cleaned, amountCents, due, isPaid, reserveFundId,
-                                    billFund != null && !Objects.equals(bill.reserveFundId, reserveFundId));
+                                    billFund != null && !Objects.equals(bill.reserveFundId, reserveFundId),
+                                    categoryId, !Objects.equals(currentCategoryId, categoryId));
                         }
                     },
                     () -> refreshData(this::showBillsAndPaydays)
@@ -1768,13 +1865,13 @@ public final class MainActivity extends Activity {
     }
 
     private void showPaydayEditor(Payday payday) {
-        beginScreen(payday == null ? "Add Payday" : "Edit Payday");
+        beginScreen(payday == null ? "Add One-Time Payday" : "Edit One-Time Payday");
         EditText paydayDate = new EditText(this);
         paydayDate.setHint("Payday YYYY-MM-DD");
         paydayDate.setSingleLine(true);
         paydayDate.setText(payday == null ? "" : payday.paydayDate);
         root.addView(paydayDate);
-        addButton(payday == null ? "Add payday" : "Save payday", () -> {
+        addButton(payday == null ? "Add one-time payday" : "Save payday", () -> {
             String cleaned = paydayDate.getText().toString().trim();
             if (!isIsoDate(cleaned)) {
                 toast("Payday must use YYYY-MM-DD.");
@@ -1795,11 +1892,165 @@ public final class MainActivity extends Activity {
         addNav();
     }
 
+    private void showPaydaySchedules() {
+        showLoading("Loading household payday schedules...");
+        executeForSession(() -> {
+            try {
+                JSONObject result = currentApi().getPaydaySchedules();
+                postIfActive(() -> renderPaydaySchedules(result));
+            } catch (Exception exception) {
+                postIfActive(() -> showError("Could not load payday schedules", exception));
+            }
+        });
+    }
+
+    private void renderPaydaySchedules(JSONObject result) {
+        beginScreen("Payday Schedules");
+        addBody("Schedules are shared by your household. The cash forecast uses the earliest upcoming payday.");
+        addBody("One-time paydays still count. You can review those in Bills and Paydays.");
+        String today = result.optString("today");
+        JSONArray schedules = result.optJSONArray("schedules");
+        if (schedules == null || schedules.length() == 0) addBody("No recurring paydays yet.");
+        if (schedules != null) {
+            for (int i = 0; i < schedules.length(); i++) {
+                PaydaySchedule schedule = new PaydaySchedule(schedules.optJSONObject(i));
+                addSection(schedule.name);
+                addBody(schedule.description());
+                addSecondaryButton("Edit " + schedule.name, () -> showPaydayScheduleEditor(schedule));
+                addDangerButton("Remove schedule " + schedule.name, () -> runMutation("Removing payday schedule...",
+                        () -> currentApi().deletePaydaySchedule(schedule.id), this::showPaydaySchedules));
+            }
+        }
+        addButton("Add payday schedule", () -> showPaydayScheduleEditor(null));
+        List<PaydaySchedule.Occurrence> upcoming = PaydaySchedule.occurrences(result.optJSONArray("upcoming_paydays"));
+        if (!upcoming.isEmpty()) {
+            addSection("Upcoming scheduled paydays");
+            for (PaydaySchedule.Occurrence payday : upcoming) {
+                addBody(payday.description());
+                addSecondaryButton("Move " + payday.name + " on " + payday.date,
+                        () -> showScheduledPaydayMove(payday));
+                if (!payday.date.equals(payday.original) && payday.original.compareTo(today) >= 0) {
+                    addSecondaryButton("Restore " + payday.original, () -> saveScheduledPaydayMove(payday, null));
+                }
+            }
+        }
+        addSecondaryButton("Bills and Paydays", () -> refreshData(this::showBillsAndPaydays));
+        addSecondaryButton("Accounts / Settings", this::showSettings);
+        addSecondaryButton("Dashboard", () -> refreshData(this::showDashboard));
+    }
+
+    private void showPaydayScheduleEditor(PaydaySchedule schedule) {
+        beginScreen(schedule == null ? "Add Payday Schedule" : "Edit Payday Schedule");
+        EditText name = fundTextInput("Schedule name", schedule == null ? "" : schedule.name, false);
+        PaydaySchedule.Frequency[] frequencies = PaydaySchedule.Frequency.values();
+        Spinner frequency = paydayChoice("Payday frequency", frequencies);
+        frequency.setSelection(schedule == null ? 0 : schedule.frequency.ordinal());
+        TextView dateHelp = addBody("");
+        EditText startsOn = fundTextInput("YYYY-MM-DD", schedule == null ? "" : schedule.startsOn, false);
+        TextView daysHelp = addBody("");
+        Spinner monthlyDay = paydayDayChoice("Monthly payday", schedule == null ? 15 : schedule.dayOne);
+        Spinner firstDay = paydayDayChoice("First payday day", schedule == null ? 15 : schedule.dayOne);
+        Spinner secondDay = paydayDayChoice("Second payday day", schedule == null ? 0 : schedule.dayTwo);
+        TextView shortMonth = addBody("The 29th, 30th or 31st falls on the last day in shorter months.");
+        Runnable refreshFields = () -> {
+            PaydaySchedule.Frequency selected = (PaydaySchedule.Frequency) frequency.getSelectedItem();
+            boolean monthly = selected == PaydaySchedule.Frequency.MONTHLY;
+            boolean twice = selected == PaydaySchedule.Frequency.TWICE_MONTHLY;
+            dateHelp.setText(monthly || twice ? "Schedule starts on" : "A known payday to start the schedule");
+            daysHelp.setText(twice ? "Choose two days of the month" : "Monthly payday");
+            daysHelp.setVisibility(monthly || twice ? View.VISIBLE : View.GONE);
+            monthlyDay.setVisibility(monthly ? View.VISIBLE : View.GONE);
+            shortMonth.setVisibility(monthly || twice ? View.VISIBLE : View.GONE);
+            firstDay.setVisibility(twice ? View.VISIBLE : View.GONE);
+            secondDay.setVisibility(twice ? View.VISIBLE : View.GONE);
+        };
+        frequency.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                refreshFields.run();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        refreshFields.run();
+        if (schedule != null) addBody("Editing the schedule removes moves for dates that no longer belong to it.");
+        addButton("Save schedule", () -> {
+            String enteredName = name.getText().toString().trim();
+            String start = startsOn.getText().toString().trim();
+            PaydaySchedule.Frequency selected = (PaydaySchedule.Frequency) frequency.getSelectedItem();
+            if (enteredName.isEmpty() || enteredName.length() > 80 || !isIsoDate(start)) {
+                toast("Enter a name of up to 80 characters and a date in YYYY-MM-DD.");
+                return;
+            }
+            boolean twice = selected == PaydaySchedule.Frequency.TWICE_MONTHLY;
+            Integer dayOne = null;
+            Integer dayTwo = twice ? secondDay.getSelectedItemPosition() : null;
+            if (twice) {
+                dayOne = firstDay.getSelectedItemPosition();
+                if (paydayInShortestMonth(dayOne) == paydayInShortestMonth(dayTwo)) {
+                    toast("Choose two days that never overlap, including in February.");
+                    return;
+                }
+            } else if (selected == PaydaySchedule.Frequency.MONTHLY) {
+                dayOne = monthlyDay.getSelectedItemPosition();
+            }
+            Integer first = dayOne;
+            runMutation("Saving payday schedule...",
+                    () -> currentApi().savePaydaySchedule(schedule == null ? 0 : schedule.id,
+                            enteredName, selected.key, start, first, dayTwo), this::showPaydaySchedules);
+        });
+        addSecondaryButton("Cancel", this::showPaydaySchedules);
+    }
+
+    private Spinner paydayChoice(String label, Object[] values) {
+        Spinner spinner = new Spinner(this);
+        spinner.setContentDescription(label);
+        ArrayAdapter<Object> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, values);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        root.addView(spinner);
+        return spinner;
+    }
+
+    private Spinner paydayDayChoice(String label, int selected) {
+        String[] days = new String[32];
+        for (int day = 0; day < days.length; day++) days[day] = PaydaySchedule.dayLabel(day);
+        Spinner spinner = paydayChoice(label, days);
+        spinner.setSelection(selected);
+        return spinner;
+    }
+
+    private static int paydayInShortestMonth(int day) {
+        return day == 0 ? 28 : Math.min(day, 28);
+    }
+
+    private void showScheduledPaydayMove(PaydaySchedule.Occurrence payday) {
+        beginScreen("Move One Payday");
+        addBody(payday.description() + ". Other paydays on this schedule keep their dates.");
+        EditText date = fundTextInput("New payday YYYY-MM-DD", payday.date, false);
+        addButton("Save new date", () -> {
+            String movedTo = date.getText().toString().trim();
+            if (!isIsoDate(movedTo)) {
+                toast("Payday must use YYYY-MM-DD.");
+                return;
+            }
+            saveScheduledPaydayMove(payday, movedTo);
+        });
+        addSecondaryButton("Cancel", this::showPaydaySchedules);
+    }
+
+    private void saveScheduledPaydayMove(PaydaySchedule.Occurrence payday, String movedTo) {
+        runMutation("Updating payday...",
+                () -> currentApi().moveScheduledPayday(payday.scheduleId, payday.original, movedTo),
+                this::showPaydaySchedules);
+    }
+
     private void showTransactions(boolean reviewOnly) {
         reviewingQueue = reviewOnly;
         beginScreen(reviewOnly ? "Transaction Review" : "Transactions");
-        addSecondaryButton("Merchant rules", this::showMerchantRules);
         List<TransactionDetail> source = reviewOnly ? reviewQueue : transactions;
+        if (reviewOnly && source.stream().anyMatch(TransactionReviewState::canAssignTogether)) {
+            addButton(TRANSACTION_SELECTION_TITLE, this::showTransactionSelection);
+        }
+        addSecondaryButton("Merchant rules", this::showMerchantRules);
         if (reviewOnly) {
             recordReviewClearStreakIfCleared();
             if (reviewQueue.isEmpty()) addAllCaughtUpCard(null);
@@ -1818,9 +2069,6 @@ public final class MainActivity extends Activity {
                     COLOR_SUCCESS_TEXT
             );
         } else {
-            if (reviewOnly && source.stream().anyMatch(TransactionReviewState::canAssignTogether)) {
-                addSecondaryButton("Select transactions", this::showTransactionSelection);
-            }
             for (TransactionDetail detail : source) {
                 addTransactionButton(detail);
             }
@@ -1830,7 +2078,7 @@ public final class MainActivity extends Activity {
 
     private void showTransactionSelection() {
         reviewingQueue = true;
-        beginScreen("Select transactions");
+        beginScreen(TRANSACTION_SELECTION_TITLE);
         addBody("Choose spending transactions for the same category. Refunds and splits are reviewed individually.");
         List<TransactionDetail> selected = new ArrayList<>();
         LinearLayout footer = new LinearLayout(this);
@@ -2065,7 +2313,7 @@ public final class MainActivity extends Activity {
             addButton(confirmLabel, () -> runMutation(
                     "Confirming transaction...",
                     () -> currentApi().markReviewed(detail.transaction.id, true),
-                    () -> afterTransactionSaved(detail.transaction.id, true)));
+                    () -> offerBillBudgetMatch(detail, detail.finalCategoryId)));
         }
         addSection("Categorize");
         Spinner categorySpinner = categorySpinner();
@@ -2079,7 +2327,7 @@ public final class MainActivity extends Activity {
             runMutation(
                     "Assigning category...",
                     () -> currentApi().assignCategory(detail.transaction.id, category.id, true),
-                    () -> afterTransactionSaved(detail.transaction.id, true)
+                    () -> offerBillBudgetMatch(detail, category.id)
             );
         });
         if (detail.isSplit()) {
@@ -2356,6 +2604,46 @@ public final class MainActivity extends Activity {
 
     private void afterTransactionSaved(int transactionId) {
         afterTransactionSaved(transactionId, false);
+    }
+
+    private void offerBillBudgetMatch(TransactionDetail detail, Integer categoryId) {
+        int transactionId = detail.transaction.id;
+        Runnable finish = () -> afterTransactionSaved(transactionId, true);
+        if (detail.transaction.pending || categoryId == null || budgetDetail == null
+                || budgetDetail.expectedBills.stream().noneMatch(bill -> categoryId.equals(bill.budgetCategoryId))) {
+            finish.run();
+            return;
+        }
+        executeForSession(() -> {
+            try {
+                JSONObject offer = currentApi().matchBillBudget(transactionId, null);
+                postIfActive(() -> {
+                    if (offer == null) {
+                        finish.run();
+                        return;
+                    }
+                    String expense = MoneyFormatter.dollars(offer.optInt("expense_cents"));
+                    new AlertDialog.Builder(this)
+                            .setTitle("Match bill budget to this expense?")
+                            .setMessage("Posted expense: " + expense
+                                    + "\n\n" + offer.optString("bill_name") + " bill: "
+                                    + MoneyFormatter.dollars(offer.optInt("bill_amount_cents")) + " → " + expense
+                                    + "\n" + offer.optString("category_name") + " budget: "
+                                    + MoneyFormatter.dollars(offer.optInt("planned_cents")) + " → " + expense)
+                            .setNegativeButton("Keep current amounts", (dialog, which) -> finish.run())
+                            .setPositiveButton("Match expense", (dialog, which) -> runMutation(
+                                    "Adjusting bill budget...", () -> currentApi().matchBillBudget(transactionId, offer), finish))
+                            .setOnCancelListener(dialog -> finish.run())
+                            .show();
+                });
+            } catch (Exception exception) {
+                postIfActive(() -> {
+                    if (handleExpiredSession(exception)) return;
+                    toast("Expense saved. Could not check its linked bill amount.");
+                    finish.run();
+                });
+            }
+        });
     }
 
     private void afterTransactionSaved(int transactionId, boolean rewardReview) {
@@ -2637,6 +2925,52 @@ public final class MainActivity extends Activity {
         addBody("Demo changes are cleared when you leave demo mode. Your real household stays separate.");
     }
 
+    private void addDailyReminderSetting() {
+        DailyReminder.Scope scope = dailyReminder.activeScope();
+        if (scope == null) return;
+        addSection("Daily reminder");
+        Switch toggle = new Switch(this);
+        toggle.setText("Remind me to check Ledger");
+        toggle.setChecked(scope.enabled());
+        root.addView(toggle);
+        addBody("Get a reminder around your chosen time if you haven't opened Ledger on this phone today.");
+
+        boolean is24Hour = android.text.format.DateFormat.is24HourFormat(this);
+        DateTimeFormatter timeFormat = DateTimeFormatter.ofPattern(is24Hour ? "HH:mm" : "h:mm a");
+        Button timeButton = addSecondaryButton("", () -> {
+            LocalTime time = scope.time();
+            new TimePickerDialog(this, (picker, hour, minute) -> {
+                if (!dailyReminder.isCurrent(scope)) return;
+                dailyReminder.setTime(scope, LocalTime.of(hour, minute));
+                if (refreshReminderSetting != null) refreshReminderSetting.run();
+            }, time.getHour(), time.getMinute(), is24Hour).show();
+        });
+        TextView blocked = addBody("Android notifications are off for this reminder.");
+        Button systemSettings = addSecondaryButton("Open Android notification settings", () -> {
+            startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
+        });
+        refreshReminderSetting = () -> {
+            boolean enabled = scope.enabled();
+            timeButton.setText("Reminder time: " + scope.time().format(timeFormat));
+            timeButton.setVisibility(enabled ? View.VISIBLE : View.GONE);
+            int blockedVisibility = enabled && !dailyReminder.notificationsAllowed() ? View.VISIBLE : View.GONE;
+            blocked.setVisibility(blockedVisibility);
+            systemSettings.setVisibility(blockedVisibility);
+        };
+        toggle.setOnCheckedChangeListener((button, enabled) -> {
+            if (!dailyReminder.isCurrent(scope)) return;
+            if (enabled) dailyReminder.createChannel();
+            dailyReminder.setEnabled(scope, enabled);
+            refreshReminderSetting.run();
+            if (enabled && Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_REMINDER_PERMISSION);
+            }
+        });
+        refreshReminderSetting.run();
+    }
+
     private void startDemoMode() {
         if (!demoMode && !preferences().getStringSet(uncertainWritesKey(), new HashSet<>()).isEmpty()) {
             showSettings();
@@ -2705,6 +3039,8 @@ public final class MainActivity extends Activity {
 
     private void handleDemoExpired() {
         advanceSession();
+        demoStore.preferences().edit().putLong("session_expires_at", 0).apply();
+        dailyReminder.sessionChanged(false);
         clearFinancialData();
         beginScreen("Demo session ended");
         addBody("This temporary demo expired or the server restarted. Start a fresh demo to continue with new sample data.");
@@ -2730,6 +3066,8 @@ public final class MainActivity extends Activity {
     private void renderSettings(JSONObject accountSettings, AppDiagnostics diagnostics, String errorMessage) {
         beginScreen("Accounts / Settings");
         addDemoSetting();
+        addDailyReminderSetting();
+        addSecondaryButton("Payday schedules", this::showPaydaySchedules);
         String uncertainKey = uncertainWritesKey();
         if (!demoMode && !preferences().getStringSet(uncertainKey, new HashSet<>()).isEmpty()) {
             addWarning("An account update lost its response. Check the affected budget, transactions or settings before entering demo mode; the change may already have been saved.");
@@ -3198,6 +3536,7 @@ public final class MainActivity extends Activity {
 
     private void beginScreen(String title) {
         currentScreen = title;
+        refreshReminderSetting = null;
         View focus = getCurrentFocus();
         if (focus != null) {
             InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
@@ -3357,7 +3696,7 @@ public final class MainActivity extends Activity {
         root.addView(textView);
     }
 
-    private void addBody(String body) {
+    private TextView addBody(String body) {
         TextView textView = new TextView(this);
         textView.setText(body);
         textView.setTextColor(COLOR_TEXT);
@@ -3365,6 +3704,7 @@ public final class MainActivity extends Activity {
         textView.setLineSpacing(dp(2), 1.0f);
         textView.setPadding(0, dp(4), 0, dp(8));
         root.addView(textView);
+        return textView;
     }
 
     private void addWarning(String body) {
@@ -3375,8 +3715,8 @@ public final class MainActivity extends Activity {
         addStyledButton(label, COLOR_PRIMARY, 0xFFFFFFFF, action);
     }
 
-    private void addSecondaryButton(String label, Runnable action) {
-        addStyledButton(label, COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK, action);
+    private Button addSecondaryButton(String label, Runnable action) {
+        return addStyledButton(label, COLOR_SURFACE_ALT, COLOR_PRIMARY_DARK, action);
     }
 
     private void addDangerButton(String label, Runnable action) {
@@ -3394,7 +3734,18 @@ public final class MainActivity extends Activity {
         } : action);
     }
 
-    private void addStyledButton(String label, int backgroundColor, int textColor, Runnable action) {
+    private Button addStyledButton(String label, int backgroundColor, int textColor, Runnable action) {
+        Button button = styledButton(label, backgroundColor, textColor, action);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.setMargins(0, dp(4), 0, dp(8));
+        root.addView(button, params);
+        return button;
+    }
+
+    private Button styledButton(String label, int backgroundColor, int textColor, Runnable action) {
         Button button = new Button(this);
         button.setAllCaps(false);
         button.setText(label);
@@ -3409,13 +3760,7 @@ public final class MainActivity extends Activity {
                 rounded(backgroundColor, backgroundColor, 14), null));
         button.setStateListAnimator(null);
         button.setOnClickListener(view -> action.run());
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        params.setMargins(0, dp(4), 0, dp(8));
-        button.setLayoutParams(params);
-        root.addView(button);
+        return button;
     }
 
     private void addCheckInStreakCard(CheckInStreak streak, LocalDate today) {
@@ -3745,7 +4090,7 @@ public final class MainActivity extends Activity {
             return "Plaid Sandbox is not configured on the backend.";
         }
         if (message.contains("No upcoming payday configured")) {
-            return "The cash forecast needs an upcoming payday. Add a payday in Bills and paydays.";
+            return "The cash forecast needs an upcoming payday. Add a schedule in Settings or a one-time payday in Bills and Paydays.";
         }
         if (message.contains("No active category") || message.contains("not part of budget month")) {
             return "Choose an active budget category for this month.";

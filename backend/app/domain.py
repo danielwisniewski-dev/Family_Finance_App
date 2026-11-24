@@ -205,6 +205,7 @@ class BudgetSummary:
     reserved_cash_cents: int = 0
     reserve_covered_bills_cents: int = 0
     reserve_issues: tuple[str, ...] = ()
+    dashboard_reserve_issues: tuple[str, ...] = ()
 
     @property
     def forecast_available(self) -> bool:
@@ -237,8 +238,12 @@ def summarize_budget(
     reserved_cash_cents: int = 0,
     reserve_covered_bills_cents: int = 0,
     reserve_issues: tuple[str, ...] = (),
+    overdrawn_fund_issues: dict[int, str] | None = None,
 ) -> BudgetSummary:
     category_tuple = tuple(category for category in categories if not category.archived)
+    listed_fund_ids = {category.reserve_fund_id for category in category_tuple if category.remaining_cents < 0}
+    duplicate_issues = {message for fund_id, message in (overdrawn_fund_issues or {}).items()
+                        if fund_id in listed_fund_ids}
     planned_cents = sum(category.planned_cents for category in category_tuple)
     income_available = available_income_cents(income_lines)
     next_payday = min((payday for payday in paydays if payday >= today), default=None)
@@ -264,6 +269,7 @@ def summarize_budget(
         reserved_cash_cents=reserved_cash_cents,
         reserve_covered_bills_cents=reserve_covered_bills_cents,
         reserve_issues=reserve_issues,
+        dashboard_reserve_issues=tuple(issue for issue in reserve_issues if issue not in duplicate_issues),
         as_of=today,
         low_cushion=(
             cash_after_bills // max(days_until_payday, 1) < low_cushion_daily_cents

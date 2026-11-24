@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from .security import RateLimitError, RuntimeSettings
 from .dates import household_today
+from .payday_schedules import PaydayRule
 from .demo_sessions import DemoSessionManager, demo_routes
 
 from .coach import (
@@ -103,6 +104,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/settings/account":
                 auth = self.require_auth()
                 self.send_json(self.repository.account_settings_summary(auth["user_id"]))
+                return
+            if parsed.path == "/payday-schedules":
+                auth = self.require_auth()
+                self.send_json(self.repository.list_payday_schedules(auth["household_id"], household_today()))
                 return
             if parsed.path == "/app/diagnostics":
                 auth = self.require_auth()
@@ -395,6 +400,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     amount_cents=require_int(payload, "amount_cents"),
                     due_on=parse_date(payload["due_on"]),
                     paid=boolean_field(payload, "paid", False),
+                    budget_category_id=optional_int(payload, "budget_category_id"),
                     actor_user_id=auth["user_id"],
                     **({"reserve_fund_id": bill_fund_id} if "reserve_fund_id" in payload else {}),
                 )
@@ -409,6 +415,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     actor_user_id=auth["user_id"],
                 )
                 self.send_json({"id": payday_id}, status=HTTPStatus.CREATED)
+                return
+            if parsed.path == "/payday-schedules":
+                auth = self.require_auth()
+                schedule_id = self.repository.save_payday_schedule(
+                    auth["household_id"], payload["name"], payday_rule(payload), actor_user_id=auth["user_id"],
+                )
+                self.send_json({"id": schedule_id}, status=HTTPStatus.CREATED)
                 return
             if parsed.path in {"/safe-to-spend", "/coach/safe-to-spend"}:
                 self.require_auth()
@@ -662,6 +675,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     amount_cents=optional_int(payload, "amount_cents"),
                     due_on=parse_date(payload["due_on"]) if payload.get("due_on") is not None else None,
                     paid=boolean_field(payload, "paid"),
+                    **({"budget_category_id": optional_int(payload, "budget_category_id")} if "budget_category_id" in payload else {}),
                     actor_user_id=auth["user_id"],
                     **({"reserve_fund_id": bill_fund_id} if "reserve_fund_id" in payload else {}),
                 )
@@ -675,6 +689,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                     payday_id=payday_id,
                     payday_date=parse_date(payload["payday_date"]),
                     actor_user_id=auth["user_id"],
+                )
+                self.send_json({"ok": True})
+                return
+            if resource_path(parsed.path, "payday-schedules", "move"):
+                auth = self.require_auth()
+                moved_to = payload["moved_to"]
+                self.repository.move_scheduled_payday(
+                    auth["household_id"], int(parsed.path.split("/")[2]), parse_date(payload["original_date"]),
+                    parse_date(moved_to) if moved_to is not None else None, household_today(), auth["user_id"],
+                )
+                self.send_json({"ok": True})
+                return
+            if resource_path(parsed.path, "payday-schedules"):
+                auth = self.require_auth()
+                self.repository.save_payday_schedule(
+                    auth["household_id"], payload["name"], payday_rule(payload),
+                    schedule_id=int(parsed.path.split("/")[2]), actor_user_id=auth["user_id"],
                 )
                 self.send_json({"ok": True})
                 return
@@ -709,6 +740,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     preview=boolean_field(payload, "preview", False), revision=payload.get("revision"),
                     actor_user_id=auth["user_id"])
                 self.send_json(result)
+                return
+            if resource_path(parsed.path, "transactions", "bill-budget"):
+                auth = self.require_auth()
+                transaction_id = int(parsed.path.split("/")[2])
+                confirmed = payload.get("confirmed")
+                if "confirmed" in payload and not isinstance(confirmed, dict):
+                    raise ValueError("Confirm a current bill budget preview.")
+                offer = self.repository.match_bill_budget(transaction_id, auth["household_id"], auth["user_id"], confirmed)
+                self.send_json({"offer": offer})
                 return
             if resource_path(parsed.path, "transactions", "income"):
                 auth = self.require_auth()
@@ -864,6 +904,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 payday_id = int(parsed.path.split("/")[2])
                 self.repository.require_payday_access(payday_id, auth["household_id"])
                 self.repository.remove_payday(payday_id=payday_id, actor_user_id=auth["user_id"])
+                self.send_json({"ok": True})
+                return
+            if resource_path(parsed.path, "payday-schedules"):
+                auth = self.require_auth()
+                self.repository.remove_payday_schedule(
+                    auth["household_id"], int(parsed.path.split("/")[2]), auth["user_id"],
+                )
                 self.send_json({"ok": True})
                 return
             if resource_path(parsed.path, "transactions", "split"):
@@ -1037,6 +1084,14 @@ def fund_spec_fields(payload: dict[str, Any]) -> dict[str, Any]:
             "annual_target_cents": require_int(payload, "annual_target_cents", default=0),
             "timing_note": payload.get("timing_note", ""),
             "breakdown": payload.get("breakdown", [])}
+
+
+def payday_rule(payload: dict[str, Any]) -> PaydayRule:
+    frequency = payload["frequency"]
+    if not isinstance(frequency, str):
+        raise ValueError("Choose a valid payday frequency.")
+    return PaydayRule(frequency, parse_date(payload["starts_on"]),
+                      optional_int(payload, "day_one"), optional_int(payload, "day_two"))
 
 
 def parse_date(value: str) -> date:

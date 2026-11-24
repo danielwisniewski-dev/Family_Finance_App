@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-LATEST_VERSION = 7
+LATEST_VERSION = 9
 
 
 def add_column(connection, table, column, definition):
@@ -136,11 +136,29 @@ def automatic_bank_sync(connection):
         record_successful_sync(connection, row[0])
 
 
+def payday_schedules(connection):
+    connection.execute("""CREATE TABLE payday_schedules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        household_id INTEGER NOT NULL REFERENCES households(id),
+        name TEXT COLLATE NOCASE NOT NULL, frequency TEXT NOT NULL, starts_on TEXT NOT NULL,
+        day_one INTEGER, day_two INTEGER, UNIQUE(household_id, name))""")
+    connection.execute("""CREATE TABLE payday_moves (
+        schedule_id INTEGER NOT NULL REFERENCES payday_schedules(id) ON DELETE CASCADE,
+        original_date TEXT NOT NULL, moved_to TEXT NOT NULL, PRIMARY KEY(schedule_id, original_date))""")
+
+
+def bill_budget_links(connection):
+    add_column(connection, "expected_bills", "budget_category_id",
+               "INTEGER REFERENCES budget_categories(id) ON DELETE SET NULL")
+    connection.execute("CREATE UNIQUE INDEX one_bill_per_category ON expected_bills(budget_category_id) WHERE budget_category_id IS NOT NULL")
+
+
 MIGRATIONS = [(1, "local_mvp_baseline", baseline), (2, "expiring_sessions_and_throttling", private_sessions),
               (3, "live_bank_sync_and_months", live_bank_data), (4, "persistent_provision_funds", provision_funds),
               (5, "explicit_bank_refresh_requests", bank_refresh_requests),
               (6, "transaction_months_and_income", transaction_planning),
-              (7, "automatic_bank_sync", automatic_bank_sync)]
+              (7, "automatic_bank_sync", automatic_bank_sync), (8, "payday_schedules", payday_schedules),
+              (9, "bill_budget_links", bill_budget_links)]
 
 
 def migrate(connection: sqlite3.Connection) -> None:

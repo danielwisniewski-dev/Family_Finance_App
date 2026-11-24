@@ -97,6 +97,27 @@ class ProvisionFundTests(unittest.TestCase):
         self.contribute()
         self.assertNotEqual(bank_status(self.repo, self.month)["revision"], before)
 
+    def test_dashboard_shows_a_deficit_warning_only_when_the_category_is_absent(self):
+        protected = self.repo.create_fund(budget_month_id=self.month, name="Protected savings",
+                                          backing_account_id=self.account, monthly_plan_cents=1_000)
+        self.contribute(1_000, fund_id=protected["id"])
+        expense = self.repo.upsert_plaid_transaction(cash_account_id=self.account,
+            plaid_transaction_id="synthetic-dashboard-deficit", amount_cents=-2_000,
+            occurred_on=self.today, name="Synthetic renewal")
+        self.repo.assign_transaction_category(transaction_id=expense.transaction_id, category_id=self.fund["category_id"])
+        self.repo.update_cash_account(account_id=self.account, balance_cents=0)
+
+        summary = self.repo.get_summary(self.month, self.today)
+        deficit = next(issue for issue in summary.reserve_issues if issue.startswith("Annual costs"))
+        self.assertTrue(any(category.id == self.fund["category_id"] and category.remaining_cents == -2_000
+                            for category in summary.categories))
+        self.assertEqual(len(summary.dashboard_reserve_issues), 1)
+        self.assertIn("less cash than its provision funds", summary.dashboard_reserve_issues[0])
+        self.assertIn(deficit, self.repo.get_funds(self.month, self.today)["issues"])
+
+        next_month = self.repo.create_budget_month(household_id=self.household, month="2026-03")
+        self.assertIn(deficit, self.repo.get_summary(next_month, date(2026, 3, 1)).dashboard_reserve_issues)
+
     def test_correcting_expense_deficit_only_earmarks_the_positive_balance(self):
         transaction = self.repo.upsert_plaid_transaction(cash_account_id=self.account,
             plaid_transaction_id="synthetic-deficit", amount_cents=-10_000, occurred_on=self.today, name="Actual expense")
